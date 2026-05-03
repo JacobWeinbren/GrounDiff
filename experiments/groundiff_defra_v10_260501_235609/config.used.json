@@ -1,0 +1,84 @@
+{
+  "name": "groundiff_defra",
+  "experiment_dir": "experiments",
+  "data": {
+    "tile_dir": "/data/england_tiles",
+    "crop": 256,
+    "use_min_dsm": true
+  },
+  "model": {
+    "unet": {
+      "image_size": 256,
+      "in_channel": 3,
+      "out_channel": 2,
+      "inner_channel": 64,
+      "channel_mults": [
+        1,
+        2,
+        4,
+        8
+      ],
+      "attn_res": [
+        16
+      ],
+      "res_blocks": 2,
+      "num_head_channels": 32,
+      "dropout": 0.2,
+      "use_scale_shift_norm": true
+    },
+    "diffusion": {
+      "T": 10,
+      "schedule": "cosine",
+      "beta_start": 0.0001,
+      "beta_end": 0.02
+    },
+    "loss": {
+      "alpha_metres": 0.2,
+      "lam_l1": 1.0,
+      "lam_l2": 1.0,
+      "lam_grad": 0.1,
+      "lam_conf": 0.1
+    }
+  },
+  "optim": {
+    "lr": 0.0001,
+    "weight_decay": 0.01,
+    "warmup_steps": 500,
+    "lr_min_frac": 0.0
+  },
+  "train": {
+    "batch_size": 16,
+    "n_epoch": 50,
+    "n_iter": 850000,
+    "log_iter": 50,
+    "val_every_epoch": 1,
+    "save_every_epoch": 1,
+    "val_max_tiles": 256,
+    "num_workers": 8,
+    "priostitch_val_scenes": 8,
+    "priostitch_val_every_epoch": 1,
+    "priostitch_val_save_viz": true,
+    "sampler": "uniform",
+    "ema_decay": 0.9999,
+    "init_kaiming": true
+  },
+  "preprocess": {
+    "laz_root": "/data/england_split",
+    "out_dir": "/data/england_tiles",
+    "gsd": 0.5,
+    "tile": 256,
+    "stride": null,
+    "min_valid_frac": 0.05,
+    "workers": 8,
+    "splits": [
+      "Training",
+      "Test"
+    ]
+  },
+  "priostitch": {
+    "tile": 256,
+    "stride": 128,
+    "blend_mode": "min",
+    "init_prior": true
+  }
+}

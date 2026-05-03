@@ -1,0 +1,449 @@
+16:40:44 INFO loaded /root/work/groundiff/experiments/groundiff_defra_v10_260501_235609/checkpoint/epoch_0050.pt; UNet=62.6M params  use_min_dsm=True
+16:40:44 INFO   representative sampling: 200 from 953 scenes across 20 OS 100km squares
+16:40:44 INFO   selected 200 scenes from 20 squares: NX NY SD SE SJ SO SS ST SU SW SX SY SZ TA TF TG TL TQ TR TV
+16:40:44 INFO 200 scenes to evaluate from split='all'  blend=min  stride=128  init_prior=True
+16:40:44 INFO   triptych viz: top 12 largest + 6 cliffiest scenes (≥ 6,000,000 valid px each)  dpi=200  hillshade=True  inpaint=True
+16:40:44 INFO scanning scenes (size + cliff score)...
+16:41:04 INFO   selected 12 scenes by size (largest by valid pixel count)
+16:41:04 INFO   selected 6 cliff scenes (max DTM gradient ≥ 5.6 m/px — typically natural cliffs, quarries, escarpments)
+16:41:04 INFO     cliff  EN_SD2606_P_12641_20220810_20220810    6.7M valid  max∇=9.8 m/px
+16:41:04 INFO      size  EN_SD2802_P_12697_20221207_20221207    7.9M valid  max∇=3.1 m/px
+16:41:04 INFO      size  EN_SD2804_P_12697_20221207_20221207    8.3M valid  max∇=5.2 m/px
+16:41:04 INFO      both  EN_SD2806_P_12697_20221207_20221207    8.7M valid  max∇=8.5 m/px
+16:41:04 INFO      both  EN_SD2808_P_12697_20221207_20221207    9.2M valid  max∇=8.6 m/px
+16:41:04 INFO      size  EN_SD2810_P_12697_20221207_20221207    8.4M valid  max∇=2.6 m/px
+16:41:04 INFO     cliff  EN_SD5428_P_12699_20220924_20220929    6.4M valid  max∇=33.2 m/px
+16:41:04 INFO      both  EN_ST3262_P_12402_20220402_20220403    7.2M valid  max∇=17.5 m/px
+16:41:04 INFO     cliff  EN_ST5282_P_12402_20220402_20220403    6.1M valid  max∇=5.6 m/px
+16:41:04 INFO      size  EN_ST6298_P_12407_20220304_20220304    9.4M valid  max∇=4.0 m/px
+16:41:04 INFO     cliff  EN_SU4206_P_12436_20220304_20220304    6.1M valid  max∇=24.8 m/px
+16:41:04 INFO      both  EN_SU4600_P_12436_20220318_20220318    8.0M valid  max∇=12.8 m/px
+16:41:04 INFO      size  EN_SU6002_P_12443_20220204_20220204    7.1M valid  max∇=2.4 m/px
+16:41:04 INFO      size  EN_SW8240_P_12382_20220305_20220305    8.9M valid  max∇=5.2 m/px
+16:41:04 INFO      both  EN_SW8242_P_12382_20220305_20220305    7.9M valid  max∇=38.5 m/px
+16:41:04 INFO      both  EN_SW8634_P_12382_20220305_20220305    7.6M valid  max∇=8.9 m/px
+16:41:04 INFO     cliff  EN_SX8038_P_12386_20220304_20220304    6.4M valid  max∇=62.7 m/px
+16:41:04 INFO     cliff  EN_SX9462_P_12385_20220205_20220205    6.7M valid  max∇=17.6 m/px
+16:41:04 INFO [1/200] EN_NX9214_P_12706_20220902_20220902: DSM=(1794, 981)  valid=15.0%  (0s elapsed)
+16:41:19 INFO   RMSE=3.321m  MAE=0.785m  E_T1=12.17%  E_T2=6.82%  E_tot=8.28%  err>0.5m=15.3%  err>1.0m=10.9%  [per-cell]
+16:41:20 INFO [2/200] EN_NY1256_P_12709_20220902_20220902: DSM=(3951, 4000)  valid=35.3%  (16s elapsed)
+16:43:35 INFO   RMSE=0.061m  MAE=0.016m  E_T1=4.63%  E_T2=0.63%  E_tot=0.75%  err>0.5m=0.3%  err>1.0m=0.0%  [per-cell]
+16:43:36 INFO [3/200] EN_SD4620_P_12699_20220924_20220929: DSM=(4000, 3435)  valid=41.7%  (152s elapsed)
+16:45:33 INFO   RMSE=0.292m  MAE=0.112m  E_T1=2.07%  E_T2=1.17%  E_tot=1.37%  err>0.5m=7.8%  err>1.0m=1.8%  [per-cell]
+16:45:34 INFO [4/200] EN_SD1282_P_12705_20220928_20220928: DSM=(2922, 1362)  valid=19.6%  (270s elapsed)
+16:46:05 INFO   RMSE=0.111m  MAE=0.028m  E_T1=4.35%  E_T2=1.72%  E_tot=1.85%  err>0.5m=0.7%  err>1.0m=0.2%  [per-cell]
+16:46:05 INFO [5/200] EN_SD1294_P_12706_20220902_20220902: DSM=(1266, 1125)  valid=11.8%  (302s elapsed)
+16:46:16 INFO   RMSE=0.143m  MAE=0.075m  E_T1=42.09%  E_T2=4.92%  E_tot=12.18%  err>0.5m=0.8%  err>1.0m=0.2%  [per-cell]
+16:46:17 INFO [6/200] EN_SD1296_P_12706_20220902_20220902: DSM=(4000, 2647)  valid=32.8%  (313s elapsed)
+16:47:47 INFO   RMSE=0.601m  MAE=0.268m  E_T1=10.02%  E_T2=7.90%  E_tot=8.93%  err>0.5m=17.4%  err>1.0m=5.9%  [per-cell]
+16:47:47 INFO [7/200] EN_SD1298_P_12706_20220902_20220902: DSM=(1014, 1227)  valid=27.2%  (403s elapsed)
+16:47:57 INFO   RMSE=1.428m  MAE=0.791m  E_T1=7.55%  E_T2=15.37%  E_tot=10.46%  err>0.5m=41.1%  err>1.0m=26.1%  [per-cell]
+16:47:57 INFO [8/200] EN_SD2204_P_12697_20221207_20221207: DSM=(4000, 2668)  valid=16.9%  (413s elapsed)
+16:49:28 INFO   RMSE=0.075m  MAE=0.044m  E_T1=16.58%  E_T2=5.70%  E_tot=5.79%  err>0.5m=0.0%  err>1.0m=0.0%  [per-cell]
+16:49:28 INFO [9/200] EN_SD2602_P_12641_20220810_20220810: DSM=(2415, 3082)  valid=23.9%  (504s elapsed)
+16:50:31 INFO   RMSE=0.021m  MAE=0.008m  E_T1=nan%  E_T2=0.20%  E_tot=0.20%  err>0.5m=0.0%  err>1.0m=0.0%  [per-cell]
+16:50:32 INFO [10/200] EN_SD2606_P_12641_20220810_20220810: DSM=(4000, 3162)  valid=52.9%  (568s elapsed)
+16:52:21 INFO   RMSE=0.201m  MAE=0.089m  E_T1=5.19%  E_T2=2.45%  E_tot=3.29%  err>0.5m=3.1%  err>1.0m=0.4%  [per-cell]
+16:52:35 INFO   viz → EN_SD2606_P_12641_20220810_20220810.png (16.3 MB)
+16:52:35 INFO [11/200] EN_SD2612_P_12698_20221028_20221028: DSM=(2404, 501)  valid=4.5%  (691s elapsed)
+16:52:43 INFO   RMSE=0.128m  MAE=0.089m  E_T1=nan%  E_T2=16.25%  E_tot=16.42%  err>0.5m=0.2%  err>1.0m=0.0%  [per-cell]
+16:52:44 INFO [12/200] EN_SD2802_P_12697_20221207_20221207: DSM=(4000, 4000)  valid=49.6%  (700s elapsed)
+16:55:05 INFO   RMSE=0.088m  MAE=0.028m  E_T1=6.45%  E_T2=1.21%  E_tot=1.71%  err>0.5m=0.5%  err>1.0m=0.1%  [per-cell]
+16:55:24 INFO   viz → EN_SD2802_P_12697_20221207_20221207.png (17.5 MB)
+16:55:24 INFO [13/200] EN_SD2804_P_12697_20221207_20221207: DSM=(4000, 4000)  valid=51.8%  (861s elapsed)
+16:57:45 INFO   RMSE=0.150m  MAE=0.060m  E_T1=4.51%  E_T2=2.45%  E_tot=2.93%  err>0.5m=1.3%  err>1.0m=0.2%  [per-cell]
+16:58:04 INFO   viz → EN_SD2804_P_12697_20221207_20221207.png (21.7 MB)
+16:58:05 INFO [14/200] EN_SD2806_P_12697_20221207_20221207: DSM=(4000, 4000)  valid=54.2%  (1021s elapsed)
+17:00:26 INFO   RMSE=0.150m  MAE=0.076m  E_T1=1.18%  E_T2=0.48%  E_tot=0.83%  err>0.5m=0.9%  err>1.0m=0.1%  [per-cell]
+17:00:44 INFO   viz → EN_SD2806_P_12697_20221207_20221207.png (23.1 MB)
+17:00:45 INFO [15/200] EN_SD2808_P_12697_20221207_20221207: DSM=(4000, 4000)  valid=57.3%  (1181s elapsed)
+17:03:06 INFO   RMSE=0.197m  MAE=0.102m  E_T1=4.16%  E_T2=1.49%  E_tot=2.76%  err>0.5m=2.6%  err>1.0m=0.2%  [per-cell]
+17:03:23 INFO   viz → EN_SD2808_P_12697_20221207_20221207.png (24.1 MB)
+17:03:24 INFO [16/200] EN_SD2810_P_12697_20221207_20221207: DSM=(4000, 4000)  valid=52.3%  (1341s elapsed)
+17:05:45 INFO   RMSE=0.188m  MAE=0.087m  E_T1=8.28%  E_T2=3.69%  E_tot=4.98%  err>0.5m=2.7%  err>1.0m=0.2%  [per-cell]
+17:06:03 INFO   viz → EN_SD2810_P_12697_20221207_20221207.png (23.6 MB)
+17:06:04 INFO [17/200] EN_SD3214_P_12641_20220810_20220810: DSM=(4000, 2555)  valid=54.6%  (1500s elapsed)
+17:07:30 INFO   RMSE=0.209m  MAE=0.107m  E_T1=1.39%  E_T2=0.92%  E_tot=1.17%  err>0.5m=3.0%  err>1.0m=0.4%  [per-cell]
+17:07:31 INFO [18/200] EN_SD3216_P_12698_20221028_20221028: DSM=(4000, 4000)  valid=40.4%  (1587s elapsed)
+17:09:51 INFO   RMSE=0.341m  MAE=0.139m  E_T1=1.69%  E_T2=2.18%  E_tot=2.00%  err>0.5m=8.0%  err>1.0m=1.8%  [per-cell]
+17:09:51 INFO [19/200] EN_SD3228_P_12700_20220924_20220924: DSM=(2742, 1632)  valid=37.3%  (1727s elapsed)
+17:10:28 INFO   RMSE=0.289m  MAE=0.144m  E_T1=1.06%  E_T2=1.69%  E_tot=1.37%  err>0.5m=6.4%  err>1.0m=0.8%  [per-cell]
+17:10:29 INFO [20/200] EN_SD3828_P_12698_20221028_20221028: DSM=(1588, 4000)  valid=30.5%  (1765s elapsed)
+17:11:23 INFO   RMSE=0.203m  MAE=0.081m  E_T1=1.92%  E_T2=1.51%  E_tot=1.61%  err>0.5m=4.2%  err>1.0m=0.5%  [per-cell]
+17:11:24 INFO [21/200] EN_SD4610_P_12699_20220924_20220929: DSM=(3239, 4000)  valid=35.7%  (1820s elapsed)
+17:13:16 INFO   RMSE=0.321m  MAE=0.102m  E_T1=4.40%  E_T2=2.61%  E_tot=2.98%  err>0.5m=5.6%  err>1.0m=2.0%  [per-cell]
+17:13:17 INFO [22/200] EN_SD5428_P_12699_20220924_20220929: DSM=(4000, 4000)  valid=40.2%  (1934s elapsed)
+17:15:38 INFO   RMSE=0.646m  MAE=0.280m  E_T1=1.70%  E_T2=2.74%  E_tot=2.22%  err>0.5m=18.2%  err>1.0m=6.4%  [per-cell]
+17:15:55 INFO   viz → EN_SD5428_P_12699_20220924_20220929.png (20.9 MB)
+17:15:55 INFO [23/200] EN_SD5430_P_12699_20220924_20220929: DSM=(380, 1538)  valid=16.3%  (2091s elapsed)
+17:15:59 INFO   RMSE=0.429m  MAE=0.235m  E_T1=1.16%  E_T2=4.29%  E_tot=2.64%  err>0.5m=16.7%  err>1.0m=5.3%  [per-cell]
+17:15:59 INFO [24/200] EN_SE4511_P_12502_20220118_20220118: DSM=(2000, 2000)  valid=96.0%  (2095s elapsed)
+17:16:32 INFO   RMSE=0.178m  MAE=0.061m  E_T1=1.93%  E_T2=0.98%  E_tot=1.41%  err>0.5m=0.8%  err>1.0m=0.2%  [per-cell]
+17:16:32 INFO [25/200] EN_SE5225nw_P_12569_20220207_20220207: DSM=(1000, 1000)  valid=99.7%  (2128s elapsed)
+17:16:39 INFO   RMSE=0.043m  MAE=0.021m  E_T1=6.40%  E_T2=0.37%  E_tot=0.81%  err>0.5m=0.0%  err>1.0m=0.0%  [per-cell]
+17:16:39 INFO [26/200] EN_SE4510_P_12502_20220118_20220118: DSM=(2000, 2000)  valid=95.2%  (2135s elapsed)
+17:17:12 INFO   RMSE=0.290m  MAE=0.110m  E_T1=1.76%  E_T2=0.60%  E_tot=1.01%  err>0.5m=6.5%  err>1.0m=2.0%  [per-cell]
+17:17:12 INFO [27/200] EN_SE5207_P_12502_20220118_20220118: DSM=(2000, 2000)  valid=98.0%  (2168s elapsed)
+17:17:45 INFO   RMSE=0.110m  MAE=0.059m  E_T1=1.44%  E_T2=2.43%  E_tot=1.94%  err>0.5m=0.6%  err>1.0m=0.1%  [per-cell]
+17:17:45 INFO [28/200] EN_SE5212_P_12502_20220118_20220118: DSM=(2000, 2000)  valid=97.5%  (2201s elapsed)
+17:18:17 INFO   RMSE=0.037m  MAE=0.015m  E_T1=1.95%  E_T2=0.11%  E_tot=0.24%  err>0.5m=0.0%  err>1.0m=0.0%  [per-cell]
+17:18:17 INFO [29/200] EN_SE5224ne_P_12569_20220207_20220207: DSM=(1000, 1000)  valid=77.3%  (2233s elapsed)
+17:18:24 INFO   RMSE=0.047m  MAE=0.018m  E_T1=12.46%  E_T2=0.21%  E_tot=0.44%  err>0.5m=0.2%  err>1.0m=0.0%  [per-cell]
+17:18:25 INFO [30/200] EN_SE5226ne_P_12569_20220207_20220207: DSM=(797, 1000)  valid=89.1%  (2241s elapsed)
+17:18:31 INFO   RMSE=0.053m  MAE=0.024m  E_T1=3.00%  E_T2=0.57%  E_tot=0.94%  err>0.5m=0.1%  err>1.0m=0.0%  [per-cell]
+17:18:32 INFO [31/200] EN_SJ4682_P_12696_20220920_20220920: DSM=(3999, 4000)  valid=35.9%  (2248s elapsed)
+17:20:51 INFO   RMSE=0.159m  MAE=0.058m  E_T1=3.08%  E_T2=1.74%  E_tot=2.03%  err>0.5m=2.2%  err>1.0m=0.4%  [per-cell]
+17:20:51 INFO [32/200] EN_SJ5286_P_12696_20220920_20220920: DSM=(1268, 3401)  valid=26.4%  (2387s elapsed)
+17:21:25 INFO   RMSE=2.153m  MAE=0.450m  E_T1=3.84%  E_T2=2.90%  E_tot=3.24%  err>0.5m=10.6%  err>1.0m=5.4%  [per-cell]
+17:21:26 INFO [33/200] EN_SJ6084_P_12696_20220920_20220920: DSM=(4000, 4000)  valid=23.5%  (2422s elapsed)
+17:23:45 INFO   RMSE=0.404m  MAE=0.182m  E_T1=1.42%  E_T2=1.58%  E_tot=1.51%  err>0.5m=10.9%  err>1.0m=2.9%  [per-cell]
+17:23:45 INFO [34/200] EN_SO6000_P_12407_20220304_20220304: DSM=(1531, 2385)  valid=25.4%  (2561s elapsed)
+17:24:14 INFO   RMSE=0.123m  MAE=0.030m  E_T1=3.77%  E_T2=1.07%  E_tot=1.25%  err>0.5m=1.2%  err>1.0m=0.4%  [per-cell]
+17:24:14 INFO [35/200] EN_SO7002_P_12408_20220415_20220420: DSM=(2459, 2788)  valid=17.9%  (2590s elapsed)
+17:25:12 INFO   RMSE=0.226m  MAE=0.085m  E_T1=3.21%  E_T2=1.63%  E_tot=1.98%  err>0.5m=4.4%  err>1.0m=0.7%  [per-cell]
+17:25:13 INFO [36/200] EN_SO7204_P_12408_20220415_20220420: DSM=(2944, 3339)  valid=18.0%  (2649s elapsed)
+17:26:36 INFO   RMSE=0.116m  MAE=0.035m  E_T1=6.04%  E_T2=1.43%  E_tot=1.86%  err>0.5m=1.2%  err>1.0m=0.2%  [per-cell]
+17:26:36 INFO [37/200] EN_SO7214_P_12408_20220415_20220420: DSM=(3361, 4000)  valid=21.2%  (2732s elapsed)
+17:28:33 INFO   RMSE=0.305m  MAE=0.078m  E_T1=2.47%  E_T2=1.61%  E_tot=1.71%  err>0.5m=3.9%  err>1.0m=1.9%  [per-cell]
+17:28:34 INFO [38/200] EN_SS8048_P_12762_20221011_20221011: DSM=(3688, 4000)  valid=27.7%  (2850s elapsed)
+17:30:40 INFO   RMSE=1.345m  MAE=0.590m  E_T1=7.16%  E_T2=6.32%  E_tot=6.71%  err>0.5m=31.6%  err>1.0m=20.1%  [per-cell]
+17:30:40 INFO [39/200] EN_SS1638_P_12398_20220305_20220305: DSM=(4000, 3495)  valid=7.8%  (2976s elapsed)
+17:32:41 INFO   RMSE=0.113m  MAE=0.057m  E_T1=24.95%  E_T2=9.03%  E_tot=9.25%  err>0.5m=0.8%  err>1.0m=0.0%  [per-cell]
+17:32:41 INFO [40/200] EN_SS2220_P_12409_20220318_20220319: DSM=(4000, 1686)  valid=28.0%  (3098s elapsed)
+17:33:39 INFO   RMSE=1.330m  MAE=0.214m  E_T1=18.35%  E_T2=4.10%  E_tot=6.85%  err>0.5m=4.9%  err>1.0m=2.6%  [per-cell]
+17:33:40 INFO [41/200] EN_SS4024_P_12395_20220319_20220319: DSM=(2901, 2917)  valid=29.3%  (3156s elapsed)
+17:34:50 INFO   RMSE=0.209m  MAE=0.092m  E_T1=1.34%  E_T2=1.47%  E_tot=1.44%  err>0.5m=4.0%  err>1.0m=0.5%  [per-cell]
+17:34:50 INFO [42/200] EN_SS4226_P_12395_20220319_20220319: DSM=(1760, 2028)  valid=23.2%  (3226s elapsed)
+17:35:18 INFO   RMSE=0.230m  MAE=0.077m  E_T1=1.34%  E_T2=1.78%  E_tot=1.69%  err>0.5m=2.9%  err>1.0m=0.9%  [per-cell]
+17:35:18 INFO [43/200] EN_SS4644_P_12763_20220910_20220910: DSM=(1751, 4000)  valid=38.0%  (3254s elapsed)
+17:36:17 INFO   RMSE=0.448m  MAE=0.181m  E_T1=4.61%  E_T2=3.77%  E_tot=4.01%  err>0.5m=11.1%  err>1.0m=4.2%  [per-cell]
+17:36:17 INFO [44/200] EN_SS4648_P_12763_20220910_20220910: DSM=(258, 831)  valid=0.5%  (3313s elapsed)
+17:36:19 INFO   RMSE=0.050m  MAE=0.033m  E_T1=nan%  E_T2=0.00%  E_tot=0.19%  err>0.5m=0.0%  err>1.0m=0.0%  [per-cell]
+17:36:19 INFO [45/200] EN_SS6248_P_12763_20220910_20220910: DSM=(4000, 4000)  valid=30.8%  (3316s elapsed)
+17:38:39 INFO   RMSE=2.072m  MAE=0.325m  E_T1=37.38%  E_T2=2.93%  E_tot=10.57%  err>0.5m=7.4%  err>1.0m=3.6%  [per-cell]
+17:38:39 INFO [46/200] EN_SS6250_P_12763_20220910_20220910: DSM=(330, 2243)  valid=2.3%  (3456s elapsed)
+17:38:44 INFO   RMSE=0.168m  MAE=0.152m  E_T1=nan%  E_T2=35.43%  E_tot=35.33%  err>0.5m=0.0%  err>1.0m=0.0%  [per-cell]
+17:38:45 INFO [47/200] EN_SS9246_P_12761_20221008_20221009: DSM=(2702, 4000)  valid=30.4%  (3461s elapsed)
+17:40:19 INFO   RMSE=0.544m  MAE=0.154m  E_T1=15.85%  E_T2=4.17%  E_tot=7.99%  err>0.5m=6.3%  err>1.0m=2.3%  [per-cell]
+17:40:20 INFO [48/200] EN_ST0442_P_12761_20221008_20221009: DSM=(3957, 1368)  valid=29.5%  (3556s elapsed)
+17:41:03 INFO   RMSE=0.522m  MAE=0.188m  E_T1=3.07%  E_T2=2.42%  E_tot=2.58%  err>0.5m=11.6%  err>1.0m=4.6%  [per-cell]
+17:41:03 INFO [49/200] EN_ST0444_P_12761_20221008_20221009: DSM=(2361, 1672)  valid=22.0%  (3599s elapsed)
+17:41:37 INFO   RMSE=0.042m  MAE=0.019m  E_T1=8.61%  E_T2=0.82%  E_tot=0.88%  err>0.5m=0.1%  err>1.0m=0.0%  [per-cell]
+17:41:37 INFO [50/200] EN_ST2542_P_12621_20220403_20220403: DSM=(2000, 1012)  valid=43.7%  (3633s elapsed)
+17:41:52 INFO   RMSE=0.119m  MAE=0.048m  E_T1=3.13%  E_T2=1.38%  E_tot=1.74%  err>0.5m=1.2%  err>1.0m=0.1%  [per-cell]
+17:41:52 INFO [51/200] EN_ST2544_P_12621_20220403_20220403: DSM=(1486, 718)  valid=47.2%  (3649s elapsed)
+17:42:01 INFO   RMSE=0.055m  MAE=0.017m  E_T1=19.88%  E_T2=1.25%  E_tot=1.72%  err>0.5m=0.2%  err>1.0m=0.0%  [per-cell]
+17:42:01 INFO [52/200] EN_ST2743_P_12621_20220403_20220403: DSM=(2000, 2000)  valid=84.4%  (3657s elapsed)
+17:42:33 INFO   RMSE=0.059m  MAE=0.016m  E_T1=8.52%  E_T2=0.73%  E_tot=0.96%  err>0.5m=0.2%  err>1.0m=0.0%  [per-cell]
+17:42:34 INFO [53/200] EN_ST2938_P_12621_20220403_20220403: DSM=(2000, 2000)  valid=79.9%  (3690s elapsed)
+17:43:06 INFO   RMSE=0.109m  MAE=0.039m  E_T1=1.96%  E_T2=1.22%  E_tot=1.39%  err>0.5m=0.8%  err>1.0m=0.2%  [per-cell]
+17:43:06 INFO [54/200] EN_ST2949_P_12621_20220403_20220403: DSM=(2000, 2000)  valid=88.8%  (3722s elapsed)
+17:43:39 INFO   RMSE=0.019m  MAE=0.007m  E_T1=55.30%  E_T2=0.13%  E_tot=0.21%  err>0.5m=0.0%  err>1.0m=0.0%  [per-cell]
+17:43:40 INFO [55/200] EN_ST3260_P_12402_20220402_20220403: DSM=(4000, 3090)  valid=35.5%  (3756s elapsed)
+17:45:27 INFO   RMSE=0.384m  MAE=0.155m  E_T1=1.50%  E_T2=2.09%  E_tot=1.80%  err>0.5m=6.7%  err>1.0m=1.4%  [per-cell]
+17:45:28 INFO [56/200] EN_ST3262_P_12402_20220402_20220403: DSM=(4000, 3936)  valid=45.6%  (3864s elapsed)
+17:47:43 INFO   RMSE=0.655m  MAE=0.241m  E_T1=1.39%  E_T2=3.54%  E_tot=2.38%  err>0.5m=15.5%  err>1.0m=2.4%  [per-cell]
+17:48:00 INFO   viz → EN_ST3262_P_12402_20220402_20220403.png (19.8 MB)
+17:48:01 INFO [57/200] EN_ST3264_P_12402_20220402_20220403: DSM=(4000, 4000)  valid=42.2%  (4017s elapsed)
+17:50:21 INFO   RMSE=0.122m  MAE=0.041m  E_T1=9.59%  E_T2=2.58%  E_tot=3.53%  err>0.5m=1.1%  err>1.0m=0.2%  [per-cell]
+17:50:22 INFO [58/200] EN_ST5282_P_12402_20220402_20220403: DSM=(4000, 4000)  valid=38.4%  (4158s elapsed)
+17:52:43 INFO   RMSE=0.329m  MAE=0.055m  E_T1=2.37%  E_T2=1.46%  E_tot=1.57%  err>0.5m=2.1%  err>1.0m=0.8%  [per-cell]
+17:54:27 INFO   viz → EN_ST5282_P_12402_20220402_20220403.png (17.6 MB)
+17:54:28 INFO [59/200] EN_ST6296_P_12407_20220304_20220304: DSM=(3980, 4000)  valid=37.4%  (4404s elapsed)
+17:56:50 INFO   RMSE=0.069m  MAE=0.022m  E_T1=3.67%  E_T2=0.99%  E_tot=1.17%  err>0.5m=0.3%  err>1.0m=0.0%  [per-cell]
+17:56:51 INFO [60/200] EN_ST6296_P_12408_20220415_20220420: DSM=(2361, 1412)  valid=20.6%  (4547s elapsed)
+17:57:20 INFO   RMSE=0.128m  MAE=0.045m  E_T1=4.92%  E_T2=1.14%  E_tot=1.60%  err>0.5m=1.6%  err>1.0m=0.1%  [per-cell]
+17:57:21 INFO [61/200] EN_ST6298_P_12407_20220304_20220304: DSM=(4000, 4000)  valid=58.5%  (4577s elapsed)
+17:59:44 INFO   RMSE=0.017m  MAE=0.008m  E_T1=5.89%  E_T2=0.60%  E_tot=0.65%  err>0.5m=0.0%  err>1.0m=0.0%  [per-cell]
+18:00:23 INFO   viz → EN_ST6298_P_12407_20220304_20220304.png (14.3 MB)
+18:00:24 INFO [62/200] EN_SU4206_P_12436_20220304_20220304: DSM=(4000, 4000)  valid=38.3%  (4760s elapsed)
+18:02:48 INFO   RMSE=0.357m  MAE=0.185m  E_T1=1.95%  E_T2=2.14%  E_tot=2.05%  err>0.5m=11.9%  err>1.0m=2.0%  [per-cell]
+18:03:05 INFO   viz → EN_SU4206_P_12436_20220304_20220304.png (21.2 MB)
+18:03:06 INFO [63/200] EN_SU4600_P_12436_20220318_20220318: DSM=(4000, 4000)  valid=49.9%  (4922s elapsed)
+18:05:30 INFO   RMSE=0.251m  MAE=0.130m  E_T1=2.24%  E_T2=0.90%  E_tot=1.46%  err>0.5m=6.1%  err>1.0m=0.5%  [per-cell]
+18:05:48 INFO   viz → EN_SU4600_P_12436_20220318_20220318.png (21.6 MB)
+18:05:49 INFO [64/200] EN_SU4602_P_12436_20220304_20220304: DSM=(4000, 4000)  valid=31.4%  (5085s elapsed)
+18:08:12 INFO   RMSE=1.342m  MAE=0.216m  E_T1=2.41%  E_T2=4.43%  E_tot=3.85%  err>0.5m=6.4%  err>1.0m=2.4%  [per-cell]
+18:08:13 INFO [65/200] EN_SU4606_P_12440_20220319_20220319: DSM=(4000, 2739)  valid=24.2%  (5229s elapsed)
+18:09:50 INFO   RMSE=0.279m  MAE=0.117m  E_T1=1.83%  E_T2=2.86%  E_tot=2.47%  err>0.5m=5.1%  err>1.0m=1.4%  [per-cell]
+18:09:51 INFO [66/200] EN_SU6002_P_12443_20220204_20220204: DSM=(4000, 4000)  valid=44.4%  (5327s elapsed)
+18:12:14 INFO   RMSE=0.152m  MAE=0.038m  E_T1=4.15%  E_T2=0.67%  E_tot=1.05%  err>0.5m=0.9%  err>1.0m=0.3%  [per-cell]
+18:12:33 INFO   viz → EN_SU6002_P_12443_20220204_20220204.png (17.5 MB)
+18:12:34 INFO [67/200] EN_SU6004_P_12443_20220204_20220204: DSM=(4000, 4000)  valid=36.4%  (5490s elapsed)
+18:14:57 INFO   RMSE=0.114m  MAE=0.049m  E_T1=1.06%  E_T2=0.72%  E_tot=0.80%  err>0.5m=0.7%  err>1.0m=0.1%  [per-cell]
+18:14:58 INFO [68/200] EN_SW7224_P_12392_20220304_20220305: DSM=(3141, 4000)  valid=41.2%  (5634s elapsed)
+18:16:50 INFO   RMSE=0.310m  MAE=0.152m  E_T1=1.51%  E_T2=1.41%  E_tot=1.44%  err>0.5m=10.6%  err>1.0m=1.4%  [per-cell]
+18:16:50 INFO [69/200] EN_SW7541_P_12501_20220112_20220112: DSM=(2000, 2000)  valid=95.6%  (5746s elapsed)
+18:17:23 INFO   RMSE=0.144m  MAE=0.058m  E_T1=1.79%  E_T2=1.38%  E_tot=1.51%  err>0.5m=1.3%  err>1.0m=0.3%  [per-cell]
+18:17:24 INFO [70/200] EN_SW8240_P_12382_20220305_20220305: DSM=(4000, 4000)  valid=55.4%  (5780s elapsed)
+18:19:48 INFO   RMSE=0.228m  MAE=0.112m  E_T1=1.83%  E_T2=1.00%  E_tot=1.26%  err>0.5m=5.4%  err>1.0m=0.6%  [per-cell]
+18:20:05 INFO   viz → EN_SW8240_P_12382_20220305_20220305.png (23.2 MB)
+18:20:05 INFO [71/200] EN_SW5626_P_12770_20221008_20221008: DSM=(2917, 867)  valid=23.7%  (5942s elapsed)
+18:20:25 INFO   RMSE=0.101m  MAE=0.057m  E_T1=21.02%  E_T2=9.68%  E_tot=9.91%  err>0.5m=0.2%  err>1.0m=0.0%  [per-cell]
+18:20:26 INFO [72/200] EN_SW7542_P_12501_20220112_20220112: DSM=(2000, 2000)  valid=94.6%  (5962s elapsed)
+18:20:59 INFO   RMSE=0.429m  MAE=0.129m  E_T1=3.54%  E_T2=5.34%  E_tot=4.63%  err>0.5m=4.2%  err>1.0m=1.2%  [per-cell]
+18:20:59 INFO [73/200] EN_SW7543_P_12501_20220112_20220112: DSM=(2000, 2000)  valid=95.2%  (5995s elapsed)
+18:21:33 INFO   RMSE=0.161m  MAE=0.076m  E_T1=1.08%  E_T2=1.11%  E_tot=1.10%  err>0.5m=2.0%  err>1.0m=0.3%  [per-cell]
+18:21:33 INFO [74/200] EN_SW7544_P_12501_20220112_20220112: DSM=(2000, 2000)  valid=93.0%  (6029s elapsed)
+18:22:06 INFO   RMSE=0.165m  MAE=0.064m  E_T1=2.04%  E_T2=1.36%  E_tot=1.55%  err>0.5m=1.7%  err>1.0m=0.4%  [per-cell]
+18:22:06 INFO [75/200] EN_SW7547_P_12501_20220112_20220112: DSM=(2000, 2000)  valid=91.5%  (6063s elapsed)
+18:22:40 INFO   RMSE=0.323m  MAE=0.063m  E_T1=3.46%  E_T2=1.67%  E_tot=1.92%  err>0.5m=1.7%  err>1.0m=0.9%  [per-cell]
+18:22:41 INFO [76/200] EN_SW7816_P_12392_20220304_20220305: DSM=(4000, 3715)  valid=36.4%  (6097s elapsed)
+18:24:55 INFO   RMSE=0.206m  MAE=0.069m  E_T1=9.44%  E_T2=3.74%  E_tot=4.73%  err>0.5m=2.1%  err>1.0m=0.7%  [per-cell]
+18:24:55 INFO [77/200] EN_SW7820_P_12392_20220304_20220305: DSM=(4000, 1462)  valid=31.6%  (6231s elapsed)
+18:25:46 INFO   RMSE=0.165m  MAE=0.075m  E_T1=2.44%  E_T2=1.02%  E_tot=1.43%  err>0.5m=2.2%  err>1.0m=0.3%  [per-cell]
+18:25:46 INFO [78/200] EN_SW7830_P_12382_20220305_20220305: DSM=(4000, 2288)  valid=31.3%  (6282s elapsed)
+18:27:05 INFO   RMSE=0.388m  MAE=0.164m  E_T1=2.85%  E_T2=3.09%  E_tot=3.00%  err>0.5m=9.6%  err>1.0m=1.8%  [per-cell]
+18:27:05 INFO [79/200] EN_SW7847_P_12501_20220112_20220112: DSM=(2000, 2000)  valid=91.2%  (6361s elapsed)
+18:27:38 INFO   RMSE=0.097m  MAE=0.038m  E_T1=1.24%  E_T2=0.65%  E_tot=0.76%  err>0.5m=0.6%  err>1.0m=0.1%  [per-cell]
+18:27:39 INFO [80/200] EN_SW8232_P_12382_20220305_20220305: DSM=(4000, 4000)  valid=24.1%  (6395s elapsed)
+18:30:01 INFO   RMSE=0.639m  MAE=0.123m  E_T1=5.01%  E_T2=2.01%  E_tot=2.44%  err>0.5m=5.3%  err>1.0m=2.6%  [per-cell]
+18:30:02 INFO [81/200] EN_SW8234_P_12382_20220305_20220305: DSM=(4000, 4000)  valid=25.2%  (6538s elapsed)
+18:32:25 INFO   RMSE=0.179m  MAE=0.045m  E_T1=6.06%  E_T2=0.57%  E_tot=1.08%  err>0.5m=1.9%  err>1.0m=0.5%  [per-cell]
+18:32:25 INFO [82/200] EN_SW8239_P_12501_20220112_20220112: DSM=(1297, 2000)  valid=91.8%  (6681s elapsed)
+18:32:48 INFO   RMSE=0.115m  MAE=0.057m  E_T1=3.06%  E_T2=0.40%  E_tot=1.23%  err>0.5m=0.9%  err>1.0m=0.1%  [per-cell]
+18:32:49 INFO [83/200] EN_SW8242_P_12382_20220305_20220305: DSM=(4000, 4000)  valid=49.5%  (6705s elapsed)
+18:35:13 INFO   RMSE=0.286m  MAE=0.121m  E_T1=1.74%  E_T2=1.35%  E_tot=1.47%  err>0.5m=6.4%  err>1.0m=1.3%  [per-cell]
+18:35:30 INFO   viz → EN_SW8242_P_12382_20220305_20220305.png (22.2 MB)
+18:35:30 INFO [84/200] EN_SW8242_P_12501_20220112_20220112: DSM=(2000, 2000)  valid=93.6%  (6866s elapsed)
+18:36:04 INFO   RMSE=0.538m  MAE=0.077m  E_T1=0.73%  E_T2=0.90%  E_tot=0.87%  err>0.5m=1.5%  err>1.0m=0.6%  [per-cell]
+18:36:04 INFO [85/200] EN_SW8247_P_12501_20220112_20220112: DSM=(2000, 2000)  valid=94.6%  (6900s elapsed)
+18:36:38 INFO   RMSE=0.171m  MAE=0.091m  E_T1=3.38%  E_T2=2.14%  E_tot=2.74%  err>0.5m=2.3%  err>1.0m=0.3%  [per-cell]
+18:36:38 INFO [86/200] EN_SW8630_P_12382_20220305_20220305: DSM=(3574, 2565)  valid=15.0%  (6934s elapsed)
+18:37:58 INFO   RMSE=0.170m  MAE=0.028m  E_T1=20.02%  E_T2=0.46%  E_tot=0.67%  err>0.5m=0.2%  err>1.0m=0.1%  [per-cell]
+18:37:59 INFO [87/200] EN_SW8634_P_12382_20220305_20220305: DSM=(4000, 4000)  valid=47.7%  (7015s elapsed)
+18:40:23 INFO   RMSE=0.271m  MAE=0.108m  E_T1=4.22%  E_T2=2.24%  E_tot=2.83%  err>0.5m=4.5%  err>1.0m=0.9%  [per-cell]
+18:40:41 INFO   viz → EN_SW8634_P_12382_20220305_20220305.png (23.2 MB)
+18:40:41 INFO [88/200] EN_SW9038_P_12382_20220305_20220305: DSM=(3549, 4000)  valid=32.1%  (7177s elapsed)
+18:42:47 INFO   RMSE=0.293m  MAE=0.103m  E_T1=2.72%  E_T2=1.96%  E_tot=2.11%  err>0.5m=6.0%  err>1.0m=1.5%  [per-cell]
+18:42:47 INFO [89/200] EN_SW9074_P_12764_20221010_20221011: DSM=(2435, 592)  valid=23.1%  (7303s elapsed)
+18:42:59 INFO   RMSE=0.115m  MAE=0.037m  E_T1=4.28%  E_T2=1.46%  E_tot=1.72%  err>0.5m=0.9%  err>1.0m=0.2%  [per-cell]
+18:43:00 INFO [90/200] EN_SX7436_P_12386_20220304_20220304: DSM=(3957, 3642)  valid=30.9%  (7316s elapsed)
+18:45:06 INFO   RMSE=0.860m  MAE=0.170m  E_T1=7.35%  E_T2=3.81%  E_tot=4.41%  err>0.5m=6.1%  err>1.0m=2.8%  [per-cell]
+18:45:06 INFO [91/200] EN_SX7434_P_12386_20220304_20220304: DSM=(2156, 2543)  valid=11.3%  (7442s elapsed)
+18:45:52 INFO   RMSE=0.071m  MAE=0.034m  E_T1=26.29%  E_T2=4.13%  E_tot=4.25%  err>0.5m=0.2%  err>1.0m=0.0%  [per-cell]
+18:45:53 INFO [92/200] EN_SX8038_P_12386_20220304_20220304: DSM=(4000, 4000)  valid=39.8%  (7489s elapsed)
+18:48:17 INFO   RMSE=0.446m  MAE=0.124m  E_T1=5.56%  E_T2=2.00%  E_tot=2.79%  err>0.5m=5.5%  err>1.0m=1.6%  [per-cell]
+18:48:34 INFO   viz → EN_SX8038_P_12386_20220304_20220304.png (18.7 MB)
+18:48:34 INFO [93/200] EN_SX8054_P_12380_20220318_20220319: DSM=(655, 1189)  valid=30.3%  (7650s elapsed)
+18:48:41 INFO   RMSE=0.501m  MAE=0.255m  E_T1=2.65%  E_T2=5.51%  E_tot=4.04%  err>0.5m=15.1%  err>1.0m=4.3%  [per-cell]
+18:48:41 INFO [94/200] EN_SX9052_P_12380_20220331_20220331: DSM=(3520, 2335)  valid=19.6%  (7657s elapsed)
+18:49:53 INFO   RMSE=0.561m  MAE=0.109m  E_T1=16.67%  E_T2=1.72%  E_tot=3.66%  err>0.5m=3.8%  err>1.0m=1.2%  [per-cell]
+18:49:54 INFO [95/200] EN_SX9056_P_12380_20220318_20220319: DSM=(2497, 1246)  valid=15.3%  (7730s elapsed)
+18:50:19 INFO   RMSE=0.478m  MAE=0.159m  E_T1=2.79%  E_T2=5.81%  E_tot=5.18%  err>0.5m=9.3%  err>1.0m=3.2%  [per-cell]
+18:50:20 INFO [96/200] EN_SX9056_P_12385_20220305_20220305: DSM=(4000, 4000)  valid=35.8%  (7756s elapsed)
+18:52:45 INFO   RMSE=0.474m  MAE=0.162m  E_T1=2.26%  E_T2=6.73%  E_tot=5.21%  err>0.5m=8.0%  err>1.0m=2.0%  [per-cell]
+18:52:45 INFO [97/200] EN_SX9060_P_12385_20220305_20220305: DSM=(4000, 2548)  valid=10.9%  (7901s elapsed)
+18:54:13 INFO   RMSE=0.085m  MAE=0.051m  E_T1=9.77%  E_T2=7.46%  E_tot=7.50%  err>0.5m=0.1%  err>1.0m=0.0%  [per-cell]
+18:54:14 INFO [98/200] EN_SX9062_P_12385_20220305_20220305: DSM=(4000, 2901)  valid=28.3%  (7990s elapsed)
+18:55:56 INFO   RMSE=0.992m  MAE=0.281m  E_T1=2.96%  E_T2=6.60%  E_tot=5.52%  err>0.5m=13.0%  err>1.0m=6.0%  [per-cell]
+18:55:57 INFO [99/200] EN_SX9062_P_12820_20221009_20221009: DSM=(2566, 1890)  valid=22.2%  (8093s elapsed)
+18:56:39 INFO   RMSE=0.962m  MAE=0.216m  E_T1=4.19%  E_T2=5.36%  E_tot=5.14%  err>0.5m=8.4%  err>1.0m=4.2%  [per-cell]
+18:56:39 INFO [100/200] EN_SX9071_P_12819_20221011_20221011: DSM=(1576, 2000)  valid=33.2%  (8135s elapsed)
+18:57:05 INFO   RMSE=1.264m  MAE=0.209m  E_T1=6.49%  E_T2=2.91%  E_tot=3.77%  err>0.5m=5.8%  err>1.0m=2.6%  [per-cell]
+18:57:06 INFO [101/200] EN_SX9454_P_12380_20220331_20220331: DSM=(3030, 1405)  valid=10.4%  (8162s elapsed)
+18:57:40 INFO   RMSE=2.345m  MAE=0.278m  E_T1=25.47%  E_T2=7.13%  E_tot=7.65%  err>0.5m=2.7%  err>1.0m=1.6%  [per-cell]
+18:57:41 INFO [102/200] EN_SX9462_P_12385_20220205_20220205: DSM=(3745, 4000)  valid=44.6%  (8197s elapsed)
+18:59:55 INFO   RMSE=0.893m  MAE=0.157m  E_T1=6.82%  E_T2=6.33%  E_tot=6.41%  err>0.5m=4.4%  err>1.0m=2.0%  [per-cell]
+19:00:13 INFO   viz → EN_SX9462_P_12385_20220205_20220205.png (17.9 MB)
+19:00:13 INFO [103/200] EN_SX9472_P_12821_20221011_20221011: DSM=(2000, 2000)  valid=65.4%  (8349s elapsed)
+19:00:47 INFO   RMSE=0.236m  MAE=0.041m  E_T1=2.86%  E_T2=1.03%  E_tot=1.18%  err>0.5m=0.9%  err>1.0m=0.4%  [per-cell]
+19:00:47 INFO [104/200] EN_SX9473_P_12819_20221011_20221011: DSM=(1134, 924)  valid=81.6%  (8383s elapsed)
+19:00:55 INFO   RMSE=1.178m  MAE=0.346m  E_T1=2.65%  E_T2=8.00%  E_tot=5.18%  err>0.5m=14.1%  err>1.0m=5.9%  [per-cell]
+19:00:56 INFO [105/200] EN_SX9474_P_12779_20221010_20221010: DSM=(4000, 2953)  valid=34.1%  (8392s elapsed)
+19:02:42 INFO   RMSE=1.435m  MAE=0.327m  E_T1=3.21%  E_T2=3.28%  E_tot=3.26%  err>0.5m=15.3%  err>1.0m=7.2%  [per-cell]
+19:02:42 INFO [106/200] EN_SY8478_P_12417_20220304_20220304: DSM=(2552, 4000)  valid=17.2%  (8498s elapsed)
+19:04:10 INFO   RMSE=0.179m  MAE=0.051m  E_T1=11.04%  E_T2=3.47%  E_tot=3.80%  err>0.5m=1.0%  err>1.0m=0.4%  [per-cell]
+19:04:11 INFO [107/200] EN_SZ8292_P_12671_20221009_20221009: DSM=(3799, 4000)  valid=14.6%  (8587s elapsed)
+19:06:25 INFO   RMSE=0.150m  MAE=0.051m  E_T1=3.13%  E_T2=3.52%  E_tot=3.51%  err>0.5m=0.9%  err>1.0m=0.3%  [per-cell]
+19:06:25 INFO [108/200] EN_SZ9098_P_12447_20220204_20220204: DSM=(1881, 4000)  valid=27.5%  (8722s elapsed)
+19:07:30 INFO   RMSE=0.176m  MAE=0.086m  E_T1=0.92%  E_T2=0.71%  E_tot=0.79%  err>0.5m=2.5%  err>1.0m=0.2%  [per-cell]
+19:07:30 INFO [109/200] EN_TA0835_P_12551_20220118_20220118: DSM=(2000, 2000)  valid=93.7%  (8786s elapsed)
+19:08:04 INFO   RMSE=0.084m  MAE=0.034m  E_T1=3.16%  E_T2=0.42%  E_tot=1.11%  err>0.5m=0.3%  err>1.0m=0.1%  [per-cell]
+19:08:04 INFO [110/200] EN_TA0234_P_12551_20220118_20220118: DSM=(2000, 2000)  valid=95.7%  (8820s elapsed)
+19:08:37 INFO   RMSE=0.079m  MAE=0.032m  E_T1=2.26%  E_T2=0.53%  E_tot=0.85%  err>0.5m=0.3%  err>1.0m=0.1%  [per-cell]
+19:08:38 INFO [111/200] EN_TA0239_P_12551_20220118_20220118: DSM=(2000, 2000)  valid=94.0%  (8854s elapsed)
+19:09:11 INFO   RMSE=0.075m  MAE=0.035m  E_T1=1.30%  E_T2=0.15%  E_tot=0.45%  err>0.5m=0.2%  err>1.0m=0.0%  [per-cell]
+19:09:11 INFO [112/200] EN_TA0734_P_12551_20220118_20220118: DSM=(2000, 2000)  valid=94.0%  (8887s elapsed)
+19:09:44 INFO   RMSE=0.070m  MAE=0.029m  E_T1=2.61%  E_T2=0.61%  E_tot=1.00%  err>0.5m=0.3%  err>1.0m=0.1%  [per-cell]
+19:09:45 INFO [113/200] EN_TA0736_P_12551_20220118_20220118: DSM=(2000, 2000)  valid=97.1%  (8921s elapsed)
+19:10:18 INFO   RMSE=0.078m  MAE=0.027m  E_T1=2.81%  E_T2=0.53%  E_tot=1.01%  err>0.5m=0.3%  err>1.0m=0.1%  [per-cell]
+19:10:18 INFO [114/200] EN_TA0830_P_12551_20220118_20220118: DSM=(2000, 2000)  valid=95.6%  (8954s elapsed)
+19:10:51 INFO   RMSE=0.159m  MAE=0.061m  E_T1=1.22%  E_T2=0.23%  E_tot=0.81%  err>0.5m=0.5%  err>1.0m=0.1%  [per-cell]
+19:10:52 INFO [115/200] EN_TA0832_P_12551_20220118_20220118: DSM=(2000, 2000)  valid=93.6%  (8988s elapsed)
+19:11:25 INFO   RMSE=0.079m  MAE=0.038m  E_T1=1.36%  E_T2=0.35%  E_tot=0.73%  err>0.5m=0.2%  err>1.0m=0.0%  [per-cell]
+19:11:25 INFO [116/200] EN_TA0834_P_12551_20220118_20220118: DSM=(2000, 2000)  valid=95.5%  (9021s elapsed)
+19:11:58 INFO   RMSE=0.126m  MAE=0.048m  E_T1=1.40%  E_T2=0.52%  E_tot=0.85%  err>0.5m=0.4%  err>1.0m=0.1%  [per-cell]
+19:11:59 INFO [117/200] EN_TA1654_P_12572_20220303_20220303: DSM=(3498, 1325)  valid=16.5%  (9055s elapsed)
+19:12:38 INFO   RMSE=0.083m  MAE=0.018m  E_T1=4.92%  E_T2=1.04%  E_tot=1.16%  err>0.5m=0.7%  err>1.0m=0.2%  [per-cell]
+19:12:39 INFO [118/200] EN_TA1666_P_12572_20220303_20220303: DSM=(1414, 980)  valid=16.6%  (9095s elapsed)
+19:12:50 INFO   RMSE=0.341m  MAE=0.192m  E_T1=1.21%  E_T2=3.40%  E_tot=2.34%  err>0.5m=12.5%  err>1.0m=2.1%  [per-cell]
+19:12:50 INFO [119/200] EN_TA1672_P_12670_20221008_20221008: DSM=(369, 808)  valid=16.9%  (9106s elapsed)
+19:12:52 INFO   RMSE=0.064m  MAE=0.015m  E_T1=nan%  E_T2=0.20%  E_tot=0.80%  err>0.5m=0.3%  err>1.0m=0.1%  [per-cell]
+19:12:53 INFO [120/200] EN_TA1852_P_12572_20220303_20220303: DSM=(4000, 3814)  valid=21.0%  (9109s elapsed)
+19:15:06 INFO   RMSE=0.123m  MAE=0.041m  E_T1=2.72%  E_T2=2.52%  E_tot=2.54%  err>0.5m=1.0%  err>1.0m=0.2%  [per-cell]
+19:15:06 INFO [121/200] EN_TA1872_P_12572_20220303_20220303: DSM=(1910, 4000)  valid=21.2%  (9243s elapsed)
+19:16:10 INFO   RMSE=0.095m  MAE=0.031m  E_T1=4.75%  E_T2=2.33%  E_tot=2.44%  err>0.5m=1.0%  err>1.0m=0.1%  [per-cell]
+19:16:11 INFO [122/200] EN_TA1872_P_12670_20221008_20221008: DSM=(2057, 4000)  valid=23.3%  (9307s elapsed)
+19:17:24 INFO   RMSE=0.120m  MAE=0.032m  E_T1=2.98%  E_T2=1.92%  E_tot=1.98%  err>0.5m=1.0%  err>1.0m=0.2%  [per-cell]
+19:17:25 INFO [123/200] EN_TA1874_P_12572_20220303_20220303: DSM=(2835, 4000)  valid=24.3%  (9381s elapsed)
+19:19:06 INFO   RMSE=4.422m  MAE=0.681m  E_T1=13.91%  E_T2=3.68%  E_tot=4.63%  err>0.5m=5.4%  err>1.0m=4.6%  [per-cell]
+19:19:06 INFO [124/200] EN_TA2042_P_12572_20220303_20220303: DSM=(313, 225)  valid=18.1%  (9482s elapsed)
+19:19:07 INFO   RMSE=0.034m  MAE=0.014m  E_T1=nan%  E_T2=1.04%  E_tot=1.31%  err>0.5m=0.0%  err>1.0m=0.0%  [per-cell]
+19:19:07 INFO [125/200] EN_TA2042_P_12670_20221008_20221008: DSM=(155, 107)  valid=11.9%  (9483s elapsed)
+19:19:07 INFO   RMSE=0.044m  MAE=0.015m  E_T1=nan%  E_T2=0.80%  E_tot=0.96%  err>0.5m=0.0%  err>1.0m=0.0%  [per-cell]
+19:19:08 INFO [126/200] EN_TA2046_P_12572_20220303_20220303: DSM=(4000, 3373)  valid=24.2%  (9484s elapsed)
+19:21:07 INFO   RMSE=0.143m  MAE=0.052m  E_T1=2.51%  E_T2=2.36%  E_tot=2.38%  err>0.5m=1.7%  err>1.0m=0.3%  [per-cell]
+19:21:08 INFO [127/200] EN_TA2046_P_12670_20221008_20221008: DSM=(4000, 3396)  valid=23.6%  (9604s elapsed)
+19:23:09 INFO   RMSE=0.215m  MAE=0.066m  E_T1=1.73%  E_T2=1.65%  E_tot=1.66%  err>0.5m=3.0%  err>1.0m=0.7%  [per-cell]
+19:23:09 INFO [128/200] EN_TA2048_P_12670_20221008_20221008: DSM=(4000, 3314)  valid=23.8%  (9726s elapsed)
+19:25:05 INFO   RMSE=0.157m  MAE=0.056m  E_T1=2.09%  E_T2=1.04%  E_tot=1.18%  err>0.5m=2.3%  err>1.0m=0.3%  [per-cell]
+19:25:05 INFO [129/200] EN_TA2066_P_12572_20220303_20220303: DSM=(1183, 2182)  valid=5.9%  (9841s elapsed)
+19:25:28 INFO   RMSE=0.129m  MAE=0.083m  E_T1=3.99%  E_T2=20.22%  E_tot=17.59%  err>0.5m=0.5%  err>1.0m=0.0%  [per-cell]
+19:25:28 INFO [130/200] EN_TA2468_P_12670_20221008_20221008: DSM=(2250, 4000)  valid=23.8%  (9864s elapsed)
+19:26:47 INFO   RMSE=1.338m  MAE=0.178m  E_T1=12.60%  E_T2=2.92%  E_tot=3.27%  err>0.5m=2.5%  err>1.0m=1.8%  [per-cell]
+19:26:47 INFO [131/200] EN_TA2472_P_12572_20220303_20220303: DSM=(1746, 3998)  valid=10.4%  (9943s elapsed)
+19:27:47 INFO   RMSE=2.244m  MAE=0.352m  E_T1=11.35%  E_T2=9.92%  E_tot=10.10%  err>0.5m=6.5%  err>1.0m=3.5%  [per-cell]
+19:27:47 INFO [132/200] EN_TA3820_P_12572_20220303_20220303: DSM=(4000, 4000)  valid=24.9%  (10004s elapsed)
+19:30:10 INFO   RMSE=0.116m  MAE=0.033m  E_T1=8.94%  E_T2=2.15%  E_tot=2.53%  err>0.5m=1.0%  err>1.0m=0.3%  [per-cell]
+19:30:11 INFO [133/200] EN_TA3820_P_12670_20221008_20221008: DSM=(4000, 4000)  valid=21.2%  (10147s elapsed)
+19:32:34 INFO   RMSE=0.239m  MAE=0.042m  E_T1=6.92%  E_T2=1.91%  E_tot=2.16%  err>0.5m=1.4%  err>1.0m=0.6%  [per-cell]
+19:32:34 INFO [134/200] EN_TA3822_P_12670_20221008_20221008: DSM=(4000, 3699)  valid=14.4%  (10290s elapsed)
+19:34:43 INFO   RMSE=0.128m  MAE=0.030m  E_T1=12.47%  E_T2=1.58%  E_tot=1.85%  err>0.5m=0.7%  err>1.0m=0.3%  [per-cell]
+19:34:43 INFO [135/200] EN_TA3824_P_12670_20221008_20221008: DSM=(156, 116)  valid=2.0%  (10419s elapsed)
+19:34:43 INFO   RMSE=0.097m  MAE=0.067m  E_T1=nan%  E_T2=nan%  E_tot=8.22%  err>0.5m=0.0%  err>1.0m=0.0%  [per-cell]
+19:34:44 INFO [136/200] EN_TF5032_P_12489_20220105_20220105: DSM=(4000, 4000)  valid=40.6%  (10420s elapsed)
+19:37:08 INFO   RMSE=0.053m  MAE=0.029m  E_T1=5.32%  E_T2=3.58%  E_tot=3.60%  err>0.5m=0.0%  err>1.0m=0.0%  [per-cell]
+19:37:09 INFO [137/200] EN_TF5234_P_12489_20220105_20220105: DSM=(4000, 4000)  valid=32.0%  (10565s elapsed)
+19:39:32 INFO   RMSE=0.104m  MAE=0.064m  E_T1=11.46%  E_T2=12.25%  E_tot=12.23%  err>0.5m=0.1%  err>1.0m=0.0%  [per-cell]
+19:39:32 INFO [138/200] EN_TF2110nw_P_12563_20220105_20220105: DSM=(113, 232)  valid=44.2%  (10708s elapsed)
+19:39:33 INFO   RMSE=0.042m  MAE=0.016m  E_T1=nan%  E_T2=0.12%  E_tot=1.67%  err>0.5m=0.1%  err>1.0m=0.0%  [per-cell]
+19:39:33 INFO [139/200] EN_TF2410ne_P_12563_20220105_20220105: DSM=(465, 249)  valid=47.2%  (10709s elapsed)
+19:39:33 INFO   RMSE=0.099m  MAE=0.049m  E_T1=2.02%  E_T2=0.10%  E_tot=1.00%  err>0.5m=0.0%  err>1.0m=0.0%  [per-cell]
+19:39:33 INFO [140/200] EN_TF2411nw_P_12563_20220105_20220105: DSM=(1000, 1000)  valid=99.2%  (10709s elapsed)
+19:39:41 INFO   RMSE=0.065m  MAE=0.018m  E_T1=11.85%  E_T2=0.68%  E_tot=1.25%  err>0.5m=0.3%  err>1.0m=0.1%  [per-cell]
+19:39:41 INFO [141/200] EN_TF2411sw_P_12563_20220105_20220105: DSM=(1000, 1000)  valid=87.2%  (10717s elapsed)
+19:39:48 INFO   RMSE=0.042m  MAE=0.017m  E_T1=7.45%  E_T2=0.72%  E_tot=1.11%  err>0.5m=0.1%  err>1.0m=0.0%  [per-cell]
+19:39:48 INFO [142/200] EN_TF2415se_P_12563_20220105_20220105: DSM=(1000, 1000)  valid=100.0%  (10724s elapsed)
+19:39:55 INFO   RMSE=0.049m  MAE=0.019m  E_T1=15.54%  E_T2=0.83%  E_tot=1.61%  err>0.5m=0.2%  err>1.0m=0.0%  [per-cell]
+19:39:56 INFO [143/200] EN_TF2418ne_P_12563_20220105_20220105: DSM=(1000, 1000)  valid=99.9%  (10732s elapsed)
+19:40:03 INFO   RMSE=0.034m  MAE=0.016m  E_T1=13.09%  E_T2=0.61%  E_tot=1.32%  err>0.5m=0.0%  err>1.0m=0.0%  [per-cell]
+19:40:03 INFO [144/200] EN_TF2420se_P_12563_20220105_20220105: DSM=(1000, 1000)  valid=92.0%  (10739s elapsed)
+19:40:10 INFO   RMSE=0.041m  MAE=0.019m  E_T1=5.98%  E_T2=0.98%  E_tot=1.40%  err>0.5m=0.0%  err>1.0m=0.0%  [per-cell]
+19:40:10 INFO [145/200] EN_TF2420sw_P_12563_20220105_20220105: DSM=(1000, 1000)  valid=99.7%  (10746s elapsed)
+19:40:18 INFO   RMSE=0.076m  MAE=0.030m  E_T1=3.59%  E_T2=0.86%  E_tot=1.48%  err>0.5m=0.3%  err>1.0m=0.1%  [per-cell]
+19:40:18 INFO [146/200] EN_TF2422se_P_12563_20220105_20220105: DSM=(278, 165)  valid=71.8%  (10754s elapsed)
+19:40:18 INFO   RMSE=0.115m  MAE=0.052m  E_T1=0.91%  E_T2=0.19%  E_tot=0.52%  err>0.5m=0.4%  err>1.0m=0.0%  [per-cell]
+19:40:18 INFO [147/200] EN_TF2700sw_P_12564_20220107_20220113: DSM=(1000, 1000)  valid=99.8%  (10754s elapsed)
+19:40:26 INFO   RMSE=0.049m  MAE=0.018m  E_T1=10.64%  E_T2=0.49%  E_tot=1.03%  err>0.5m=0.2%  err>1.0m=0.0%  [per-cell]
+19:40:26 INFO [148/200] EN_TF2715nw_P_12563_20220105_20220105: DSM=(1000, 798)  valid=80.9%  (10762s elapsed)
+19:40:32 INFO   RMSE=0.032m  MAE=0.017m  E_T1=54.57%  E_T2=0.22%  E_tot=0.80%  err>0.5m=0.0%  err>1.0m=0.0%  [per-cell]
+19:40:32 INFO [149/200] EN_TF2715sw_P_12563_20220105_20220105: DSM=(884, 826)  valid=53.9%  (10768s elapsed)
+19:40:37 INFO   RMSE=0.031m  MAE=0.012m  E_T1=50.79%  E_T2=0.41%  E_tot=1.10%  err>0.5m=0.0%  err>1.0m=0.0%  [per-cell]
+19:40:37 INFO [150/200] EN_TF4102sw_P_12564_20220107_20220113: DSM=(590, 902)  valid=72.5%  (10774s elapsed)
+19:40:42 INFO   RMSE=0.041m  MAE=0.011m  E_T1=12.54%  E_T2=0.37%  E_tot=0.61%  err>0.5m=0.0%  err>1.0m=0.0%  [per-cell]
+19:40:42 INFO [151/200] EN_TF4490_P_12831_20221124_20221124: DSM=(2601, 2119)  valid=21.0%  (10778s elapsed)
+19:41:29 INFO   RMSE=0.081m  MAE=0.024m  E_T1=5.34%  E_T2=1.64%  E_tot=1.80%  err>0.5m=0.6%  err>1.0m=0.1%  [per-cell]
+19:41:29 INFO [152/200] EN_TF5000nw_P_12535_20220127_20220130: DSM=(1000, 814)  valid=54.2%  (10826s elapsed)
+19:41:37 INFO   RMSE=0.209m  MAE=0.069m  E_T1=10.26%  E_T2=0.81%  E_tot=3.19%  err>0.5m=2.9%  err>1.0m=1.5%  [per-cell]
+19:41:37 INFO [153/200] EN_TF5042_P_12489_20220105_20220105: DSM=(2955, 4000)  valid=24.8%  (10833s elapsed)
+19:44:04 INFO   RMSE=0.068m  MAE=0.044m  E_T1=12.01%  E_T2=7.04%  E_tot=7.17%  err>0.5m=0.0%  err>1.0m=0.0%  [per-cell]
+19:44:04 INFO [154/200] EN_TF5078_P_12834_20221125_20221125: DSM=(2591, 1034)  valid=19.3%  (10980s elapsed)
+19:44:28 INFO   RMSE=0.169m  MAE=0.060m  E_T1=1.79%  E_T2=2.36%  E_tot=2.26%  err>0.5m=2.1%  err>1.0m=0.5%  [per-cell]
+19:44:28 INFO [155/200] EN_TF5088_P_12607_20220416_20220421: DSM=(4000, 2770)  valid=6.6%  (11004s elapsed)
+19:46:05 INFO   RMSE=0.113m  MAE=0.067m  E_T1=15.65%  E_T2=9.32%  E_tot=9.46%  err>0.5m=0.4%  err>1.0m=0.0%  [per-cell]
+19:46:06 INFO [156/200] EN_TF5088_P_12831_20221124_20221124: DSM=(4000, 2642)  valid=28.7%  (11102s elapsed)
+19:47:38 INFO   RMSE=0.061m  MAE=0.034m  E_T1=5.81%  E_T2=4.19%  E_tot=4.26%  err>0.5m=0.0%  err>1.0m=0.0%  [per-cell]
+19:47:38 INFO [157/200] EN_TF5200nw_P_12535_20220127_20220130: DSM=(1000, 1000)  valid=98.3%  (11194s elapsed)
+19:47:46 INFO   RMSE=0.030m  MAE=0.013m  E_T1=12.73%  E_T2=0.42%  E_tot=0.91%  err>0.5m=0.0%  err>1.0m=0.0%  [per-cell]
+19:47:46 INFO [158/200] EN_TF5200se_P_12535_20220127_20220130: DSM=(1000, 1000)  valid=99.7%  (11202s elapsed)
+19:47:53 INFO   RMSE=0.069m  MAE=0.032m  E_T1=1.66%  E_T2=0.50%  E_tot=0.76%  err>0.5m=0.4%  err>1.0m=0.0%  [per-cell]
+19:47:53 INFO [159/200] EN_TF5201se_P_12535_20220127_20220130: DSM=(1000, 1000)  valid=99.4%  (11209s elapsed)
+19:48:00 INFO   RMSE=0.020m  MAE=0.009m  E_T1=19.62%  E_T2=0.21%  E_tot=0.37%  err>0.5m=0.0%  err>1.0m=0.0%  [per-cell]
+19:48:01 INFO [160/200] EN_TF5278_P_12834_20221125_20221125: DSM=(4000, 4000)  valid=38.5%  (11217s elapsed)
+19:51:12 INFO   RMSE=0.106m  MAE=0.026m  E_T1=6.50%  E_T2=1.40%  E_tot=1.68%  err>0.5m=0.6%  err>1.0m=0.3%  [per-cell]
+19:51:13 INFO [161/200] EN_TF5280_P_12607_20220416_20220421: DSM=(4000, 4000)  valid=32.1%  (11409s elapsed)
+19:54:39 INFO   RMSE=0.113m  MAE=0.050m  E_T1=1.81%  E_T2=5.41%  E_tot=4.93%  err>0.5m=0.6%  err>1.0m=0.1%  [per-cell]
+19:54:40 INFO [162/200] EN_TF5282_P_12607_20220416_20220421: DSM=(4000, 4000)  valid=15.2%  (11616s elapsed)
+19:58:05 INFO   RMSE=0.093m  MAE=0.045m  E_T1=5.51%  E_T2=6.14%  E_tot=6.11%  err>0.5m=0.3%  err>1.0m=0.0%  [per-cell]
+19:58:05 INFO [163/200] EN_TF5400sw_P_12535_20220127_20220130: DSM=(1000, 1000)  valid=99.7%  (11821s elapsed)
+19:58:16 INFO   RMSE=0.029m  MAE=0.016m  E_T1=12.78%  E_T2=0.20%  E_tot=0.54%  err>0.5m=0.0%  err>1.0m=0.0%  [per-cell]
+19:58:16 INFO [164/200] EN_TF5401nw_P_12535_20220127_20220130: DSM=(1000, 1000)  valid=91.3%  (11832s elapsed)
+19:58:26 INFO   RMSE=0.051m  MAE=0.013m  E_T1=12.54%  E_T2=0.22%  E_tot=0.49%  err>0.5m=0.1%  err>1.0m=0.0%  [per-cell]
+19:58:27 INFO [165/200] EN_TF5424_P_12489_20220105_20220105: DSM=(3076, 4000)  valid=36.2%  (11843s elapsed)
+20:01:07 INFO   RMSE=0.073m  MAE=0.021m  E_T1=9.21%  E_T2=1.68%  E_tot=1.98%  err>0.5m=0.3%  err>1.0m=0.1%  [per-cell]
+20:01:07 INFO [166/200] EN_TF5440_P_12489_20220105_20220105: DSM=(3063, 4000)  valid=23.7%  (12003s elapsed)
+20:03:40 INFO   RMSE=0.105m  MAE=0.062m  E_T1=18.86%  E_T2=11.28%  E_tot=11.60%  err>0.5m=0.2%  err>1.0m=0.0%  [per-cell]
+20:03:40 INFO [167/200] EN_TF5472_P_12607_20220416_20220421: DSM=(4000, 2686)  valid=28.1%  (12156s elapsed)
+20:05:53 INFO   RMSE=0.149m  MAE=0.056m  E_T1=1.46%  E_T2=1.99%  E_tot=1.88%  err>0.5m=1.3%  err>1.0m=0.3%  [per-cell]
+20:05:53 INFO [168/200] EN_TF5482_P_12607_20220416_20220421: DSM=(933, 322)  valid=10.6%  (12289s elapsed)
+20:05:56 INFO   RMSE=0.090m  MAE=0.058m  E_T1=nan%  E_T2=9.03%  E_tot=9.40%  err>0.5m=0.0%  err>1.0m=0.0%  [per-cell]
+20:05:57 INFO [169/200] EN_TF7644_P_12838_20221209_20221209: DSM=(3051, 4000)  valid=31.4%  (12293s elapsed)
+20:08:30 INFO   RMSE=0.188m  MAE=0.064m  E_T1=12.73%  E_T2=6.41%  E_tot=7.06%  err>0.5m=3.0%  err>1.0m=1.0%  [per-cell]
+20:08:30 INFO [170/200] EN_TG3236_P_12595_20220421_20220421: DSM=(2689, 3778)  valid=10.6%  (12446s elapsed)
+20:10:40 INFO   RMSE=0.081m  MAE=0.041m  E_T1=32.34%  E_T2=4.89%  E_tot=5.25%  err>0.5m=0.1%  err>1.0m=0.0%  [per-cell]
+20:10:40 INFO [171/200] EN_TL3276ne_P_12535_20220127_20220130: DSM=(1000, 1000)  valid=100.0%  (12577s elapsed)
+20:10:51 INFO   RMSE=0.025m  MAE=0.013m  E_T1=3.19%  E_T2=0.26%  E_tot=0.35%  err>0.5m=0.0%  err>1.0m=0.0%  [per-cell]
+20:10:51 INFO [172/200] EN_TL1898se_P_12564_20220107_20220113: DSM=(644, 748)  valid=75.3%  (12587s elapsed)
+20:10:57 INFO   RMSE=0.134m  MAE=0.061m  E_T1=2.75%  E_T2=2.06%  E_tot=2.32%  err>0.5m=1.4%  err>1.0m=0.2%  [per-cell]
+20:10:57 INFO [173/200] EN_TL2098sw_P_12564_20220107_20220113: DSM=(1000, 1000)  valid=99.9%  (12593s elapsed)
+20:11:07 INFO   RMSE=0.094m  MAE=0.058m  E_T1=3.67%  E_T2=0.56%  E_tot=1.92%  err>0.5m=0.3%  err>1.0m=0.0%  [per-cell]
+20:11:07 INFO [174/200] EN_TL2198sw_P_12564_20220107_20220113: DSM=(1000, 1000)  valid=99.9%  (12603s elapsed)
+20:11:18 INFO   RMSE=0.130m  MAE=0.062m  E_T1=6.61%  E_T2=0.32%  E_tot=2.25%  err>0.5m=0.8%  err>1.0m=0.2%  [per-cell]
+20:11:18 INFO [175/200] EN_TL2199se_P_12564_20220107_20220113: DSM=(1000, 1000)  valid=88.9%  (12614s elapsed)
+20:11:29 INFO   RMSE=0.290m  MAE=0.141m  E_T1=1.64%  E_T2=7.40%  E_tot=4.38%  err>0.5m=6.0%  err>1.0m=2.2%  [per-cell]
+20:11:29 INFO [176/200] EN_TL2199sw_P_12564_20220107_20220113: DSM=(816, 1000)  valid=84.2%  (12625s elapsed)
+20:11:38 INFO   RMSE=0.108m  MAE=0.062m  E_T1=0.78%  E_T2=0.42%  E_tot=0.61%  err>0.5m=0.4%  err>1.0m=0.1%  [per-cell]
+20:11:38 INFO [177/200] EN_TL2697ne_P_12564_20220107_20220113: DSM=(430, 1000)  valid=70.4%  (12634s elapsed)
+20:11:42 INFO   RMSE=0.058m  MAE=0.033m  E_T1=0.98%  E_T2=0.29%  E_tot=0.52%  err>0.5m=0.0%  err>1.0m=0.0%  [per-cell]
+20:11:43 INFO [178/200] EN_TL2698nw_P_12564_20220107_20220113: DSM=(1000, 1000)  valid=99.8%  (12639s elapsed)
+20:11:53 INFO   RMSE=0.061m  MAE=0.021m  E_T1=26.01%  E_T2=0.62%  E_tot=1.40%  err>0.5m=0.4%  err>1.0m=0.0%  [per-cell]
+20:11:53 INFO [179/200] EN_TL2698sw_P_12564_20220107_20220113: DSM=(1000, 1000)  valid=99.7%  (12649s elapsed)
+20:12:04 INFO   RMSE=0.060m  MAE=0.026m  E_T1=5.31%  E_T2=1.03%  E_tot=1.54%  err>0.5m=0.2%  err>1.0m=0.1%  [per-cell]
+20:12:04 INFO [180/200] EN_TL2699se_P_12564_20220107_20220113: DSM=(1000, 1000)  valid=99.1%  (12660s elapsed)
+20:12:14 INFO   RMSE=0.048m  MAE=0.017m  E_T1=9.54%  E_T2=0.99%  E_tot=1.39%  err>0.5m=0.2%  err>1.0m=0.0%  [per-cell]
+20:12:14 INFO [181/200] EN_TL3274ne_P_12535_20220127_20220130: DSM=(823, 474)  valid=55.4%  (12670s elapsed)
+20:12:18 INFO   RMSE=0.191m  MAE=0.060m  E_T1=2.62%  E_T2=2.57%  E_tot=2.59%  err>0.5m=1.6%  err>1.0m=0.8%  [per-cell]
+20:12:18 INFO [182/200] EN_TL3276nw_P_12535_20220127_20220130: DSM=(1000, 1000)  valid=100.0%  (12675s elapsed)
+20:12:29 INFO   RMSE=0.027m  MAE=0.013m  E_T1=3.19%  E_T2=0.18%  E_tot=0.29%  err>0.5m=0.0%  err>1.0m=0.0%  [per-cell]
+20:12:29 INFO [183/200] EN_TL3277nw_P_12535_20220127_20220130: DSM=(1000, 1000)  valid=100.0%  (12685s elapsed)
+20:12:40 INFO   RMSE=0.025m  MAE=0.012m  E_T1=20.47%  E_T2=0.33%  E_tot=0.68%  err>0.5m=0.0%  err>1.0m=0.0%  [per-cell]
+20:12:40 INFO [184/200] EN_TL3277se_P_12535_20220127_20220130: DSM=(1000, 1000)  valid=100.0%  (12696s elapsed)
+20:12:50 INFO   RMSE=0.039m  MAE=0.017m  E_T1=2.02%  E_T2=0.38%  E_tot=0.45%  err>0.5m=0.1%  err>1.0m=0.0%  [per-cell]
+20:12:50 INFO [185/200] EN_TL3278nw_P_12535_20220127_20220130: DSM=(1000, 1000)  valid=100.0%  (12706s elapsed)
+20:13:01 INFO   RMSE=0.129m  MAE=0.019m  E_T1=6.24%  E_T2=0.53%  E_tot=0.65%  err>0.5m=0.3%  err>1.0m=0.2%  [per-cell]
+20:13:01 INFO [186/200] EN_TL3279se_P_12535_20220127_20220130: DSM=(1000, 1000)  valid=81.2%  (12717s elapsed)
+20:13:12 INFO   RMSE=0.118m  MAE=0.019m  E_T1=14.89%  E_T2=0.13%  E_tot=0.50%  err>0.5m=0.4%  err>1.0m=0.3%  [per-cell]
+20:13:12 INFO [187/200] EN_TL4885se_P_12534_20220315_20220316: DSM=(1000, 912)  valid=54.4%  (12728s elapsed)
+20:13:22 INFO   RMSE=0.035m  MAE=0.013m  E_T1=20.34%  E_T2=0.78%  E_tot=1.18%  err>0.5m=0.0%  err>1.0m=0.0%  [per-cell]
+20:13:22 INFO [188/200] EN_TL4886ne_P_12535_20220127_20220130: DSM=(775, 565)  valid=19.1%  (12738s elapsed)
+20:13:28 INFO   RMSE=0.040m  MAE=0.026m  E_T1=nan%  E_T2=0.24%  E_tot=0.27%  err>0.5m=0.0%  err>1.0m=0.0%  [per-cell]
+20:13:28 INFO [189/200] EN_TL4887sw_P_12535_20220127_20220130: DSM=(1000, 1000)  valid=75.2%  (12744s elapsed)
+20:13:38 INFO   RMSE=0.037m  MAE=0.020m  E_T1=12.28%  E_T2=0.57%  E_tot=0.91%  err>0.5m=0.0%  err>1.0m=0.0%  [per-cell]
+20:13:38 INFO [190/200] EN_TL4890sw_P_12535_20220127_20220130: DSM=(1000, 1000)  valid=100.0%  (12754s elapsed)
+20:13:49 INFO   RMSE=0.044m  MAE=0.020m  E_T1=8.72%  E_T2=0.51%  E_tot=1.33%  err>0.5m=0.1%  err>1.0m=0.0%  [per-cell]
+20:13:49 INFO [191/200] EN_TL4896nw_P_12535_20220127_20220130: DSM=(1000, 1000)  valid=98.3%  (12765s elapsed)
+20:14:00 INFO   RMSE=0.100m  MAE=0.017m  E_T1=22.18%  E_T2=0.35%  E_tot=1.13%  err>0.5m=0.2%  err>1.0m=0.1%  [per-cell]
+20:14:00 INFO [192/200] EN_TL5999nw_P_12534_20220315_20220316: DSM=(1000, 1000)  valid=95.4%  (12776s elapsed)
+20:14:10 INFO   RMSE=0.134m  MAE=0.024m  E_T1=28.99%  E_T2=0.82%  E_tot=1.61%  err>0.5m=0.5%  err>1.0m=0.3%  [per-cell]
+20:14:11 INFO [193/200] EN_TQ1602_P_12449_20220319_20220319: DSM=(4000, 4000)  valid=35.1%  (12787s elapsed)
+20:17:37 INFO   RMSE=0.478m  MAE=0.102m  E_T1=1.14%  E_T2=2.43%  E_tot=2.13%  err>0.5m=3.4%  err>1.0m=0.9%  [per-cell]
+20:17:38 INFO [194/200] EN_TQ3802_P_12672_20221009_20221009: DSM=(1371, 4000)  valid=22.8%  (12994s elapsed)
+20:18:44 INFO   RMSE=0.495m  MAE=0.183m  E_T1=1.34%  E_T2=4.27%  E_tot=3.12%  err>0.5m=9.3%  err>1.0m=2.6%  [per-cell]
+20:18:45 INFO [195/200] EN_TQ8668_P_12114_20220106_20220106: DSM=(4000, 4000)  valid=42.3%  (13061s elapsed)
+20:22:11 INFO   RMSE=0.124m  MAE=0.037m  E_T1=14.99%  E_T2=3.07%  E_tot=3.84%  err>0.5m=1.4%  err>1.0m=0.4%  [per-cell]
+20:22:12 INFO [196/200] EN_TQ8670_P_12114_20220106_20220106: DSM=(4000, 4000)  valid=40.8%  (13268s elapsed)
+20:25:38 INFO   RMSE=0.170m  MAE=0.065m  E_T1=17.78%  E_T2=6.49%  E_tot=7.96%  err>0.5m=2.9%  err>1.0m=0.6%  [per-cell]
+20:25:39 INFO [197/200] EN_TQ8676_P_12114_20220106_20220106: DSM=(2039, 4000)  valid=13.5%  (13475s elapsed)
+20:27:18 INFO   RMSE=1.099m  MAE=0.144m  E_T1=2.93%  E_T2=4.26%  E_tot=3.96%  err>0.5m=5.2%  err>1.0m=3.0%  [per-cell]
+20:27:19 INFO [198/200] EN_TQ9484_P_12460_20220109_20220109: DSM=(4000, 4000)  valid=43.1%  (13575s elapsed)
+20:30:45 INFO   RMSE=0.106m  MAE=0.024m  E_T1=2.06%  E_T2=0.40%  E_tot=0.50%  err>0.5m=0.9%  err>1.0m=0.2%  [per-cell]
+20:30:46 INFO [199/200] EN_TR2268_P_12685_20221009_20221009: DSM=(4000, 4000)  valid=43.7%  (13782s elapsed)
+20:34:13 INFO   RMSE=0.175m  MAE=0.040m  E_T1=9.47%  E_T2=1.59%  E_tot=2.10%  err>0.5m=1.6%  err>1.0m=0.7%  [per-cell]
+20:34:13 INFO [200/200] EN_TV0898_P_12449_20220319_20220319: DSM=(192, 767)  valid=1.3%  (13989s elapsed)
+20:34:14 INFO   RMSE=0.173m  MAE=0.136m  E_T1=nan%  E_T2=29.86%  E_tot=31.67%  err>0.5m=0.5%  err>1.0m=0.0%  [per-cell]
+20:34:14 INFO 
+GLOBAL  RMSE=0.557m  MAE=0.094m  err>0.5m=3.6%  err>1.0m=1.1%  (n_cells=553,565,373, scenes=200)
+GLOBAL  per-cell   E_T1=3.86%  E_T2=2.39%  E_tot=2.71%  (n_cells=553,565,373; pass --laz_root for per-point Sithole-Vosselman)
+        (13990s)
+20:34:14 INFO wrote runs/test_england_ep50/metrics.csv
