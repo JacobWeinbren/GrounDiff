@@ -1,8 +1,7 @@
 # GrounDiff (clean rebuild)
 
 Paper-faithful reimplementation of GrounDiff (Dhaouadi et al., WACV 2026,
-arXiv:2511.10391), trained on DEFRA UK LIDAR. See `DECISIONS.md` for
-the small principled deviations (cls=2+9 for DTM ground returns).
+arXiv:2511.10391), trained on DEFRA UK LIDAR. (cls=2+9 for DTM ground returns).
 
 The diffusion / denoising scaffolding is adapted from the Palette
 image-to-image diffusion implementation (Janspiry/Palette-Image-to-Image-
@@ -83,10 +82,6 @@ Validation runs every epoch and prints physical-unit metrics:
 ep N val (n=...): RMSE=0.18m  MAE=0.07m  err>0.5m=2.1%  err>1.0m=0.5%
 ```
 
-Paper Tab.1 baseline (DSM-only on DALES): RMSE 0.16m, MAE 0.094m,
-err>0.5m 5.2%, err>1.0m 2.0%. With ~250× more training data than
-DALES, expect to meet or beat these numbers within a few epochs.
-
 ### 4. Test (full PrioStitch evaluation)
 
 ```bash
@@ -111,38 +106,6 @@ python -u -m scripts.infer_priostitch \
 
 Output `.npz` contains `dtm_pred` (predicted DTM in metres), `valid`,
 `bbox`, `gsd`, `stats`.
-
-## Repo layout
-
-```
-groundiff/
-├── README.md
-├── DECISIONS.md
-├── requirements.txt
-├── configs/
-│   ├── default.json     # paper-faithful defaults
-│   └── defra.json       # DEFRA path overrides
-├── data/
-│   ├── normalize.py     # paper Eq.15 joint min-max
-│   ├── augment.py       # paper §7.1 augmentation
-│   └── dataset.py       # tile dataset
-├── models/
-│   ├── nn.py            # building blocks (GroupNorm, gamma_embedding, ...)
-│   ├── unet.py          # 62.6M-param GrounDiff U-Net
-│   ├── diffusion.py     # forward/reverse + gating
-│   ├── losses.py        # paper Eq.11-14
-│   ├── metrics.py       # RMSE, MAE, E_T thresholds
-│   └── groundiff.py     # top-level wrapper
-├── scripts/
-│   ├── preprocess.py    # LAZ → DSM+DTM tiles
-│   ├── train.py
-│   ├── test.py          # PrioStitch eval + CSV
-│   ├── visualize_inputs.py
-│   └── infer_priostitch.py
-└── utils/
-    ├── checkpoint.py
-    └── priostitch.py    # paper §3.3 tiling/blending
-```
 
 ## Acknowledgement
 
