@@ -1,606 +1,589 @@
-"""PrioStitch (paper §3.3 + Fig.5).
+"""PrioStitch: paper §3.4 — two-pass inference for scenes larger than one tile.
 
-Pipeline at inference time on an arbitrarily-large DSM:
+Pass 1 (coarse):
+    Downsample the whole scene's 4-channel raster to a tractable size
+    (e.g. 1024 × 1024), run one forward pass of the diffusion through
+    `init='noisy_dsm'`. This gives a global DTM prior at low resolution.
 
-  (a) Downsample DSM to network input size (256×256). Run GrounDiff
-      with init=N(s, I) → low-resolution prior DTM.
-  (b) Tile the original full-resolution DSM into overlapping 256×256
-      patches, stride < 256.
-  (c) For each patch: extract the corresponding region of the upsampled
-      prior DTM, use that as the diffusion init (q_sample at γ_T).
-      Run GrounDiff to produce a refined DTM patch.
-  (d) Blend overlapping patches.
+Pass 2 (fine):
+    Upsample the coarse prior back to the scene's native resolution.
+    Then for each fine-resolution tile, run the diffusion with
+    `init='priostitch'` and `prior_dtm=upsampled_coarse[tile]`. The
+    PrioStitch init is `q_sample(prior_dtm, γ_T)` rather than
+    `q_sample(dsm, γ_T)`, so the network refines a tile-local view of
+    the global prior.
 
-Blend modes (paper §12.2 + Tab.7):
-  'mean'        — simple average over overlaps
-  'min'         — per-cell min (paper's BEST, Tab.7 RMSE 0.514)
-  'max'         — per-cell max
-  'linear'      — distance-from-edge linear ramp
-  'cosine'      — half-cosine ramp (smoothest)
-  'exponential' — exp(-d²) like a Gaussian falloff
+Tile stitching:
+    We tile with overlap and average overlapping predictions via a
+    raised-cosine window to avoid seam artefacts. Each tile is
+    normalised independently (per-tile [-1, +1] using its own dsm_max
+    range), so we de-normalise back to metres before averaging.
+
+Input:
+    The same raster.npz format as preprocess.py emits. We work on the
+    arrays directly (not LAZ).
+
+Output:
+    `dtm_pred` (H, W) float32 — predicted DTM in absolute metres.
+    `logit`    (H, W) float32 — final-step confidence logit ℓ.
+    `prob_ground` (H, W) float32 — σ(ℓ).
 """
 from __future__ import annotations
-import math
-from typing import Callable, Optional
+
+from typing import Optional
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 
 
-def _make_blend_weights(tile: int, mode: str = 'linear') -> np.ndarray:
-    """Per-pixel weight kernel of shape (tile, tile). Higher in the
-    centre, falls off toward the edges. Used by weighted-blend modes
-    only; min/max/mean are handled separately as per-pixel reductions."""
-    coord = (np.arange(tile) + 0.5) / tile        # in (0, 1)
-    # Distance from edge along each axis, normalised to [0, 1] (centre = 1)
-    dx = np.minimum(coord, 1.0 - coord) * 2.0
-    dy = np.minimum(coord, 1.0 - coord) * 2.0
-    Y, X = np.meshgrid(dy, dx, indexing='ij')
-    d = np.minimum(X, Y)                          # nearest edge
+def _tta_transforms(n: int):
+    """Per-tile test-time augmentation transforms.
 
-    if mode == 'linear':
-        w = d.astype(np.float32)
-    elif mode == 'cosine':
-        w = (0.5 - 0.5 * np.cos(np.pi * d)).astype(np.float32)
-    elif mode == 'exponential':
-        # Centre weight 1, edge weight exp(-2) ≈ 0.135
-        w = np.exp(-2.0 * (1.0 - d)).astype(np.float32)
+    Ported from the stage 1 image-GrounDiff codebase. Each entry is
+    (forward, inverse): forward applies a flip/rotation to the input,
+    inverse undoes it on the prediction so we can average tiles in the
+    canonical orientation.
+
+    n=1  -> identity only (no TTA).
+    n=4  -> D2 dihedral group: identity + h-flip + v-flip + 180° rot.
+    n=8  -> full D4 group: D2 + three 90° rotations + one diagonal flip.
+
+    Cost scales linearly: 4× and 8× the per-tile inference time
+    respectively. With our tile=1024 and T=10 that's ~5-10s extra per
+    tile at TTA=8 — fine for the final test/inference pass but
+    prohibitive for the per-val viz hook, so val viz keeps tta=1.
+    """
+    I = lambda t: t
+    hflip = lambda t: torch.flip(t, dims=[-1])
+    vflip = lambda t: torch.flip(t, dims=[-2])
+    hvflip = lambda t: torch.flip(t, dims=[-1, -2])
+    rot1 = lambda t: torch.rot90(t, 1, dims=[-2, -1])
+    rot2 = lambda t: torch.rot90(t, 2, dims=[-2, -1])
+    rot3 = lambda t: torch.rot90(t, 3, dims=[-2, -1])
+    rot1_inv = lambda t: torch.rot90(t, -1, dims=[-2, -1])
+    rot3_inv = lambda t: torch.rot90(t, -3, dims=[-2, -1])
+    if n <= 1:
+        return [(I, I)]
+    if n <= 4:
+        return [(I, I), (hflip, hflip), (vflip, vflip), (hvflip, hvflip)]
+    # n=8 -> full D4
+    return [
+        (I, I), (hflip, hflip), (vflip, vflip), (hvflip, hvflip),
+        (rot1, rot1_inv), (rot2, rot2), (rot3, rot3_inv),
+        # one extra: rot1 ∘ hflip → diagonal reflection
+        (lambda t: torch.rot90(torch.flip(t, [-1]), 1, [-2, -1]),
+         lambda t: torch.flip(torch.rot90(t, -1, [-2, -1]), [-1])),
+    ]
+
+
+def _raised_cosine_window(tile_size: int, edge_frac: float = 0.25,
+                           floor: float = 0.05) -> torch.Tensor:
+    """A 2D raised-cosine window that ramps from `floor`→1 over the
+    outer `edge_frac` of each side. Used to weight overlapping tile
+    predictions so seams blend smoothly.
+
+    The floor (default 0.05) ensures the window is never exactly zero,
+    so even at scene corners where a single tile covers the pixel the
+    accumulator gets meaningful weight and `sum_dtm / sum_w` produces a
+    sensible value instead of zero-divided-by-tiny.
+    """
+    n = tile_size
+    edge = max(1, int(n * edge_frac))
+    w = torch.ones(n, dtype=torch.float32)
+    if edge > 1:
+        ramp = 0.5 * (1 - torch.cos(torch.linspace(0, np.pi, edge)))
+        w[:edge] = ramp
+        w[-edge:] = ramp.flip(0)
+    w = floor + (1.0 - floor) * w
+    return w[:, None] * w[None, :]  # (n, n)
+
+
+def _linear_window(tile_size: int, floor: float = 1e-3) -> torch.Tensor:
+    """2D linear window: weight = normalised distance from nearest edge.
+
+    Centre weight 1.0, edge weight 0 (clamped to `floor`). Matches paper
+    §12.2 "linear weighting based on distance from tile edge" and the
+    official reference's _make_blend_weights('linear').
+    """
+    n = tile_size
+    coord = (torch.arange(n, dtype=torch.float32) + 0.5) / n
+    d = torch.minimum(coord, 1.0 - coord) * 2.0   # 0 at edges, 1 at centre
+    w_2d = torch.minimum(d[:, None], d[None, :])
+    return torch.clamp(w_2d, min=floor)
+
+
+def _exp_window(tile_size: int) -> torch.Tensor:
+    """2D exponential decay window: weight = exp(-2 · (1 - d_edge_norm)).
+
+    Centre weight 1.0, edge weight exp(-2) ≈ 0.135. Matches paper
+    §12.2 "exponential decay weighting" and the official reference's
+    _make_blend_weights('exponential').
+    """
+    n = tile_size
+    coord = (torch.arange(n, dtype=torch.float32) + 0.5) / n
+    d = torch.minimum(coord, 1.0 - coord) * 2.0
+    d_2d = torch.minimum(d[:, None], d[None, :])
+    return torch.exp(-2.0 * (1.0 - d_2d)).clamp(min=1e-3)
+
+
+def _to_device_inputs(*arrays, device):
+    out = []
+    for a in arrays:
+        t = torch.from_numpy(a).float().to(device)
+        if t.ndim == 2:
+            t = t[None, None]
+        elif t.ndim == 3:
+            t = t[None]
+        out.append(t)
+    return out
+
+
+def _normalise_pair(dsm_max: np.ndarray, dsm_min: np.ndarray,
+                     dsm_mean: np.ndarray, dsm_mask: np.ndarray
+                     ) -> tuple:
+    """Inference-time normalisation. MUST match the training frame exactly
+    (data/dataset.py::_tile_normalise) or the model sees a shifted input
+    distribution at test time. Both bounds come from the max-z DSM over
+    `dsm_mask`; dsm_min/dsm_mean are normalised into that frame and
+    clamped to [-1, 1] (dsm_min can fall below the max-z minimum).
+
+    Returns (max_n, min_n, mean_n, z_lo, z_hi).
+    """
+    real = dsm_mask.astype(bool)
+    if not real.any():
+        z_lo, z_hi = 0.0, 1.0
     else:
-        raise ValueError(f"_make_blend_weights does not handle mode {mode!r} "
-                         "(use weighted_blend dispatcher instead)")
-    return np.maximum(w, 1e-3)
+        z_lo = float(dsm_max[real].min())
+        z_hi = float(dsm_max[real].max())
+    span = max(z_hi - z_lo, 1e-3)
+    def n(a): return ((a - z_lo) / span * 2.0 - 1.0).astype(np.float32)
+    # Paper §7.2 / Eq. 15: normalise then set invalid regions to 0,
+    # matching data/dataset.py::_tile_normalise exactly. Inference is not
+    # augmented, so no anti-bleed fill is needed here — only the no-data
+    # value matters, and it must equal the training value (0).
+    max_n = np.clip(n(dsm_max), -1.0, 1.0).astype(np.float32)
+    min_n = np.clip(n(dsm_min), -1.0, 1.0).astype(np.float32)
+    mean_n = np.clip(n(dsm_mean), -1.0, 1.0).astype(np.float32)
+    max_n[~real] = 0.0
+    min_n[~real] = 0.0
+    mean_n[~real] = 0.0
+    return max_n, min_n, mean_n, z_lo, z_hi
 
 
-def weighted_blend(tile_outputs, tile_origins, full_h: int, full_w: int,
-                   tile: int = 256, mode: str = 'min'
-                   ) -> np.ndarray:
-    """Blend a list of tile predictions back into a single full-size
-    raster.
+@torch.no_grad()
+def coarse_pass(
+    model,
+    dsm_max: np.ndarray,
+    dsm_min: np.ndarray,
+    dsm_mean: np.ndarray,
+    dsm_mask: np.ndarray,
+    *,
+    coarse_size: int = 256,
+    device: str | torch.device = 'cuda',
+) -> tuple[np.ndarray, float, float]:
+    """Run one forward pass on a downsampled view of the whole scene.
 
-    Modes (paper §12.2 + Tab.7):
-        'mean':         simple average over overlaps
-        'min':          per-cell min — paper's best (Tab.7 RMSE 0.514)
-        'max':          per-cell max
-        'linear':       distance-from-edge linear weighting
-        'cosine':       half-cosine weighting
-        'exponential':  exp decay from centre
+    Returns (coarse_dtm_metres, z_lo, z_hi). The downsample factor is
+    chosen so the longer side matches `coarse_size` (rounded to a
+    multiple of 16 = 2 * patch_size = 16 to satisfy DiT's divisibility).
+    """
+    device = torch.device(device)
+    H, W = dsm_max.shape
+    scale = coarse_size / max(H, W)
+    # Round target shape down to a multiple of the model's spatial
+    # divisibility. For our UNet this is 2 ** num_downsamples (e.g.
+    # 4 levels → 3 downsamples → multiple of 8). Falls back to 16 if
+    # the model exposes neither attribute (legacy DiT path).
+    if hasattr(model.dit, 'grid_multiple'):
+        block = int(model.dit.grid_multiple)
+    elif hasattr(model.dit, 'patch_size'):
+        block = 2 * int(model.dit.patch_size)
+    else:
+        block = 16
+    new_H = max(block, int(round(H * scale / block)) * block)
+    new_W = max(block, int(round(W * scale / block)) * block)
+
+    dm_n, dn_n, dmean_n, z_lo, z_hi = _normalise_pair(
+        dsm_max, dsm_min, dsm_mean, dsm_mask)
+
+    # Downsample to (new_H, new_W). For max/min we use max/min pooling
+    # (preserving extrema is important). For mean we use avg pooling.
+    # For mask: any cell in the block having data → mask=1.
+    def _down_max(arr, mode):
+        t = torch.from_numpy(arr)[None, None].float()
+        if mode == 'max':
+            return F.adaptive_max_pool2d(t, (new_H, new_W))[0, 0].numpy()
+        elif mode == 'min':
+            return -F.adaptive_max_pool2d(-t, (new_H, new_W))[0, 0].numpy()
+        elif mode == 'mean':
+            return F.adaptive_avg_pool2d(t, (new_H, new_W))[0, 0].numpy()
+        else:
+            raise ValueError(mode)
+
+    dm_c = _down_max(dm_n, 'max')
+    dn_c = _down_max(dn_n, 'min')
+    dmean_c = _down_max(dmean_n, 'mean')
+    # Mask: average then threshold; anything with positive mean has data.
+    mask_c = (_down_max(dsm_mask.astype(np.float32), 'max') > 0.5).astype(np.float32)
+
+    # To tensors.
+    dm_t, dn_t, dmean_t, mask_t = _to_device_inputs(
+        dm_c, dn_c, dmean_c, mask_c, device=device)
+
+    # Run reverse diffusion with noisy_dsm init.
+    dtm_pred = model.infer(
+        dsm_max=dm_t, dsm_min=dn_t, dsm_mean=dmean_t, dsm_mask=mask_t,
+        init='noisy_dsm')[0, 0]                              # [Hc, Wc]
+    # De-normalise back to metres.
+    dtm_pred_m = ((dtm_pred.float().cpu().numpy() + 1.0) / 2.0 * (z_hi - z_lo)
+                   + z_lo).astype(np.float32)
+    return dtm_pred_m, z_lo, z_hi
+
+
+@torch.no_grad()
+def fine_pass(
+    model,
+    dsm_max: np.ndarray,
+    dsm_min: np.ndarray,
+    dsm_mean: np.ndarray,
+    dsm_mask: np.ndarray,
+    coarse_dtm_m: np.ndarray | None,
+    *,
+    tile_size: int = 256,
+    overlap: int = 128,
+    blend_mode: str = 'linear',
+    device: str | torch.device = 'cuda',
+    use_priostitch: bool = True,
+    tta: int = 1,
+    progress_cb=None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Tile-by-tile inference at native raster resolution.
 
     Args:
-        tile_outputs: list of [tile, tile] np.float32 arrays
-        tile_origins: list of (i, j) pixel origins (top-left) per tile
-        full_h, full_w: output raster shape
-        tile: tile size
-        mode: blend mode
+        coarse_dtm_m: [Hc, Wc] coarse DTM from `coarse_pass`, in METRES
+                      (absolute). Upsampled to (H, W) and used as the
+                      PrioStitch init prior. Pass None to use 'noisy_dsm'
+                      init (paper baseline, no PrioStitch).
+        tile_size:   tile side in pixels (must divide model.dit.grid_multiple).
+                      Default 256 = paper-faithful.
+        overlap:     pixels of overlap between adjacent tiles.
+                      Default 128 = paper §8 Table 7: "tiles overlap by
+                      50 percent, stride 128" (at tile_size=256).
+        blend_mode:  How to merge overlapping tile DTM predictions.
+                      Paper §12.2 / Table 7 lists six modes; all
+                      supported here:
+
+                      'min'        : pixel-wise minimum across overlapping
+                                     tiles. Paper Tab.7(e) — best regression
+                                     RMSE on DALES. Default.
+                      'mean'       : simple arithmetic average across tiles.
+                                     Paper Tab.7(d).
+                      'max'        : pixel-wise maximum. Paper Tab.7(f),
+                                     rarely wins (preserves above-ground
+                                     artifacts).
+                      'linear'     : windowed weighted mean with linear
+                                     edge-to-centre ramp. Paper Tab.7(g) —
+                                     "best balance of performance and
+                                     visual quality".
+                      'cosine'     : raised-cosine windowed weighted mean.
+                                     Paper Tab.7(h).
+                      'exponential': exp-decay windowed weighted mean
+                                     (centre weight 1, edge ≈ 0.135).
+                                     Paper Tab.7(i).
+
+                      Logits ALWAYS use cosine-windowed mean regardless
+                      of `blend_mode` — min/max on logits doesn't have a
+                      sensible interpretation, and σ(ℓ) smoothness across
+                      seams is desirable.
+        tta:         1 | 4 | 8 — test-time augmentation passes per tile.
+                     Each tile is run under N D2/D4 symmetry transforms
+                     and averaged in canonical orientation. Costs `tta`×
+                     inference time but reduces aliasing and improves
+                     robustness near tile edges. Default 1 (off).
 
     Returns:
-        blended full-size raster
+        dtm_pred_m: [H, W] predicted DTM in metres.
+        logit:      [H, W] final-step logit ℓ.
     """
-    if mode in ('min', 'max', 'mean'):
-        # Per-cell reduction over overlapping tiles. No weight kernel.
-        out = np.full((full_h, full_w), np.nan, dtype=np.float32)
-        if mode == 'mean':
-            sum_ = np.zeros((full_h, full_w), dtype=np.float64)
-            cnt  = np.zeros((full_h, full_w), dtype=np.int32)
-            for arr, (i, j) in zip(tile_outputs, tile_origins):
-                i1 = min(i + tile, full_h)
-                j1 = min(j + tile, full_w)
-                h = i1 - i; w = j1 - j
-                sum_[i:i1, j:j1] += arr[:h, :w]
-                cnt [i:i1, j:j1] += 1
-            mask = cnt > 0
-            out[mask] = (sum_[mask] / cnt[mask]).astype(np.float32)
-            out[~mask] = 0.0
-        else:
-            reducer = np.fmin if mode == 'min' else np.fmax
-            for arr, (i, j) in zip(tile_outputs, tile_origins):
-                i1 = min(i + tile, full_h)
-                j1 = min(j + tile, full_w)
-                h = i1 - i; w = j1 - j
-                cur = out[i:i1, j:j1]
-                # np.fmin / np.fmax treat NaN specially: if one side is
-                # NaN, the result is the other side. So uninitialised
-                # cells get filled, then subsequent overlaps fold in.
-                out[i:i1, j:j1] = reducer(cur, arr[:h, :w].astype(np.float32))
-            out = np.where(np.isnan(out), 0.0, out)
-        return out.astype(np.float32)
-
-    # Weighted-blend modes (linear / cosine / exponential)
-    w_kernel = _make_blend_weights(tile, mode=mode)
-    out = np.zeros((full_h, full_w), dtype=np.float64)
-    den = np.zeros((full_h, full_w), dtype=np.float64)
-    for arr, (i, j) in zip(tile_outputs, tile_origins):
-        i1 = min(i + tile, full_h)
-        j1 = min(j + tile, full_w)
-        h = i1 - i; w = j1 - j
-        out[i:i1, j:j1] += arr[:h, :w] * w_kernel[:h, :w]
-        den[i:i1, j:j1] += w_kernel[:h, :w]
-    return (out / np.maximum(den, 1e-9)).astype(np.float32)
-
-
-def _resize_to(img: np.ndarray, h: int, w: int,
-               mode: str = 'bilinear') -> np.ndarray:
-    """Resize a 2D float array to (h, w) via torch interpolate.
-    Wrapped here to avoid scipy/PIL dependencies."""
-    t = torch.from_numpy(img.astype(np.float32))[None, None]
-    t = F.interpolate(t, size=(h, w), mode=mode, align_corners=False
-                       if mode != 'nearest' else None)
-    return t[0, 0].numpy()
-
-
-def priostitch_inference(model, dsm_full: np.ndarray, *,
-                         device: str = 'cuda',
-                         tile: int = 256, stride: int = 128,
-                         blend_mode: str = 'min',
-                         init_prior: bool = True,
-                         valid_mask: Optional[np.ndarray] = None,
-                         progress: Optional[Callable[[int, int], None]] = None,
-                         return_prob: bool = False,
-                         dsm_metres: Optional[np.ndarray] = None,
-                         scene_stats: Optional[dict] = None,
-                         dsm_min_metres: Optional[np.ndarray] = None,
-                         capture_tiles: Optional[list] = None,
-                         capture_n: int = 4,
-                         tta: int = 1,
-                         ) -> np.ndarray:
-    """Full PrioStitch run with per-tile DSM-only normalisation.
-
-    Args:
-        model: GrounDiff instance with .infer()
-        dsm_full: [H, W] float32 DSM in [-1, 1] (scene-normalised)
-        dsm_metres: [H, W] DSM in metres
-        scene_stats: dict with 'vmin'/'vmax' for scene normalisation
-        dsm_min_metres: [H, W] optional min-z DSM in metres. If
-            provided, fed as 2nd conditioning channel (requires the
-            model's UNet to have in_channel=3).
-        tile, stride: tiling geometry
-        blend_mode: see weighted_blend
-        init_prior: if True, use upsampled low-res prior per tile
-        valid_mask: optional [H, W] valid mask
-        progress: callback(done, total)
-        return_prob: also return σ(ℓ) map
-        capture_tiles: optional list to APPEND per-tile snapshots into.
-        capture_n: how many tiles to snapshot.
-        tta: test-time augmentation passes per tile. 1 = no TTA (fastest).
-            4 = 4-way D2 (identity, h-flip, v-flip, hv-flip).
-            8 = 8-way D4 (above + 90° / 180° / 270° rotations).
-            Predictions are averaged after un-augmenting. Kills
-            directional/grid bias on tricky scenes (cliffs, structured
-            terrain). Costs `tta`× the inference time per tile.
-
-    Returns:
-        DTM in METRES, [H, W] float32. (return_prob → tuple.)
-    """
-    H, W = dsm_full.shape
-
-    # Reconstruct DSM in metres if not provided
-    if dsm_metres is None:
-        if scene_stats is None:
-            raise ValueError("priostitch_inference needs either dsm_metres "
-                             "or scene_stats for per-tile re-normalisation")
-        s_vmin = float(scene_stats['vmin'])
-        s_vmax = float(scene_stats['vmax'])
-        s_span = max(s_vmax - s_vmin, 1e-6)
-        dsm_metres = (dsm_full + 1.0) * 0.5 * s_span + s_vmin
-        if valid_mask is not None:
-            dsm_metres = np.where(valid_mask.astype(bool),
-                                   dsm_metres, 0.0).astype(np.float32)
-    dsm_metres = dsm_metres.astype(np.float32)
-
-    # ---- Step (a): low-res global prior (per-tile DSM-only norm) -------
-    # Note: paper Eq.15 jointly normalises by min(s,g) / max(s,g) at
-    # training time. We use DSM-only at inference (no GT DTM available
-    # on new tiles) AND at training (in dataset.__getitem__) so the
-    # train and inference distributions are identical.
-    if init_prior:
-        dsm_t_full = torch.from_numpy(dsm_metres)[None, None].to(device)
-        dsm_lo_m_t = F.interpolate(dsm_t_full, size=(tile, tile),
-                                    mode='bilinear', align_corners=False)
-        dsm_lo_m = dsm_lo_m_t[0, 0].cpu().numpy()
-        if valid_mask is not None:
-            vm_full = torch.from_numpy(
-                valid_mask.astype(np.float32))[None, None].to(device)
-            vm_lo = F.interpolate(vm_full, size=(tile, tile),
-                                   mode='bilinear', align_corners=False)
-            vm_lo_b = (vm_lo[0, 0].cpu().numpy() > 0.5)
-        else:
-            vm_lo_b = np.ones((tile, tile), dtype=bool)
-        if vm_lo_b.any():
-            lo_vmin = float(dsm_lo_m[vm_lo_b].min())
-            lo_vmax = float(dsm_lo_m[vm_lo_b].max())
-        else:
-            lo_vmin, lo_vmax = float(dsm_lo_m.min()), float(dsm_lo_m.max())
-        lo_span = max(lo_vmax - lo_vmin, 1e-6)
-        dsm_lo_n = np.where(vm_lo_b,
-                             2.0 * (dsm_lo_m - lo_vmin) / lo_span - 1.0,
-                             0.0).astype(np.float32)
-        dsm_lo_t = torch.from_numpy(dsm_lo_n)[None, None].to(device)
-
-        # Optional dsm_min on the low-res prior pass too
-        dsm_min_lo_t = None
-        if dsm_min_metres is not None:
-            dsm_min_full_t = torch.from_numpy(
-                dsm_min_metres.astype(np.float32))[None, None].to(device)
-            dsm_min_lo_m = F.interpolate(dsm_min_full_t, size=(tile, tile),
-                                          mode='bilinear',
-                                          align_corners=False
-                                          )[0, 0].cpu().numpy()
-            dsm_min_lo_n = np.where(
-                vm_lo_b,
-                np.clip(2.0 * (dsm_min_lo_m - lo_vmin) / lo_span - 1.0,
-                         -1.0, 1.0),
-                0.0).astype(np.float32)
-            dsm_min_lo_t = torch.from_numpy(
-                dsm_min_lo_n)[None, None].to(device)
-
-        prior_lo_n = model.infer(dsm_lo_t, init='noisy_dsm',
-                                  dsm_min=dsm_min_lo_t)
-        prior_lo_m = (prior_lo_n + 1.0) * 0.5 * lo_span + lo_vmin
-        prior_full_m = F.interpolate(prior_lo_m, size=(H, W),
-                                      mode='bilinear', align_corners=False
-                                      )[0, 0].cpu().numpy()
+    if blend_mode not in ('min', 'max', 'mean', 'cosine', 'linear', 'exponential'):
+        raise ValueError(
+            f"blend_mode={blend_mode!r} not supported. Choose from "
+            "'min', 'max', 'mean', 'cosine', 'linear', 'exponential'.")
+    device = torch.device(device)
+    H, W = dsm_max.shape
+    # If the whole scene is smaller than one tile in either axis, pad the
+    # arrays up to tile_size BEFORE allocating accumulators / upsampling the
+    # prior (everything below sizes off H, W). Reflect elevation so the
+    # border isn't an artificial cliff; zero the mask so padded cells are
+    # no-data. We crop back to (H_orig, W_orig) before returning. Without
+    # this, a scene narrower than tile_size in one axis produced a single
+    # origin at 0 whose tile couldn't be tile_size wide -> the assertion
+    # "tile_size doesn't fit" (the smoke-test crash). DEFRA tiles vary in
+    # shape so some are < 256 in one dimension.
+    H_orig, W_orig = H, W
+    pad_h = max(0, tile_size - H)
+    pad_w = max(0, tile_size - W)
+    if pad_h or pad_w:
+        def _pad(a, mode, **kw):
+            return np.pad(a, ((0, pad_h), (0, pad_w)), mode=mode, **kw)
+        dsm_max = (_pad(dsm_max, 'reflect') if (H > 1 and W > 1)
+                   else _pad(dsm_max, 'edge'))
+        dsm_min = _pad(dsm_min, 'edge')
+        dsm_mean = _pad(dsm_mean, 'edge')
+        dsm_mask = _pad(dsm_mask, 'constant', constant_values=0)
+        H, W = dsm_max.shape
+    if hasattr(model.dit, 'grid_multiple'):
+        block = int(model.dit.grid_multiple)
+    elif hasattr(model.dit, 'patch_size'):
+        block = 2 * int(model.dit.patch_size)
     else:
-        prior_full_m = None
+        block = 16
+    assert tile_size % block == 0, \
+        f"tile_size={tile_size} must divide {block}"
+    stride = tile_size - overlap
 
-    # ---- Step (b)+(c): per-tile diffusion (per-tile normalised) -------
-    is_  = list(range(0, max(H - tile, 0) + 1, stride))
-    if not is_ or is_[-1] + tile < H: is_.append(max(H - tile, 0))
-    js_  = list(range(0, max(W - tile, 0) + 1, stride))
-    if not js_ or js_[-1] + tile < W: js_.append(max(W - tile, 0))
+    # Upsample coarse prior to (H, W).
+    prior_full = None
+    if coarse_dtm_m is not None and use_priostitch:
+        prior_full = F.interpolate(
+            torch.from_numpy(coarse_dtm_m)[None, None].float(),
+            size=(H, W), mode='bilinear', align_corners=False)[0, 0].numpy()
 
-    # Decide which tiles to capture for diagnostics. Pick tiles by
-    # non-ground content (max-min gap is the proxy when we have
-    # dsm_min, otherwise just middle-of-grid). Goal: capture tiles
-    # that span boring → interesting so the diagnostic montage
-    # is informative.
-    n_tiles_total = len(is_) * len(js_)
-    capture_indices: set = set()
-    if capture_tiles is not None and capture_n > 0:
-        # Score each tile by mean canopy-gap on VALID pixels only.
-        # Tiles with no valid pixels (entirely off-scene) are excluded
-        # from the score pool — they'd produce blank diagnostic panels.
-        scores = []
-        for ti, i in enumerate(is_):
-            for tj, j in enumerate(js_):
-                idx = ti * len(js_) + tj
-                i1 = min(i + tile, H); j1 = min(j + tile, W)
-                if valid_mask is not None:
-                    v_block = valid_mask[i:i1, j:j1].astype(bool)
-                else:
-                    v_block = np.ones((i1 - i, j1 - j), dtype=bool)
-                if not v_block.any():
-                    # Skip tiles with no valid data — they'd produce
-                    # blank panels and the metrics don't depend on them.
-                    continue
-                if dsm_min_metres is not None:
-                    gap = (dsm_metres[i:i1, j:j1]
-                           - dsm_min_metres[i:i1, j:j1])
-                    sc = float(np.median(gap[v_block]))
-                else:
-                    region = dsm_metres[i:i1, j:j1][v_block]
-                    sc = float(region.max() - region.min())
-                scores.append((sc, idx))
-        # Sort by score desc, pick top capture_n
-        scores.sort(key=lambda x: -x[0])
-        capture_indices = {idx for _, idx in scores[:capture_n]}
+    # Output accumulators.
+    # `sum_logit` always uses raised-cosine windowed mean for logits
+    # (smooth σ(ℓ) across seams). DTM accumulator depends on blend_mode:
+    #   'mean':         sum_dtm + counts, dtm_full = sum_dtm / count
+    #   'min':          per-pixel minimum across tiles
+    #   'max':          per-pixel maximum across tiles
+    #   'cosine':       raised-cosine windowed weighted mean (current default)
+    #   'linear':       linear-from-edge windowed weighted mean (paper Tab.7g)
+    #   'exponential':  exp-decay windowed weighted mean (paper Tab.7i)
+    sum_logit = np.zeros((H, W), dtype=np.float64)
+    sum_w = np.zeros((H, W), dtype=np.float64)
+    weighted_modes = ('cosine', 'linear', 'exponential')
+    if blend_mode in weighted_modes:
+        sum_dtm = np.zeros((H, W), dtype=np.float64)
+    elif blend_mode == 'mean':
+        sum_dtm = np.zeros((H, W), dtype=np.float64)
+        cnt_dtm = np.zeros((H, W), dtype=np.int32)
+    elif blend_mode == 'min':
+        dtm_blend = np.full((H, W), np.inf, dtype=np.float64)
+    elif blend_mode == 'max':
+        dtm_blend = np.full((H, W), -np.inf, dtype=np.float64)
 
-    outputs_m = []  # in METRES (each tile denormalised by its own stats)
-    prob_outputs = []
-    origins = []
-    total = len(is_) * len(js_)
-    done = 0
-    for i in is_:
-        for j in js_:
-            i1 = min(i + tile, H)
-            j1 = min(j + tile, W)
-            d_m = np.zeros((tile, tile), dtype=np.float32)
-            d_m[:i1 - i, :j1 - j] = dsm_metres[i:i1, j:j1]
-            v_t = np.zeros((tile, tile), dtype=bool)
-            if valid_mask is not None:
-                v_t[:i1 - i, :j1 - j] = valid_mask[i:i1, j:j1].astype(bool)
-            else:
-                v_t[:i1 - i, :j1 - j] = True
+    # Logits always blend with the cosine window for smoothness.
+    logit_window = _raised_cosine_window(tile_size).numpy()
+    # DTM window depends on blend_mode (only used for weighted modes).
+    if blend_mode == 'cosine':
+        window = _raised_cosine_window(tile_size).numpy()
+    elif blend_mode == 'linear':
+        window = _linear_window(tile_size).numpy()
+    elif blend_mode == 'exponential':
+        window = _exp_window(tile_size).numpy()
+    else:
+        window = None  # min / max / mean — no DTM weighting kernel
 
-            # Per-tile vmin/vmax over valid pixels
-            if v_t.any():
-                t_vmin = float(d_m[v_t].min())
-                t_vmax = float(d_m[v_t].max())
-            else:
-                t_vmin, t_vmax = 0.0, 1.0
-            t_span = max(t_vmax - t_vmin, 1e-6)
-            d_n = np.where(v_t,
-                            2.0 * (d_m - t_vmin) / t_span - 1.0,
-                            0.0).astype(np.float32)
-            d_t = torch.from_numpy(d_n)[None, None].to(device)
+    # Tile origins. Make sure to cover the right/bottom edge with one
+    # final tile snapped to the boundary.
+    def _origins(total, ts, st):
+        os_ = list(range(0, total - ts + 1, st))
+        if not os_:
+            os_ = [0]
+        elif os_[-1] + ts < total:
+            os_.append(total - ts)
+        return os_
 
-            # Optional dsm_min channel for this tile
-            dsm_min_t_t = None
-            if dsm_min_metres is not None:
-                dmin_m = np.zeros((tile, tile), dtype=np.float32)
-                dmin_m[:i1 - i, :j1 - j] = dsm_min_metres[i:i1, j:j1]
-                dmin_n = np.where(
-                    v_t,
-                    np.clip(2.0 * (dmin_m - t_vmin) / t_span - 1.0,
-                             -1.0, 1.0),
-                    0.0).astype(np.float32)
-                dsm_min_t_t = torch.from_numpy(
-                    dmin_n)[None, None].to(device)
+    ys = _origins(H, tile_size, stride)
+    xs = _origins(W, tile_size, stride)
+    n_tiles = len(ys) * len(xs)
+    t_done = 0
 
-            # Construct prior tensor once per tile (TTA reuses it)
-            p_m = None
-            p_t = None
-            if init_prior and prior_full_m is not None:
-                p_m = np.zeros((tile, tile), dtype=np.float32)
-                p_m[:i1 - i, :j1 - j] = prior_full_m[i:i1, j:j1]
-                p_n = np.where(v_t,
-                                2.0 * (p_m - t_vmin) / t_span - 1.0,
-                                0.0).astype(np.float32)
-                p_t = torch.from_numpy(p_n)[None, None].to(device)
+    for iy in ys:
+        for ix in xs:
+            t_done += 1
+            iy_e = iy + tile_size
+            ix_e = ix + tile_size
+            assert iy_e <= H and ix_e <= W, \
+                (f"tile out of bounds after padding "
+                 f"(iy_e={iy_e}, ix_e={ix_e}, H={H}, W={W}); "
+                 f"check overlap/origin logic")
 
-            # ---- TTA: run model under D2/D4 transforms and average -----
-            # Transforms (numpy spatial flips/rotations) — each entry is
-            # (forward_fn, inverse_fn). Forward is applied to the input
-            # tensor, inverse to the prediction.
-            def _tta_transforms(n: int):
-                """Return list of (forward, inverse) tensor transforms.
-                n=1 → identity only; n=4 → D2 (4 flips); n=8 → D4."""
-                I = lambda t: t
-                hflip = lambda t: torch.flip(t, dims=[-1])
-                vflip = lambda t: torch.flip(t, dims=[-2])
-                hvflip = lambda t: torch.flip(t, dims=[-1, -2])
-                rot1 = lambda t: torch.rot90(t, 1, dims=[-2, -1])
-                rot2 = lambda t: torch.rot90(t, 2, dims=[-2, -1])
-                rot3 = lambda t: torch.rot90(t, 3, dims=[-2, -1])
-                rot1_inv = lambda t: torch.rot90(t, -1, dims=[-2, -1])
-                rot3_inv = lambda t: torch.rot90(t, -3, dims=[-2, -1])
-                if n <= 1:
-                    return [(I, I)]
-                if n <= 4:
-                    return [(I, I), (hflip, hflip),
-                            (vflip, vflip), (hvflip, hvflip)]
-                # n=8 → full D4
-                return [(I, I), (hflip, hflip), (vflip, vflip),
-                        (hvflip, hvflip),
-                        (rot1, rot1_inv), (rot2, rot2),
-                        (rot3, rot3_inv),
-                        # one extra: rot1 ∘ hflip → diagonal reflection
-                        (lambda t: torch.rot90(torch.flip(t, [-1]), 1, [-2, -1]),
-                         lambda t: torch.flip(torch.rot90(t, -1, [-2, -1]), [-1]))]
+            dm = dsm_max[iy:iy_e, ix:ix_e]
+            dn = dsm_min[iy:iy_e, ix:ix_e]
+            dme = dsm_mean[iy:iy_e, ix:ix_e]
+            ma = dsm_mask[iy:iy_e, ix:ix_e]
 
-            transforms = _tta_transforms(tta)
-            preds_n = []
-            logits = []
+            # Per-tile normalisation
+            dm_n, dn_n, dme_n, z_lo, z_hi = _normalise_pair(dm, dn, dme, ma)
+            dm_t, dn_t, dme_t, ma_t = _to_device_inputs(
+                dm_n, dn_n, dme_n, ma.astype(np.float32), device=device)
+
+            prior_t = None
+            if prior_full is not None:
+                prior_tile = prior_full[iy:iy_e, ix:ix_e]
+                prior_n = ((prior_tile - z_lo) / max(z_hi - z_lo, 1e-3) * 2.0 - 1.0
+                            ).astype(np.float32)
+                prior_t, = _to_device_inputs(prior_n, device=device)
+
+            # ---- TTA: D2/D4 transforms, predict, invert, average -----
+            transforms = _tta_transforms(int(tta))
+            dtm_acc = None
+            logit_acc = None
             for fwd, inv in transforms:
-                d_t_aug = fwd(d_t)
-                dsm_min_aug = fwd(dsm_min_t_t) if dsm_min_t_t is not None else None
-                if init_prior and prior_full_m is not None:
-                    p_t_aug = fwd(p_t)
-                    pred_n_aug, logit_aug = model.infer(
-                        d_t_aug, init='priostitch',
-                        prior_dtm=p_t_aug,
-                        dsm_min=dsm_min_aug,
+                dm_aug = fwd(dm_t)
+                dn_aug = fwd(dn_t)
+                dme_aug = fwd(dme_t)
+                ma_aug = fwd(ma_t)
+                if prior_t is not None:
+                    prior_aug = fwd(prior_t)
+                    dtm_pred, logit = model.infer(
+                        dsm_max=dm_aug, dsm_min=dn_aug,
+                        dsm_mean=dme_aug, dsm_mask=ma_aug,
+                        init='priostitch', prior_dtm=prior_aug,
                         return_logit=True)
                 else:
-                    pred_n_aug, logit_aug = model.infer(
-                        d_t_aug, init='noisy_dsm',
-                        dsm_min=dsm_min_aug,
-                        return_logit=True)
-                # Un-augment back to canonical orientation
-                preds_n.append(inv(pred_n_aug))
-                logits.append(inv(logit_aug))
-            # Average over TTA passes
-            pred_n = torch.stack(preds_n, dim=0).mean(dim=0)
-            logit  = torch.stack(logits, dim=0).mean(dim=0)
+                    dtm_pred, logit = model.infer(
+                        dsm_max=dm_aug, dsm_min=dn_aug,
+                        dsm_mean=dme_aug, dsm_mask=ma_aug,
+                        init='noisy_dsm', return_logit=True)
+                # Un-augment back to canonical orientation, then accumulate
+                # on-device to save host roundtrips.
+                dtm_pred = inv(dtm_pred)
+                logit = inv(logit)
+                if dtm_acc is None:
+                    dtm_acc = dtm_pred
+                    logit_acc = logit
+                else:
+                    dtm_acc = dtm_acc + dtm_pred
+                    logit_acc = logit_acc + logit
+            dtm_pred = dtm_acc / float(len(transforms))
+            logit = logit_acc / float(len(transforms))
 
-            pred_n_np = pred_n[0, 0].cpu().numpy()
-            # Denormalise per-tile back to metres
-            pred_m = (pred_n_np + 1.0) * 0.5 * t_span + t_vmin
-            outputs_m.append(pred_m.astype(np.float32))
-            prob_t = None
-            if return_prob:
-                prob_t = torch.sigmoid(logit)[0, 0].cpu().numpy()
-                prob_outputs.append(prob_t)
-            origins.append((i, j))
+            dtm_pred_np = dtm_pred[0, 0].float().cpu().numpy()
+            logit_np = logit[0, 0].float().cpu().numpy()
+            # De-normalise back to metres
+            dtm_pred_m = (dtm_pred_np + 1.0) / 2.0 * (z_hi - z_lo) + z_lo
 
-            # Capture diagnostic snapshot if this tile was chosen
-            tile_idx = (is_.index(i) * len(js_)) + js_.index(j)
-            if capture_tiles is not None and tile_idx in capture_indices:
-                snap = dict(
-                    origin=(i, j),
-                    tile_size=tile,
-                    valid=v_t.copy(),
-                    tile_vmin=t_vmin,
-                    tile_vmax=t_vmax,
-                    dsm_m=d_m.copy(),
-                    pred_m=pred_m.astype(np.float32).copy(),
-                    prob=(prob_t.copy() if prob_t is not None else None),
-                )
-                if dsm_min_metres is not None:
-                    snap['dsm_min_m'] = dmin_m.copy()
-                if init_prior and prior_full_m is not None:
-                    snap['prior_m'] = p_m.copy()
-                capture_tiles.append(snap)
+            # Logits always blend with the cosine window (smooth seams).
+            sum_logit[iy:iy_e, ix:ix_e] += logit_np * logit_window
+            sum_w[iy:iy_e, ix:ix_e] += logit_window
 
-            done += 1
-            if progress is not None:
-                progress(done, total)
+            if blend_mode in weighted_modes:
+                sum_dtm[iy:iy_e, ix:ix_e] += dtm_pred_m * window
+            elif blend_mode == 'mean':
+                sum_dtm[iy:iy_e, ix:ix_e] += dtm_pred_m
+                cnt_dtm[iy:iy_e, ix:ix_e] += 1
+            elif blend_mode == 'min':
+                view = dtm_blend[iy:iy_e, ix:ix_e]
+                np.minimum(view, dtm_pred_m, out=view)
+            elif blend_mode == 'max':
+                view = dtm_blend[iy:iy_e, ix:ix_e]
+                np.maximum(view, dtm_pred_m, out=view)
 
-    # ---- Step (d): weighted blend in metres ---------------------------
-    blended = weighted_blend(outputs_m, origins, H, W,
-                             tile=tile, mode=blend_mode)
-    if valid_mask is not None:
-        blended = np.where(valid_mask.astype(bool), blended, 0.0)
-    if return_prob:
-        prob_blended = weighted_blend(prob_outputs, origins, H, W,
-                                       tile=tile, mode='mean')
-        if valid_mask is not None:
-            prob_blended = np.where(valid_mask.astype(bool), prob_blended, 0.0)
-        return blended, prob_blended
-    return blended
+            if progress_cb is not None:
+                progress_cb(t_done, n_tiles)
+
+    # Final assembly. Logits always use cosine-mean for smooth seams.
+    sum_w = np.maximum(sum_w, 1e-9)
+    logit_full = (sum_logit / sum_w).astype(np.float32)
+
+    if blend_mode in weighted_modes:
+        # The DTM window may be different from logit_window, so we
+        # divide by the DTM-side sum of weights. Since the same set of
+        # tiles touches each pixel, the per-pixel weight sum is
+        # (#tiles_covering · window). We reconstruct it by re-using the
+        # tile-origin loop count via the DTM window itself: easier to
+        # divide sum_dtm by the running sum of `window` directly, but
+        # we already have sum_w for the cosine-windowed logits. Pull
+        # the kernel ratio so divisions match per-pixel coverage.
+        # Implementation: compute a parallel sum_w_dtm so each weighted
+        # mode normalises by its own window.
+        sum_w_dtm = np.zeros((H, W), dtype=np.float64)
+        for iy in ys:
+            for ix in xs:
+                iy_e = min(iy + tile_size, H)
+                ix_e = min(ix + tile_size, W)
+                wh, ww = iy_e - iy, ix_e - ix
+                sum_w_dtm[iy:iy_e, ix:ix_e] += window[:wh, :ww]
+        sum_w_dtm = np.maximum(sum_w_dtm, 1e-9)
+        dtm_pred_full = (sum_dtm / sum_w_dtm).astype(np.float32)
+    elif blend_mode == 'mean':
+        cnt = np.maximum(cnt_dtm.astype(np.float64), 1.0)
+        dtm_pred_full = (sum_dtm / cnt).astype(np.float32)
+        # Cells with no tile (shouldn't happen if tiling covers H×W,
+        # but defensive): fall back to DSM.
+        if (cnt_dtm == 0).any():
+            mask = (cnt_dtm == 0)
+            dtm_pred_full = np.where(mask, dsm_max.astype(np.float32),
+                                       dtm_pred_full)
+    else:
+        # min / max: cells never touched keep the ±inf sentinel —
+        # fill with DSM as a safe finite fallback.
+        finite = np.isfinite(dtm_blend)
+        if not finite.all():
+            dtm_blend = np.where(finite, dtm_blend, dsm_max.astype(np.float64))
+        dtm_pred_full = dtm_blend.astype(np.float32)
+
+    # Crop back to the original scene size if we padded a sub-tile scene.
+    if (H_orig, W_orig) != (H, W):
+        dtm_pred_full = dtm_pred_full[:H_orig, :W_orig]
+        logit_full = logit_full[:H_orig, :W_orig]
+    return dtm_pred_full, logit_full
 
 
-def save_tile_viz_montage(snapshots: list, *, out_path,
-                          dtm_gt_full=None, scene_id: str = "",
-                          dsm_min_available: bool = False):
-    """Build a per-tile diagnostic montage from priostitch snapshots.
+@torch.no_grad()
+def priostitch_infer(
+    model,
+    dsm_max: np.ndarray,
+    dsm_min: np.ndarray,
+    dsm_mean: np.ndarray,
+    dsm_mask: np.ndarray,
+    *,
+    coarse_size: int = 256,
+    tile_size: int = 256,
+    overlap: int = 128,
+    blend_mode: str = 'linear',
+    device: str | torch.device = 'cuda',
+    use_priostitch: bool = True,
+    tta: int = 1,
+    progress_cb=None,
+) -> dict:
+    """End-to-end: coarse pass, then fine tile pass with priostitch init.
 
-    Each row = one captured tile. Columns vary based on whether
-    DSM_min is available:
-
-    Without dsm_min (no min-z channel; baseline):
-      DSM | Prior DTM | Pred DTM | σ(ℓ) | Pred − GT (if GT given)
-
-    With dsm_min:
-      DSM | DSM_min | Canopy gap | Prior DTM | Pred DTM | Pred − DSM_min | σ(ℓ)
-
-    The "Canopy gap" panel highlights where DSM_min is significantly
-    below DSM — the "free ground info" cells. The "Pred − DSM_min"
-    panel shows whether the network trusts that signal as ground.
+    Defaults follow paper §3.3 + §8 Table 7 exactly:
+      coarse_size = 512 (network's input dimensions, paper §3.3)
+      tile_size   = 512 (matches training)
+      overlap     = 256 (paper "tiles overlap by 50 percent" scaled to 512² → stride 256)
+      blend_mode  = 'min' (best-performing PrioStitch ablation row)
 
     Args:
-        snapshots: list of dicts from `priostitch_inference(capture_tiles=...)`
-        out_path: file path for the saved PNG
-        dtm_gt_full: optional [H, W] full-scene GT DTM in metres. Used
-            to extract per-tile GT and add a final "pred − GT" column.
-        scene_id: title prefix
-        dsm_min_available: layout flag; if True, render the wide layout.
+        tta: 1 | 4 | 8 — test-time augmentation passes per fine tile.
+             Default 1 (no TTA). 8 = full D4 (paper's stage-1 default
+             for the test script). Costs `tta`× fine-pass time.
+
+    Returns dict with:
+        dtm_pred:    [H, W] float32 metres
+        logit:       [H, W] float32 raw confidence logits
+        prob_ground: [H, W] float32 in [0, 1]
+        coarse_dtm:  [Hc, Wc] float32 metres (the global prior)
     """
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    from pathlib import Path
-
-    if not snapshots:
-        return None
-
-    if dsm_min_available:
-        n_cols = 7 if dtm_gt_full is None else 8
-    else:
-        n_cols = 4 if dtm_gt_full is None else 5
-    n_rows = len(snapshots)
-
-    fig, axes = plt.subplots(n_rows, n_cols,
-                              figsize=(2.6 * n_cols, 2.7 * n_rows),
-                              squeeze=False)
-
-    for r, snap in enumerate(snapshots):
-        i, j = snap['origin']
-        tile = snap['tile_size']
-        v = snap['valid']
-        dsm_m = snap['dsm_m']
-        pred_m = snap['pred_m']
-        prob = snap.get('prob')
-        prior_m = snap.get('prior_m')
-        dsm_min_m = snap.get('dsm_min_m')
-
-        def _mask(arr):
-            return np.ma.masked_where(~v, arr)
-
-        # Common elev range across DSM, pred, GT (and DSM_min, prior if present)
-        rasters = [dsm_m, pred_m]
-        if dsm_min_m is not None: rasters.append(dsm_min_m)
-        if prior_m is not None: rasters.append(prior_m)
-        gt_tile = None
-        if dtm_gt_full is not None:
-            i1 = min(i + tile, dtm_gt_full.shape[0])
-            j1 = min(j + tile, dtm_gt_full.shape[1])
-            gt_tile = np.zeros((tile, tile), dtype=np.float32)
-            gt_tile[:i1 - i, :j1 - j] = dtm_gt_full[i:i1, j:j1]
-            rasters.append(gt_tile)
-        if v.any():
-            elev_min = float(min(rr[v].min() for rr in rasters))
-            elev_max = float(max(rr[v].max() for rr in rasters))
-        else:
-            elev_min, elev_max = 0.0, 1.0
-
-        col = 0
-        for a in axes[r]:
-            a.set_xticks([]); a.set_yticks([])
-
-        # Column 1: DSM
-        im = axes[r, col].imshow(_mask(dsm_m), cmap='terrain',
-                                  vmin=elev_min, vmax=elev_max)
-        axes[r, col].set_title('DSM' if r == 0 else '', fontsize=10)
-        axes[r, col].set_ylabel(f"({i},{j})", fontsize=9)
-        plt.colorbar(im, ax=axes[r, col], shrink=0.7)
-        col += 1
-
-        # DSM_min
-        if dsm_min_available:
-            if dsm_min_m is not None:
-                im = axes[r, col].imshow(_mask(dsm_min_m), cmap='terrain',
-                                          vmin=elev_min, vmax=elev_max)
-            axes[r, col].set_title('DSM_min' if r == 0 else '', fontsize=10)
-            if dsm_min_m is not None:
-                plt.colorbar(im, ax=axes[r, col], shrink=0.7)
-            col += 1
-
-            # Canopy gap = DSM - DSM_min
-            if dsm_min_m is not None:
-                gap = dsm_m - dsm_min_m
-                gmax = max(1.0, float(np.percentile(gap[v], 99))
-                           if v.any() else 1.0)
-                im = axes[r, col].imshow(_mask(gap), cmap='YlGn',
-                                          vmin=0, vmax=gmax)
-                plt.colorbar(im, ax=axes[r, col], shrink=0.7)
-            axes[r, col].set_title(
-                'DSM − DSM_min' if r == 0 else '', fontsize=10)
-            col += 1
-
-        # Prior DTM
-        if prior_m is not None:
-            im = axes[r, col].imshow(_mask(prior_m), cmap='terrain',
-                                      vmin=elev_min, vmax=elev_max)
-            plt.colorbar(im, ax=axes[r, col], shrink=0.7)
-        axes[r, col].set_title(
-            'Prior DTM' if r == 0 else '', fontsize=10)
-        col += 1
-
-        # Pred DTM
-        im = axes[r, col].imshow(_mask(pred_m), cmap='terrain',
-                                  vmin=elev_min, vmax=elev_max)
-        axes[r, col].set_title('Pred DTM' if r == 0 else '', fontsize=10)
-        plt.colorbar(im, ax=axes[r, col], shrink=0.7)
-        col += 1
-
-        # Pred − DSM_min (when available)
-        if dsm_min_available and dsm_min_m is not None:
-            diff = pred_m - dsm_min_m
-            dlim = max(0.5, float(np.percentile(np.abs(diff[v]), 99))
-                       if v.any() else 0.5)
-            im = axes[r, col].imshow(_mask(diff), cmap='RdBu_r',
-                                      vmin=-dlim, vmax=dlim)
-            axes[r, col].set_title(
-                'Pred − DSM_min' if r == 0 else '', fontsize=10)
-            plt.colorbar(im, ax=axes[r, col], shrink=0.7)
-            col += 1
-
-        # σ(ℓ)
-        if prob is not None:
-            im = axes[r, col].imshow(_mask(prob),
-                                      cmap='RdYlGn', vmin=0, vmax=1)
-            plt.colorbar(im, ax=axes[r, col], shrink=0.7)
-        axes[r, col].set_title('σ(ℓ)' if r == 0 else '', fontsize=10)
-        col += 1
-
-        # Pred − GT (if GT given)
-        if gt_tile is not None:
-            err = pred_m - gt_tile
-            elim = max(0.5, float(np.percentile(np.abs(err[v]), 99))
-                       if v.any() else 0.5)
-            im = axes[r, col].imshow(_mask(err), cmap='RdBu_r',
-                                      vmin=-elim, vmax=elim)
-            axes[r, col].set_title(
-                'Pred − GT' if r == 0 else '', fontsize=10)
-            plt.colorbar(im, ax=axes[r, col], shrink=0.7)
-            col += 1
-
-    fig.suptitle(f"{scene_id} — per-tile diagnostics "
-                 f"({len(snapshots)} tiles, ranked by canopy gap)",
-                 fontsize=11)
-    fig.tight_layout()
-    out_path = Path(out_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path, dpi=110, bbox_inches='tight')
-    plt.close(fig)
-    return out_path
+    coarse_dtm_m, z_lo, z_hi = None, None, None
+    if use_priostitch:
+        coarse_dtm_m, z_lo, z_hi = coarse_pass(
+            model, dsm_max, dsm_min, dsm_mean, dsm_mask,
+            coarse_size=coarse_size, device=device)
+    dtm_full, logit_full = fine_pass(
+        model, dsm_max, dsm_min, dsm_mean, dsm_mask,
+        coarse_dtm_m=coarse_dtm_m,
+        tile_size=tile_size, overlap=overlap, blend_mode=blend_mode,
+        device=device,
+        use_priostitch=use_priostitch, tta=tta,
+        progress_cb=progress_cb)
+    prob_ground = 1.0 / (1.0 + np.exp(-logit_full.astype(np.float64))).astype(np.float32)
+    return dict(
+        dtm_pred=dtm_full,
+        logit=logit_full,
+        prob_ground=prob_ground.astype(np.float32),
+        coarse_dtm=coarse_dtm_m,
+    )

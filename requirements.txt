@@ -1,9 +1,0 @@
-torch>=2.0
-numpy>=1.24
-scipy>=1.10
-laspy[lazrs]>=2.5
-tqdm>=4.65
-tensorboardX>=2.6
-matplotlib>=3.7
-pillow>=10.0
-rasterio>=1.3

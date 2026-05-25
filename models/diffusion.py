@@ -1,78 +1,65 @@
-"""GrounDiff diffusion process (paper §3.2 Eq.1-10).
+"""GrounDiff diffusion process (paper §3.2, Eq. 1-10).
 
-Forward (Eq.2):
-    g_t = √ᾱ_t · g_0 + √(1-ᾱ_t) · ε,   ε ~ N(0, I)
+We port the reference implementation from the original Stage-1 image
+GrounDiff (`stage1/models/diffusion.py`) one-to-one — same schedule,
+same sampling, same γ-encoding. The only thing this module changes
+relative to Stage 1 is the *backbone* it calls (PPD-style DiT instead
+of the OpenAI U-Net), and the multi-channel conditioning input.
 
-Denoiser (Eq.4):
-    (r̂, ℓ) = D_θ(g_t, s, t),   in_channel=2 [g_t, s], out_channel=2 [r̂, ℓ]
+Forward (Eq. 2):
+    g_t = √γ_t · g_0 + √(1 − γ_t) · ε,   ε ~ N(0, I)
 
-Gating (Eq.5):
-    G(r̂, ℓ, s) = σ(ℓ) ⊙ s + (1 - σ(ℓ)) ⊙ (s - r̂)
+Denoiser (Eq. 4):
+    (r̂, ℓ) = D_θ(x_t, γ_t),   where
+    x_t = concat([g_t, dsm_max, dsm_min], dim=1)  # 3 channels
 
-Reverse (Eq.7-10):
-    ĝ_t   = G(D_θ(g_t, s, t), s)               -- predicted clean DTM
-    µ_θ   = (β_t · √ᾱ_{t-1} · ĝ_t + (1-ᾱ_{t-1}) · √α_t · g_t) / (1-ᾱ_t)
-    σ_t²  = β_t · (1-ᾱ_{t-1}) / (1-ᾱ_t)
-    g_{t-1} = µ_θ + σ_t · ε
+Gating (Eq. 5, see `gating.py`):
+    G(r̂, ℓ, s) = σ(ℓ) ⊙ s + (1 − σ(ℓ)) ⊙ (s − r̂)
+    where s = dsm_max (the principal DSM channel).
 
-Inference start (paper §3.2):
-    g_T ~ N(s, I)   -- noisy DSM, NOT pure Gaussian noise.
+Reverse step (Eq. 7-10): predict g_0 via gating, then sample
+g_{t-1} ~ q(g_{t-1} | g_t, g_0_pred).
 
-We use Palette's γ-encoding convention (γ_t = ᾱ_t) since the UNet
-embeds γ rather than t directly. This is mathematically equivalent
-to t-encoding for fixed schedule, but lets the same denoiser be
-used at any noise level smoothly.
+Inference init (paper §3.2):
+    g_T ~ q_sample(s, γ_T)   "noisy DSM" init — much better than pure
+                              Gaussian init since s is already close to g.
 
-Schedule (paper §7.3):
-    T = 10 by default, cosine schedule β ∈ [1e-4, 2e-2]
+Schedule (paper §7.3): T=10 cosine β.
 """
 from __future__ import annotations
+
 import math
-import numpy as np
+
 import torch
 
 
 def _make_betas(schedule: str, T: int,
                 beta_start: float = 1e-4, beta_end: float = 2e-2,
-                cosine_s: float = 8e-3):
-    """Construct β schedule of length T.
-
-    'linear': linear interpolation [beta_start, beta_end].
-    'cosine': improved-DDPM cosine (Nichol & Dhariwal 2021), parametrised
-              by cosine_s. Endpoints β_start/β_end ignored.
-
-    Note paper §7.3 says 'cosine noise scheduler ranging from 0.0001 to
-    0.02'. Two readings of that sentence are common; we ship both
-    options. The 'cosine' default below uses Nichol & Dhariwal's exact
-    formula, which is what Palette uses.
-    """
-    if schedule == 'linear':
+                cosine_s: float = 8e-3) -> torch.Tensor:
+    """Build the β schedule. 'cosine' is the Nichol & Dhariwal 2021
+    parameterisation (used by Palette, recommended in GrounDiff §7.3)."""
+    if schedule == "linear":
         return torch.linspace(beta_start, beta_end, T, dtype=torch.float64)
-    if schedule == 'cosine':
+    if schedule == "cosine":
         ts = torch.arange(T + 1, dtype=torch.float64) / T + cosine_s
         alphas = torch.cos(ts / (1 + cosine_s) * math.pi / 2).pow(2)
         alphas = alphas / alphas[0]
         betas = 1 - alphas[1:] / alphas[:-1]
         return betas.clamp(max=0.999)
-    raise ValueError(f"Unknown schedule {schedule!r}")
-
-
-def gating(r_hat: torch.Tensor, logit: torch.Tensor,
-           dsm: torch.Tensor) -> torch.Tensor:
-    """Paper Eq.5: G(r̂, ℓ, s) = σ(ℓ)⊙s + (1-σ(ℓ))⊙(s - r̂)."""
-    sig = torch.sigmoid(logit)
-    return sig * dsm + (1.0 - sig) * (dsm - r_hat)
+    raise ValueError(f"unknown schedule {schedule!r}")
 
 
 class GrounDiffDiffusion:
-    """Holds the noise schedule and provides forward / reverse helpers.
+    """Holds the discrete noise schedule (T steps) and helpers.
 
-    Buffers (all length T, indexed 0..T-1 ↔ paper t=1..T):
-        betas, alphas, alphas_bar, sqrt_alphas_bar, sqrt_one_minus_alphas_bar
-        posterior_log_variance, posterior_mean_coef1, posterior_mean_coef2
+    All schedule tensors are 1-D of length T, indexed 0..T-1 ↔ paper
+    timesteps t = 1..T. We use Palette's γ_t = ᾱ_t convention so the
+    DiT can be γ-conditioned (continuous γ) at inference for smooth
+    sampling at any t — even though training samples γ from a small
+    discrete set this gives better behaviour at boundaries.
     """
 
-    def __init__(self, T: int = 10, schedule: str = 'cosine',
+    def __init__(self, T: int = 10, schedule: str = "cosine",
                  beta_start: float = 1e-4, beta_end: float = 2e-2,
                  cosine_s: float = 8e-3):
         betas = _make_betas(schedule, T, beta_start, beta_end, cosine_s)
@@ -84,7 +71,8 @@ class GrounDiffDiffusion:
         self.T = int(T)
         self.schedule = schedule
 
-        # Promote to fp32 once and stash; .to(device) on first batch use.
+        # Promote to fp32 and stash. Materialised on the device on first
+        # use via `.to(device)`.
         self.betas = betas.float()
         self.alphas = alphas.float()
         self.alphas_bar = alphas_bar.float()
@@ -92,13 +80,14 @@ class GrounDiffDiffusion:
         self.sqrt_alphas_bar = torch.sqrt(self.alphas_bar)
         self.sqrt_one_minus_alphas_bar = torch.sqrt(1.0 - self.alphas_bar)
 
-        # Posterior variance is 0 at t=0; clamp the log for numerical safety.
-        post_var = (self.betas
-                    * (1.0 - self.alphas_bar_prev)
-                    / (1.0 - self.alphas_bar).clamp(min=1e-20))
+        # Posterior variance (paper Eq. 8): β_t · (1 − ᾱ_{t-1}) / (1 − ᾱ_t).
+        post_var = (self.betas * (1.0 - self.alphas_bar_prev)
+                     / (1.0 - self.alphas_bar).clamp(min=1e-20))
         self.posterior_log_variance = torch.log(post_var.clamp(min=1e-20))
-        # Posterior mean coefs for q(g_{t-1} | g_t, g_0):
+
+        # Posterior mean coefficients for q(g_{t-1} | g_t, g_0):
         #   µ = c1 · g_0 + c2 · g_t
+        # (paper Eq. 10 split form).
         self.posterior_mean_coef1 = (
             self.betas * torch.sqrt(self.alphas_bar_prev)
             / (1.0 - self.alphas_bar).clamp(min=1e-20)
@@ -107,69 +96,70 @@ class GrounDiffDiffusion:
             (1.0 - self.alphas_bar_prev) * torch.sqrt(self.alphas)
             / (1.0 - self.alphas_bar).clamp(min=1e-20)
         )
-        self._device = None
+        self._device: torch.device | None = None
 
     def to(self, device):
         if self._device == device:
             return self
-        for name in ('betas', 'alphas', 'alphas_bar', 'alphas_bar_prev',
-                     'sqrt_alphas_bar', 'sqrt_one_minus_alphas_bar',
-                     'posterior_log_variance',
-                     'posterior_mean_coef1', 'posterior_mean_coef2'):
+        for name in ("betas", "alphas", "alphas_bar", "alphas_bar_prev",
+                     "sqrt_alphas_bar", "sqrt_one_minus_alphas_bar",
+                     "posterior_log_variance",
+                     "posterior_mean_coef1", "posterior_mean_coef2"):
             setattr(self, name, getattr(self, name).to(device))
         self._device = device
         return self
 
     @staticmethod
-    def _gather(coef: torch.Tensor, t: torch.Tensor,
-                shape) -> torch.Tensor:
-        """Gather schedule values at integer steps t and broadcast to
-        the given shape (e.g. [B,1,1,1] for an image batch)."""
+    def _gather(coef: torch.Tensor, t: torch.Tensor, shape) -> torch.Tensor:
+        """Gather schedule values at int steps t and broadcast to `shape`."""
         out = coef.gather(0, t)
         return out.view(t.shape[0], *([1] * (len(shape) - 1)))
 
-    # ------- Training-time helpers -------------------------------------
+    # ------------------------------------------------------------------ #
+    #  Training-time
+    # ------------------------------------------------------------------ #
 
     def sample_gammas(self, batch: int, device) -> torch.Tensor:
         """Palette-style continuous γ sampling.
 
-        For each example, sample a step t uniformly in {1..T}, then
-        sample γ uniformly in [ᾱ_t, ᾱ_{t-1}]. This gives the denoiser
-        smooth coverage of γ ∈ (0, 1] rather than only T discrete points.
+        Sample t ~ Uniform{1..T}, then γ ~ Uniform[ᾱ_t, ᾱ_{t-1}]. This
+        gives the denoiser smooth coverage of γ ∈ (0, 1] rather than
+        only T discrete points.
         """
         self.to(device)
-        t = torch.randint(1, self.T + 1, (batch,), device=device)  # 1..T
+        t = torch.randint(1, self.T + 1, (batch,), device=device)
         idx_t = (t - 1).long()
         idx_prev = (t - 2).clamp(min=0).long()
-        gamma_lo = self.alphas_bar.gather(0, idx_t)         # ᾱ_t
+        gamma_lo = self.alphas_bar.gather(0, idx_t)
         gamma_hi = torch.where(
             t > 1, self.alphas_bar.gather(0, idx_prev),
-            torch.ones_like(gamma_lo))                       # ᾱ_{t-1}, ᾱ_0=1
+            torch.ones_like(gamma_lo))
         u = torch.rand(batch, device=device)
-        return gamma_lo + (gamma_hi - gamma_lo) * u           # [B]
+        return gamma_lo + (gamma_hi - gamma_lo) * u
 
     def q_sample(self, g_0: torch.Tensor, gammas: torch.Tensor,
                  noise: torch.Tensor | None = None) -> torch.Tensor:
-        """Forward Eq.2 with γ_t = ᾱ_t.
-
-        g_t = √γ_t · g_0 + √(1-γ_t) · ε
-        """
+        """Forward Eq. 2: g_t = √γ · g_0 + √(1−γ) · ε."""
         if noise is None:
             noise = torch.randn_like(g_0)
         gammas = gammas.view(-1, 1, 1, 1).to(g_0)
         return gammas.sqrt() * g_0 + (1.0 - gammas).sqrt() * noise
 
-    # ------- Inference -------------------------------------------------
+    # ------------------------------------------------------------------ #
+    #  Inference
+    # ------------------------------------------------------------------ #
 
     @torch.no_grad()
-    def p_sample(self, model, g_t: torch.Tensor, dsm: torch.Tensor,
-                 t: int, return_logit: bool = False,
-                 dsm_min: torch.Tensor | None = None) -> torch.Tensor:
-        """One reverse step from g_t to g_{t-1}.
+    def p_sample(self, model, g_t: torch.Tensor,
+                 dsm_max: torch.Tensor, dsm_min: torch.Tensor,
+                 dsm_mask: torch.Tensor,
+                 t: int, *, return_logit: bool = False):
+        """One reverse step g_t → g_{t-1}.
 
-        model(x, gamma) -> (r̂, ℓ) stacked along channel axis where
-        x = cat([g_t, dsm, dsm_min?], dim=1) per paper §3.2.
+        `model(x, gamma)` must return [B, 2, H, W] (r̂, ℓ).
         """
+        from .gating import gating  # local import to avoid cycles
+
         device = g_t.device
         self.to(device)
         bs = g_t.shape[0]
@@ -177,16 +167,17 @@ class GrounDiffDiffusion:
         idx = torch.full((bs,), t - 1, device=device, dtype=torch.long)
         gamma = self.alphas_bar.gather(0, idx).view(bs, 1, 1, 1)
 
-        if dsm_min is not None:
-            x = torch.cat([g_t, dsm, dsm_min], dim=1)
-        else:
-            x = torch.cat([g_t, dsm], dim=1)
-        out = model(x, gamma.view(bs))                    # [B, 2, H, W]
+        # [g_t, dsm_max, dsm_min] — 3 channels matching official
+        # GrounDiff defra.json with `use_min_dsm: true`. dsm_mask is
+        # kept on the signature for backward compatibility but is no
+        # longer used as a network input.
+        x = torch.cat([g_t, dsm_max, dsm_min], dim=1)
+        out = model(x, gamma.view(bs))                # [B, 2, H, W]
         r_hat, logit = out[:, 0:1], out[:, 1:2]
-        g0_hat = gating(r_hat, logit, dsm).clamp(-1.0, 1.0)
+        # Use the principal DSM channel (max-z) as `s` in the gating fn.
+        g0_hat = gating(r_hat, logit, dsm_max).clamp(-1.0, 1.0)
 
         if t == 1:
-            # Posterior variance = 0 at the final step; just return g_0
             return (g0_hat, logit) if return_logit else g0_hat
 
         c1 = self._gather(self.posterior_mean_coef1, idx, g_t.shape)
@@ -198,48 +189,47 @@ class GrounDiffDiffusion:
         return (next_g, logit) if return_logit else next_g
 
     @torch.no_grad()
-    def sample(self, model, dsm: torch.Tensor,
-               init: str = 'noisy_dsm',
-               return_logit: bool = False,
-               dsm_min: torch.Tensor | None = None) -> torch.Tensor:
-        """Run full reverse process g_T → g_0, returning the final DTM."""
-        device = dsm.device
+    def sample(self, model, dsm_max: torch.Tensor, dsm_min: torch.Tensor,
+               dsm_mask: torch.Tensor,
+               *, init: str = "noisy_dsm", return_logit: bool = False):
+        """Run g_T → g_0 and return the predicted DTM (and final logit)."""
+        device = dsm_max.device
         self.to(device)
-        if init == 'noisy_dsm':
-            gamma_T = self.alphas_bar[-1].view(1).repeat(dsm.shape[0])
-            g_t = self.q_sample(dsm, gamma_T)
-        elif init == 'gaussian':
-            g_t = torch.randn_like(dsm)
+        if init == "noisy_dsm":
+            gamma_T = self.alphas_bar[-1].view(1).repeat(dsm_max.shape[0])
+            g_t = self.q_sample(dsm_max, gamma_T)
+        elif init == "gaussian":
+            g_t = torch.randn_like(dsm_max)
         else:
             raise ValueError(f"unknown init {init!r}")
 
         last_logit = None
         for t in reversed(range(1, self.T + 1)):
-            g_t, logit = self.p_sample(model, g_t, dsm, t,
-                                        return_logit=True,
-                                        dsm_min=dsm_min)
+            g_t, logit = self.p_sample(
+                model, g_t, dsm_max, dsm_min, dsm_mask, t,
+                return_logit=True)
             last_logit = logit
         if return_logit:
             return g_t, last_logit
         return g_t
 
     @torch.no_grad()
-    def sample_from_prior(self, model, dsm: torch.Tensor,
-                          prior_dtm: torch.Tensor,
-                          return_logit: bool = False,
-                          dsm_min: torch.Tensor | None = None
-                          ) -> torch.Tensor:
-        """PrioStitch: start the reverse from `q_sample(prior_dtm, γ_T)`
-        instead of N(s, I). `prior_dtm` is the upsampled global prior."""
-        device = dsm.device
+    def sample_from_prior(self, model, dsm_max: torch.Tensor,
+                          dsm_min: torch.Tensor,
+                          dsm_mask: torch.Tensor, prior_dtm: torch.Tensor,
+                          *, return_logit: bool = False):
+        """PrioStitch: start the reverse from q_sample(prior_dtm, γ_T)
+        instead of from N(s, I). `prior_dtm` is the upsampled global prior.
+        """
+        device = dsm_max.device
         self.to(device)
-        gamma_T = self.alphas_bar[-1].view(1).repeat(dsm.shape[0])
+        gamma_T = self.alphas_bar[-1].view(1).repeat(dsm_max.shape[0])
         g_t = self.q_sample(prior_dtm, gamma_T)
         last_logit = None
         for t in reversed(range(1, self.T + 1)):
-            g_t, logit = self.p_sample(model, g_t, dsm, t,
-                                        return_logit=True,
-                                        dsm_min=dsm_min)
+            g_t, logit = self.p_sample(
+                model, g_t, dsm_max, dsm_min, dsm_mask, t,
+                return_logit=True)
             last_logit = logit
         if return_logit:
             return g_t, last_logit

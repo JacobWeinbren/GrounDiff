@@ -1,153 +1,130 @@
-# GrounDiff (clean rebuild)
+# stage2_raster
 
-Paper-faithful reimplementation of GrounDiff (Dhaouadi et al., WACV 2026,
-arXiv:2511.10391), trained on DEFRA UK LIDAR. See `DECISIONS.md` for
-the small principled deviations (cls=2+9 for DTM ground returns).
+Pixel-space diffusion with paper-faithful GrounDiff loss & gating, for
+LAZ → DTM at 0.10 m resolution on DEFRA ALS. Backbone is a Palette-
+derived UNet (~80M params) — the same architecture lineage as stage 1
+GrounDiff, scaled up for 1024² tiles and 5-channel input. We chose
+UNet over the more fashionable DiT on the empirical evidence from
+Marigold (CVPR 2024) and its follow-ups that UNet remains SOTA for
+dense pixel-aligned regression tasks.
 
-The diffusion / denoising scaffolding is adapted from the Palette
-image-to-image diffusion implementation (Janspiry/Palette-Image-to-Image-
-Diffusion-Models), which itself adapts openai/guided-diffusion.
-
-## Install
-
-```bash
-pip install -r requirements.txt
-```
-
-## Verified paper claims
-
-| Claim                          | Paper      | This impl. | Where verified                          |
-|--------------------------------|------------|------------|-----------------------------------------|
-| UNet parameter count           | 62.6M      | 62.64M     | analytic, see `DECISIONS.md`            |
-| UNet input channels            | 2          | 2          | `models/unet.py` `in_channel=2`         |
-| UNet output channels           | 2 (r̂, ℓ)  | 2          | `models/unet.py` `out_channel=2`        |
-| Diffusion forward Eq.2         | √ᾱ_t·g₀+√(1-ᾱ_t)·ε | same | `models/diffusion.py::q_sample`     |
-| Gating Eq.5                    | σ(ℓ)·s + (1-σ(ℓ))·(s-r̂) | same | `models/diffusion.py::gating`        |
-| Loss Eq.11-14, λ₁=λ₂=1, λ_∇=λ_c=0.1 | yes  | yes        | `models/losses.py::groundiff_loss`      |
-| Gradient loss Eq.13 magnitude-only | yes    | yes        | `models/losses.py::_grad_magnitude`     |
-| Norm Eq.15 joint min-max → [-1,1] | yes     | yes        | `data/normalize.py`                     |
-| Aug §7.1 rot/jitter/resize/crop/flip @ p=0.5 | yes | yes  | `data/augment.py::groundiff_augment`    |
-| Init at inference `g_T ~ N(s, I)` | yes     | yes        | `diffusion.py::sample` w/ `noisy_dsm`   |
-| PrioStitch §3.3 prior-init + blend | yes    | yes        | `utils/priostitch.py`                   |
-| AdamW lr=1e-4 wd=0.01 cos+warmup 500 | yes  | yes        | `scripts/train.py` + `configs/*.json`   |
-| T=10, β cosine [1e-4, 2e-2]    | yes        | yes        | `models/diffusion.py::_make_betas`      |
-
-## Workflow
-
-### 1. Preprocess DEFRA LAZ → tiles
+## Quick start
 
 ```bash
-python -u -m scripts.preprocess \
-    --laz_root /data/england_split \
-    --out_dir  /data/england_tiles \
-    --gsd 0.5 \
-    --tile 256 \
-    --workers 8
+# Edit paths at the top of INSTALL_AND_RUN.sh, then:
+./INSTALL_AND_RUN.sh
 ```
 
-Expected wall-clock: 30-45 min on the full DEFRA corpus (~960 LAZ
-files, 8 workers, H100). Output: `/data/england_tiles/{train,test}/`,
-~200-400 GB total at fp16+gzip compression.
+This will: install deps → preprocess LAZ → pick 20 representative scenes
+→ train 300k steps → run PrioStitch inference on those 20 → render
+visualisations.
 
-### 2. Sanity-check the tiles
-
-```bash
-python -u -m scripts.visualize_inputs \
-    --tile_dir /data/england_tiles \
-    --out_dir runs/input_viz \
-    --split test --max_tiles 16
+Outputs land under `$RUN_ROOT/`:
+```
+preprocessed/<scene>/raster.npz       raster cache (idempotent, .done markers)
+run/train.log                         human-readable log
+run/metrics.csv                       per-step  (step,lr,loss,l1,l2,grad,conf,sps)
+run/val_metrics.csv                   per-eval  (step,loss,l1,l2,grad,conf,
+                                        e_t1_pct,e_t2_pct,e_tot_pct,n_tiles,n_pixels)
+run/split.json                        stratified train/val scene-name split
+                                        (reused across resumes; delete to re-split)
+run/viz_scenes.json                   the 20 representative val scenes picked
+                                        before training (reused on resume)
+run/viz/step_NNNNNNNN/                per-val visualisations -- one dir per val
+  ├ <scene>_elevation.png             pass. Each holds elevation + analysis PNGs
+  ├ <scene>_analysis.png              + a metrics CSV for every viz scene + a
+  ├ <scene>_metrics.csv               rollup.csv across the whole step.
+  └ rollup.csv
+run/latest.pt, run/best.pt            checkpoints (resumable)
+eval/laz/<scene>.classified.laz       FINAL output LAZ with extra dims
+eval/laz/<scene>.classified.stats.json per-point E_T1/E_T2/E_tot vs original cls
+eval/metrics_rollup.csv               final per-scene rollup across all 20 scenes
 ```
 
-You should see DSM + DTM normed to [-1, 1] with a high-coverage valid
-mask. Empty/0% tiles indicate a preprocessing problem (e.g.
-ground-class returns missing — check `cls 2 ∪ 9` actually present).
+The `run/viz/step_NNNNNNNN/` directories let you scrub through training and
+watch the same 20 held-out scenes improve: any image viewer's "browse next file"
+key (or `ffmpeg -framerate 2 -pattern_type glob -i 'run/viz/*/SCENE_elevation.png'
+training_progress.mp4`) gives you a flipbook.
 
-### 3. Train
+## Design choices (paper-faithful or explicit deviation)
 
-```bash
-python -u -m scripts.train \
-    --config configs/defra.json \
-    --tile_dir /data/england_tiles \
-    --name_suffix v1
-```
+| Component | Source | Notes |
+|---|---|---|
+| Loss `L1 + L2 + 0.1·L∇ + 0.1·L_c` | GrounDiff §3.2 Eq. 11-14 | unchanged. L∇ uses gradient *magnitude* (paper §3.2). |
+| Gating `σ(ℓ)·s + (1-σ(ℓ))·(s-r̂)` | GrounDiff Eq. 5 | unchanged. |
+| Diffusion T=10 cosine β | GrounDiff §7.3 | unchanged. γ-encoded (Palette) for continuous training γ. |
+| α_metres = 0.20 m | Sithole-Vosselman 2003 §4.2.1 | built into preprocess; M_α stored in raster.npz. |
+| 5 input channels: g_t + dsm_max/min/mean/mask | new (paper uses single DSM) | min and mean help separate canopy from ground; mask flags empty cells. |
+| Pixel-space UNet backbone | Palette / OpenAI-guided-diffusion lineage; same arch family as stage 1; choice validated by Marigold (CVPR 2024) | 5 levels for 1024² tile, channel_mults=(1,2,4,4,8), attention at 64×64 bottleneck, ~80M params. Conv inductive bias matches dense regression on terrain. |
+| Per-tile normalisation: DSM-only frame | deviation from GrounDiff §7.2 | Paper uses min/max of DSM ∪ DTM; can't use DTM at inference. We use `[dsm_min.min(), dsm_max.max()]` with a 1 m min-span. |
+| Hard mining | new | per-tile EMA loss tracker; Metropolis-style acceptance. |
 
-Logs to `experiments/groundiff_defra_v1_<timestamp>/`:
-- `train.log` — text log
-- `tb/` — TensorBoard scalars
-- `checkpoint/best.pt` — best-by-val-RMSE
-- `checkpoint/epoch_NNNN.pt` — periodic snapshots
-
-Validation runs every epoch and prints physical-unit metrics:
-
-```
-ep N val (n=...): RMSE=0.18m  MAE=0.07m  err>0.5m=2.1%  err>1.0m=0.5%
-```
-
-Paper Tab.1 baseline (DSM-only on DALES): RMSE 0.16m, MAE 0.094m,
-err>0.5m 5.2%, err>1.0m 2.0%. With ~250× more training data than
-DALES, expect to meet or beat these numbers within a few epochs.
-
-### 4. Test (full PrioStitch evaluation)
-
-```bash
-python -u -m scripts.test \
-    --config configs/defra.json \
-    --tile_dir /data/england_tiles \
-    --resume experiments/groundiff_defra_v1_<run>/checkpoint/best.pt \
-    --out_dir runs/test_eval
-```
-
-Writes `runs/test_eval/metrics.csv` with per-scene + global numbers.
-
-### 5. Single-scene inference
-
-```bash
-python -u -m scripts.infer_priostitch \
-    --config configs/defra.json \
-    --resume experiments/.../best.pt \
-    --scene_npz /data/england_tiles/test/EN_TQ24/_scene_EN_TQ24.npz \
-    --out_path /tmp/EN_TQ24_pred_dtm.npz
-```
-
-Output `.npz` contains `dtm_pred` (predicted DTM in metres), `valid`,
-`bbox`, `gsd`, `stats`.
-
-## Repo layout
+## Repository layout
 
 ```
-groundiff/
+stage2_raster/
 ├── README.md
-├── DECISIONS.md
-├── requirements.txt
+├── INSTALL_AND_RUN.sh           # one-shot pipeline driver
 ├── configs/
-│   ├── default.json     # paper-faithful defaults
-│   └── defra.json       # DEFRA path overrides
-├── data/
-│   ├── normalize.py     # paper Eq.15 joint min-max
-│   ├── augment.py       # paper §7.1 augmentation
-│   └── dataset.py       # tile dataset
+│   └── defra.json               # production config: 300k steps, UNet (~80M params)
 ├── models/
-│   ├── nn.py            # building blocks (GroupNorm, gamma_embedding, ...)
-│   ├── unet.py          # 62.6M-param GrounDiff U-Net
-│   ├── diffusion.py     # forward/reverse + gating
-│   ├── losses.py        # paper Eq.11-14
-│   ├── metrics.py       # RMSE, MAE, E_T thresholds
-│   └── groundiff.py     # top-level wrapper
+│   ├── __init__.py              # exports
+│   ├── nn_unet.py               # GroupNorm32, zero_module, gamma_embedding helpers
+│   ├── unet.py                  # GrounDiffUNet (Palette-derived; stage-1 lineage scaled up)
+│   ├── gating.py                # paper Eq. 5
+│   ├── diffusion.py             # T=10 cosine + γ-encoding + sampling
+│   ├── losses.py                # paper §3.2 Eq. 11-14
+│   └── groundiff_raster.py      # top-level wrapper
+├── data/
+│   ├── __init__.py
+│   ├── preprocess.py            # LAZ → raster.npz {dsm_max/min/mean/mask, gt_dtm, valid, m_alpha, had_ground_return, bbox, gsd, alpha_metres}
+│   └── dataset.py               # RasterTileDataset (iterable, hard mining) + RasterEvalTiles
 ├── scripts/
-│   ├── preprocess.py    # LAZ → DSM+DTM tiles
-│   ├── train.py
-│   ├── test.py          # PrioStitch eval + CSV
-│   ├── visualize_inputs.py
-│   └── infer_priostitch.py
+│   ├── train.py                 # AdamW + cosine LR + EMA, CSV logging, OOM-safe, resumable
+│   ├── infer_to_laz.py          # PrioStitch → per-point bilinear sample → LAZ with extra dims
+│   ├── visualize.py             # 5-panel figure
+│   └── select_scenes.py         # pick 20 PrioStitch-sized scenes, diverse by pct_M_α
 └── utils/
-    ├── checkpoint.py
-    └── priostitch.py    # paper §3.3 tiling/blending
+    ├── __init__.py
+    ├── colormap.py              # hypsometric + BWR + classification colormaps
+    └── priostitch.py            # coarse_pass + fine_pass + priostitch_infer
 ```
 
-## Acknowledgement
+## Classification (what counts as ground)
 
-- Paper: Dhaouadi, Meier, Kaiser, Cremers. *GrounDiff: Diffusion-Based
-  Ground Surface Generation from Digital Surface Models.* WACV 2026.
-- Diffusion scaffolding adapted from
-  [Palette-Image-to-Image-Diffusion-Models](https://github.com/Janspiry/Palette-Image-to-Image-Diffusion-Models)
-  which adapts [openai/guided-diffusion](https://github.com/openai/guided-diffusion).
+There are two layers:
+
+**Cell-level** (the 10×10 cm raster grid): a cell is predicted ground iff
+`σ(ℓ) ≥ 0.5` where `ℓ` is the per-pixel logit from the model's confidence
+head. This is what the `Classification` visualisation panel shows and what
+`val_metrics.csv` E_T1/E_T2 are computed against.
+
+**Point-level** (the original ALS points): each LAZ point at `(x, y, z)`
+gets `ẑ = bilinear_sample(dtm_pred, x, y)`, then is classified as ground
+iff `|z − ẑ| < α` (with α defaulting to 0.20 m, the same threshold used
+to build the training mask M_α). This is what `infer_to_laz.py` writes
+back to the output LAZ classification field.
+
+The two agree by construction at trained convergence: σ(ℓ) ≈ M_α =
+`|s − ĝ| < α` at the cell, and per-point classification with the same α
+threshold lifts that decision from the cell to its constituent points.
+
+## Inputs / outputs
+
+**Input**: a directory of `.copc.laz` files (typical DEFRA ALS).
+
+**Preprocess output** per scene `<name>/raster.npz`:
+- `dsm_max`, `dsm_min`, `dsm_mean`  `[H,W]` float32, metres
+- `dsm_mask`   `[H,W]` uint8, 1 iff cell has ≥1 ALS return
+- `gt_dtm`     `[H,W]` float32, TIN-interpolated GT
+- `valid`      `[H,W]` uint8, GT defined (inside TIN hull)
+- `m_alpha`    `[H,W]` uint8, `|s − g| < α_metres` AND valid
+- `had_ground_return` `[H,W]` uint8, ≥1 ALS return classified as ground (cls 2/9)
+- `bbox`, `gsd`, `alpha_metres`
+
+**Final LAZ output** has standard `classification` overwritten (2 = ground,
+1 = non-ground) plus four extra dimensions:
+- `dtm_pred_z`  (float32): ẑ at each point
+- `residual_z`  (float32): z − ẑ
+- `prob_ground` (uint16): σ(ℓ) at each point (after bilinear sample)
+- `gt_class`    (uint8): the original LAZ classification, preserved

@@ -1,28 +1,48 @@
-"""GrounDiff U-Net (paper §3.2 + Fig.4).
+"""GrounDiff U-Net backbone.
 
-Architecture (from poster + Fig.4):
-  - Encoder: Conv2D(in→64) → ResBlocks(64) → ResBlock+Down(128) →
-             ResBlocks(128) → ResBlock+Down(256) → ResBlocks(256) →
-             ResBlock+Down(512) → ResBlocks(512) → ResBlock+Down(512)
-  - Bottleneck: ResBlock(512) + SelfAttention + ResBlock(512)
+Architectural pedigree:
+  OpenAI guided-diffusion → Palette (Saharia et al. 2022) → official
+  GrounDiff (Dhaouadi et al., WACV 2026) → this. The structural code —
+  pre-activation ResBlocks, FiLM scale-shift, GroupNorm32 with fp32
+  upcast, SiLU, bottleneck self-attention, zero-init final conv,
+  γ-encoded conditioning — is Palette / guided-diffusion lineage.
+  We train from scratch in pixel space on the 4-channel conditioning
+  input.
+
+Architecture summary (paper §8.1, image_size=256, 62.6M params):
+  - Encoder: Conv2D(4 → C) → ResBlocks(C) → ResBlock+Down(2C) →
+             ResBlocks(2C) → ResBlock+Down(4C) → ResBlocks(4C) →
+             ResBlock+Down(8C) → ResBlocks(8C)
+             (channel_mults=(1,2,4,8), 4 levels, 3 downsamples)
+  - Bottleneck: ResBlock + SelfAttention + ResBlock at 32×32 (for 256²
+                input) = 1024 attention tokens per head.
   - Decoder: mirrors encoder with concatenative skip connections.
-  - Out: GroupNorm → SiLU → zero_module(Conv2D(64 → 2))
+  - Out: GroupNorm → SiLU → zero_module(Conv2D(C → 2))
         First output channel = r̂ (residual / nDSM)
         Second output channel = ℓ (per-pixel confidence logits)
-  - FiLM timestep conditioning per ResBlock (γ embedding).
+  - FiLM γ-conditioning per ResBlock (γ embedding → scale, shift).
 
-Defaults give ~62.6M parameters at image_size=256 (paper §8.1).
+Why these scales (256² tile, 4 channels):
+  - Paper §7.1: 256×256 tiles, single-scale operation.
+  - 3 downsamples: 256 → 128 → 64 → 32. The 32×32 bottleneck gives
+    1024 attention tokens — receptive field spans the whole tile.
+  - inner_channel=64, mults=(1,2,4,8) puts the deepest level at 512
+    channels. Total ~62.6M params (matches paper §8.1 exactly with
+    in_channels=2; our in_channels=4 adds ~1500 stem-conv weights,
+    negligible).
 
-Adapted from openai/guided-diffusion via Palette.
+Forward signature:
+    forward(x: [B, 4, H, W], gammas: [B]) -> [B, 2, H, W]
 """
 from __future__ import annotations
+
 from abc import abstractmethod
 import math
+
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-from .nn import normalization, zero_module, gamma_embedding
+from .nn_unet import normalization, zero_module, gamma_embedding
 
 
 class _EmbedBlock(nn.Module):
@@ -33,6 +53,7 @@ class _EmbedBlock(nn.Module):
 
 class _EmbedSequential(nn.Sequential, _EmbedBlock):
     """Sequential that propagates `emb` only into _EmbedBlock children."""
+
     def forward(self, x, emb):
         for layer in self:
             x = layer(x, emb) if isinstance(layer, _EmbedBlock) else layer(x)
@@ -49,7 +70,7 @@ class _Upsample(nn.Module):
             self.conv = nn.Conv2d(channels, out_ch, 3, padding=1)
 
     def forward(self, x):
-        x = F.interpolate(x, scale_factor=2, mode='nearest')
+        x = nn.functional.interpolate(x, scale_factor=2, mode="nearest")
         if self.use_conv:
             x = self.conv(x)
         return x
@@ -71,7 +92,7 @@ class _Downsample(nn.Module):
 
 class _ResBlock(_EmbedBlock):
     """Pre-activation ResBlock with FiLM γ-conditioning, optionally
-    folding up/downsampling into the residual path."""
+    folding up/down-sampling into the residual path."""
 
     def __init__(self, channels, emb_ch, dropout=0.0, out_ch=None,
                  use_scale_shift_norm=True, up=False, down=False):
@@ -95,7 +116,6 @@ class _ResBlock(_EmbedBlock):
         else:
             self.h_upd = self.x_upd = nn.Identity()
 
-        # FiLM: emb → 2*out_ch (scale, shift) when use_scale_shift_norm
         emb_out_dim = 2 * out_ch if use_scale_shift_norm else out_ch
         self.emb_layers = nn.Sequential(
             nn.SiLU(),
@@ -139,7 +159,15 @@ class _ResBlock(_EmbedBlock):
 
 class _Attention(nn.Module):
     """Spatial self-attention block (multi-head). Applied at the
-    bottleneck only by default — paper Fig.4."""
+    bottleneck only by default.
+
+    Uses `F.scaled_dot_product_attention` which on Blackwell dispatches
+    to FlashAttention (or memory-efficient attention) automatically. At
+    our bottleneck of 64×64 = 4096 tokens with 4-16 heads, this is much
+    faster and lower-memory than a manual einsum because it fuses the
+    QK^T → softmax → AV chain into one kernel and avoids materialising
+    the [4096, 4096] attention matrix in HBM.
+    """
 
     def __init__(self, channels, num_heads=4, num_head_channels=-1):
         super().__init__()
@@ -158,51 +186,72 @@ class _Attention(nn.Module):
 
     def forward(self, x):
         b, c, h, w = x.shape
-        flat = x.reshape(b, c, h * w)
-        qkv = self.qkv(self.norm(flat))                       # [B, 3C, HW]
-        qkv = qkv.view(b * self.num_heads, 3 * self.head_dim, h * w)
-        q, k, v = qkv.split(self.head_dim, dim=1)
-        scale = 1.0 / math.sqrt(math.sqrt(self.head_dim))
-        # More numerically stable than scaling once after the matmul
-        attn = torch.einsum('bct,bcs->bts', q * scale, k * scale)
-        attn = torch.softmax(attn.float(), dim=-1).type(attn.dtype)
-        out = torch.einsum('bts,bcs->bct', attn, v)
-        out = out.reshape(b, c, h * w)
+        n = h * w
+        flat = x.reshape(b, c, n)
+        qkv = self.qkv(self.norm(flat))                       # [B, 3C, N]
+        # Build Q, K, V each as [B, num_heads, N, head_dim] with
+        # last-dim-contiguous strides. The contiguous() call materialises
+        # the transpose so Inductor doesn't have to insert a layout-
+        # conversion copy at every compiled SDPA call. Without it we get
+        # the `Layout conflict detected for bufNNN: ... but layout is
+        # frozen to [stride 1 on middle dim]` warnings during compile,
+        # and the resulting code runs an extra copy per attention.
+        qkv = qkv.reshape(b, 3, self.num_heads, self.head_dim, n)
+        q, k, v = qkv.unbind(dim=1)                           # each [B, H, D, N]
+        q = q.transpose(-1, -2).contiguous()                   # [B, H, N, D]
+        k = k.transpose(-1, -2).contiguous()
+        v = v.transpose(-1, -2).contiguous()
+        out = nn.functional.scaled_dot_product_attention(q, k, v)
+        out = out.transpose(-1, -2).reshape(b, c, n)           # [B, C, N]
         out = self.proj_out(out)
         return (flat + out).reshape(b, c, h, w)
 
 
 class GrounDiffUNet(nn.Module):
-    """GrounDiff denoiser (paper §3.2 Fig.4).
+    """GrounDiff denoiser (UNet backbone).
 
-    in_channel: 2 — (DSM, noisy_DTM) channel-concatenated.
-    out_channel: 2 — (residual r̂, confidence logit ℓ).
-    inner_channel: 64 — base width.
-    channel_mults: (1, 2, 4, 8) — width per stage.
-    res_blocks: 2 per stage.
-    attn_res: {16} — attention only at the bottleneck level (paper).
+    in_channels: 4 — [g_t, dsm_max, dsm_min, dsm_mean].
+    out_channels: 2 — [r̂, ℓ] (residual + confidence logit).
 
-    With image_size=256, channel_mults=(1,2,4,8), this gives spatial
-    resolutions 256→128→64→32→16, and ~62.6M parameters (paper §8.1).
+    Defaults (paper §8.1, image_size=256):
+        inner_channel=64, channel_mults=(1, 2, 4, 8), 4 levels.
+        Bottleneck at 1/8 spatial (32×32 for 256² input) with
+        self-attention. ~62.6M parameters at in_channels=2;
+        in_channels=4 adds ~1500 stem-conv weights (negligible).
+
+    `attn_at_levels=()` is bottleneck-only attention (paper). The
+    bottleneck's always-on residual-attention-residual stack is built
+    regardless of this list — adding levels here ADDS attention at
+    shallower encoder/decoder depths, with quadratic memory cost in
+    the attention spatial extent.
     """
 
-    def __init__(self, *, image_size: int = 256,
-                 in_channel: int = 2,
-                 out_channel: int = 2,
-                 inner_channel: int = 64,
-                 channel_mults=(1, 2, 4, 8),
-                 attn_res=(16,),
-                 res_blocks: int = 2,
-                 num_head_channels: int = 32,
-                 dropout: float = 0.0,
-                 use_scale_shift_norm: bool = True):
+    def __init__(
+        self,
+        *,
+        in_channels: int = 4,
+        out_channels: int = 2,
+        inner_channel: int = 64,
+        channel_mults=(1, 2, 4, 8),
+        attn_at_levels=(),
+        res_blocks: int = 2,
+        num_head_channels: int = 32,
+        dropout: float = 0.0,
+        use_scale_shift_norm: bool = True,
+        zero_init_output: bool = True,
+    ):
         super().__init__()
-        self.image_size = image_size
-        self.in_channel = in_channel
-        self.out_channel = out_channel
+        self.in_channels = in_channels
+        self.out_channels = out_channels
         self.inner_channel = inner_channel
+        # Store for downstream consumers (e.g. PrioStitch needs to know
+        # the spatial divisibility constraint for resampling). Each level
+        # except the last in channel_mults adds a stride-2 downsample, so
+        # input H/W must be divisible by 2 ** (len(channel_mults) - 1).
+        self.channel_mults = tuple(channel_mults)
+        self.grid_multiple = 2 ** (len(self.channel_mults) - 1)
 
-        # γ → embedding → MLP
+        # γ-embedding MLP: matches Palette / guided-diffusion convention.
         emb_ch = inner_channel * 4
         self.cond_embed = nn.Sequential(
             nn.Linear(inner_channel, emb_ch),
@@ -210,13 +259,20 @@ class GrounDiffUNet(nn.Module):
             nn.Linear(emb_ch, emb_ch),
         )
 
+        # Translate level indices (0-based depth from input) into the
+        # `ds` counter (downsample factor). attn_at_levels=() leaves
+        # attention bottleneck-only (paper §3.2). Passing e.g. (3,)
+        # would ADD attention at encoder/decoder level 3 (ds=8) on top
+        # of the bottleneck.
+        attn_ds = {2 ** lvl for lvl in attn_at_levels}
+
         ch = int(channel_mults[0] * inner_channel)
         input_ch = ch
         self.input_blocks = nn.ModuleList(
-            [_EmbedSequential(nn.Conv2d(in_channel, ch, 3, padding=1))]
+            [_EmbedSequential(nn.Conv2d(in_channels, ch, 3, padding=1))]
         )
         skip_chs = [ch]
-        ds = 1                                    # downsample factor
+        ds = 1
         for level, mult in enumerate(channel_mults):
             for _ in range(res_blocks):
                 layers = [
@@ -225,7 +281,7 @@ class GrounDiffUNet(nn.Module):
                               use_scale_shift_norm=use_scale_shift_norm)
                 ]
                 ch = int(mult * inner_channel)
-                if ds in attn_res:
+                if ds in attn_ds:
                     layers.append(
                         _Attention(ch, num_head_channels=num_head_channels))
                 self.input_blocks.append(_EmbedSequential(*layers))
@@ -241,7 +297,7 @@ class GrounDiffUNet(nn.Module):
                 skip_chs.append(ch)
                 ds *= 2
 
-        # Bottleneck: Res → Attn → Res
+        # Bottleneck always has attention regardless of attn_at_levels.
         self.middle_block = _EmbedSequential(
             _ResBlock(ch, emb_ch, dropout,
                       use_scale_shift_norm=use_scale_shift_norm),
@@ -260,7 +316,7 @@ class GrounDiffUNet(nn.Module):
                               use_scale_shift_norm=use_scale_shift_norm)
                 ]
                 ch = int(inner_channel * mult)
-                if ds in attn_res:
+                if ds in attn_ds:
                     layers.append(
                         _Attention(ch, num_head_channels=num_head_channels))
                 if level and i == res_blocks:
@@ -271,22 +327,36 @@ class GrounDiffUNet(nn.Module):
                     ds //= 2
                 self.output_blocks.append(_EmbedSequential(*layers))
 
+        out_conv = nn.Conv2d(ch, out_channels, 3, padding=1)
+        if zero_init_output:
+            out_conv = zero_module(out_conv)
         self.out = nn.Sequential(
             normalization(ch),
             nn.SiLU(),
-            zero_module(nn.Conv2d(ch, out_channel, 3, padding=1)),
+            out_conv,
         )
 
-    def forward(self, x: torch.Tensor, gammas: torch.Tensor):
+    def forward(self, x: torch.Tensor, gammas: torch.Tensor) -> torch.Tensor:
         """Forward pass.
 
         Args:
-            x:      [B, in_channel, H, W] — concat of cond and noisy target
-            gammas: [B] — γ_t = ᾱ_t for the batch (Palette convention)
+            x:      [B, in_channels, H, W] — [g_t, dsm_max, dsm_min,
+                    dsm_mean] concatenated (4 channels).
+            gammas: [B] — γ (cumulative noise level).
 
         Returns:
-            [B, out_channel, H, W] — first channel r̂, second ℓ.
+            [B, out_channels, H, W] — channel 0 r̂, channel 1 ℓ.
         """
+        # Channels-last (NHWC) layout. cuDNN's tensor-core conv kernels
+        # are ~10-30% faster when both weights and activations live in
+        # NHWC. Weight conversion happens once in train.py
+        # (`model.to(memory_format=torch.channels_last)`); we convert
+        # input activations here so every forward — training, eval,
+        # PrioStitch inference — gets the fast path. On CPU this is a
+        # no-op stride change; on CUDA it's a single async copy whose
+        # cost is dwarfed by the conv speedup.
+        if x.is_cuda:
+            x = x.to(memory_format=torch.channels_last)
         emb = self.cond_embed(gamma_embedding(gammas.view(-1),
                                               self.inner_channel))
         h = x
