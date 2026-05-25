@@ -872,6 +872,7 @@ def main():
     # (low util, oscillating), bump prefetch_factor and/or num_workers.
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, num_workers=num_workers,
+        shuffle=True,                       # randomise tile order each epoch
         pin_memory=(device != 'cpu'),
         prefetch_factor=prefetch_factor if num_workers > 0 else None,
         persistent_workers=(num_workers > 0))
@@ -1088,6 +1089,7 @@ def main():
         time.sleep(2.0)
         train_loader = DataLoader(
             train_ds, batch_size=batch_size, num_workers=num_workers,
+            shuffle=True,                   # keep randomised after a reset
             pin_memory=(device != 'cpu'),
             prefetch_factor=prefetch_factor if num_workers > 0 else None,
             persistent_workers=(num_workers > 0))
