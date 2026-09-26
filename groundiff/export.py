@@ -79,6 +79,7 @@ def export(ckpt: str | Path, out: str | Path, use_ema: bool = True, opset: int =
         x = torch.randn(2, net.n_input_channels, t, t)     # [prior, guidance...]
         args, names = (x,), ["x"]
         dyn = {"x": {0: "batch"}, "out": {0: "batch"}}
+    print(f"exporting {onnx_path} ...", flush=True)
     try:
         torch.onnx.export(net, args, str(onnx_path), input_names=names, output_names=["out"],
                           dynamic_axes=dyn, opset_version=opset, dynamo=False)
@@ -91,6 +92,7 @@ def export(ckpt: str | Path, out: str | Path, use_ema: bool = True, opset: int =
         _inline_weights(onnx_path)
     spec.to_json(json_path)
     _embed_spec(onnx_path, json_path.read_text())
+    print(f"wrote {onnx_path} (usable now); checking it against PyTorch, up to a few minutes ...", flush=True)
     if check:
         ref = TorchNet(model, "cpu")
         ox = OnnxNet(onnx_path, ["CPUExecutionProvider"])
