@@ -42,6 +42,7 @@ import csv
 import glob
 import json
 import math
+import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, wait
@@ -87,13 +88,18 @@ def expand_inputs(paths: list) -> list[Path]:
     """Expand wildcards (Windows shells do not) and folders; drop duplicates."""
     out, seen = [], set()
     for p in paths:
-        p = str(p)
+        p = str(p).strip()
+        if not p:                              # a blank entry would mean "the current folder"
+            continue
         # a real path is used as is (names may contain [ ] which glob would treat as a pattern)
         hits = [p] if Path(p).exists() else sorted(glob.glob(p))
         for h in hits:
             hp = Path(h)
-            files = (sorted(q for q in hp.rglob("*") if q.suffix.lower() in (".las", ".laz"))
-                     if hp.is_dir() else ([hp] if hp.suffix.lower() in (".las", ".laz") else []))
+            if hp.is_dir() and (hp.resolve() == Path(hp.resolve().anchor) or hp.resolve() == Path.home()):
+                raise ValueError(f"{p}: refusing to search a whole disk or home folder for LAS/LAZ files; "
+                                 "pick the files or the folder that holds them")
+            files = (_find_las(hp) if hp.is_dir()
+                     else ([hp] if hp.suffix.lower() in (".las", ".laz") else []))
             if not files:
                 print(f"[warn] {p}: matches no .las/.laz file")
             for f in files:
@@ -103,6 +109,15 @@ def expand_inputs(paths: list) -> list[Path]:
                     seen.add(key)
                     out.append(f)
     return out
+
+
+def _find_las(folder: Path) -> list[Path]:
+    """LAS/LAZ files under folder; unreadable or offline sub-folders (cloud drives) are skipped."""
+    found = []
+    for root, dirs, names in os.walk(folder, onerror=lambda e: None):
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        found += [Path(root) / n for n in names if n.lower().endswith((".las", ".laz"))]
+    return sorted(found)
 
 
 def tile_extent(path: Path, max_extent_m: float = 5000.0, log: Callable = print) -> tuple:
@@ -385,12 +400,16 @@ def run_batch(tiles: list, out_dir: str | Path, net, spec: RuntimeSpec, *, gsd: 
               buffer_m: float | None = None, workers: int = 1, read_opts: dict | None = None,
               overlays: bool = True, predict_kwargs: dict | None = None, max_block_m: float = 1000.0,
               block_m: float = 100.0, progress: Callable | None = None, log: Callable = print,
-              cancelled: Callable = lambda: False, default_epsg: int | None = 27700) -> dict:
+              cancelled: Callable = lambda: False, default_epsg: int | None = 27700,
+              status: Callable | None = None) -> dict:
     """tiles: LAS/LAZ/COPC paths, folders or wildcards (lasground_new output
     for models that use its classes). gsd / read_opts default to the values
     the model was trained with (spec). default_epsg: CRS for outputs when
     the inputs carry none (EA open-data tiles have no CRS VLR; they are
-    EPSG:27700). Raises Cancelled if cancelled() becomes true."""
+    EPSG:27700). Raises Cancelled if cancelled() becomes true.
+    progress(fraction): tiles fill 0-95 %, mosaics and priorities the rest.
+    status(text): what is happening now, e.g. 'Tile 3/12 SP1234: model 40 %
+    - about 14 min left' (QGIS: feedback.setProgressText)."""
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     gsd = float(gsd or spec.gsd or 1.0)
@@ -421,6 +440,7 @@ def run_batch(tiles: list, out_dir: str | Path, net, spec: RuntimeSpec, *, gsd: 
         raise ValueError("none of the input tiles could be read: "
                          + "; ".join(f"{k}: {v}" for k, v in problems.items()))
     G = Grid.from_bounds(*union, gsd)
+    counts, extents = {}, {}
     try:                                       # memory: roughly 550 bytes per point read (TIN, rasters)
         infos = {Path(f): header_info(f) for f in {f for j in jobs for f in j.files}}
         counts = {f: i["point_count"] for f, i in infos.items()}
@@ -442,6 +462,21 @@ def run_batch(tiles: list, out_dir: str | Path, net, spec: RuntimeSpec, *, gsd: 
                "grid": G.to_dict(), "gsd": gsd, "buffer_m": buffer_m, "n_jobs": len(jobs), "cancelled": False}
     crs, crs_is_default = None, False
     t_start = time.time()
+    TILES_SHARE = 0.95
+    done_frac = [0.0]
+
+    def say(text):
+        if status:
+            status(text)
+
+    def report(f):
+        """overall fraction f of the tile work done"""
+        done_frac[0] = f
+        if progress:
+            progress(TILES_SHARE * f)
+
+    def left():
+        return eta_text(time.time() - t_start, done_frac[0])
 
     def check_cancel(_frac=None):
         if cancelled():
@@ -463,8 +498,16 @@ def run_batch(tiles: list, out_dir: str | Path, net, spec: RuntimeSpec, *, gsd: 
             check_cancel()
             rec = {"name": job.name, "tile": job.tile}
             fut = pending.pop(idx)
+            label = f"Tile {idx + 1}/{len(jobs)} {job.name}"
+            try:
+                n_pts = _job_points(job, counts, extents) if counts else 0
+            except Exception:
+                n_pts = 0
+            t_read = time.time()
             while not fut.done():                  # stay responsive to cancel during a slow read
                 check_cancel()
+                say(f"{label}: reading points" + (f" ({n_pts / 1e6:.1f}M)" if n_pts else "")
+                    + f", {time.time() - t_read:.0f} s{left()}")
                 wait([fut], timeout=0.5)
             try:
                 arrs, grid, info = fut.result()
@@ -503,10 +546,10 @@ def run_batch(tiles: list, out_dir: str | Path, net, spec: RuntimeSpec, *, gsd: 
             anchor = lattice_anchor(grid.xmin, grid.ymax, gsd)
             t1 = time.time()
 
-            def prog(f, _idx=idx):
+            def prog(f, _idx=idx, _label=label):
                 check_cancel()
-                if progress:
-                    progress((_idx + f) / len(jobs))
+                report((_idx + f) / len(jobs))
+                say(f"{_label}: model {100 * f:.0f} %{left()}")
 
             try:
                 res = predict_scene(arrs, spec, net, seed=seed, anchor=anchor, region=(r0, c0, h, w), gsd=gsd,
@@ -537,8 +580,7 @@ def run_batch(tiles: list, out_dir: str | Path, net, spec: RuntimeSpec, *, gsd: 
                         placed[f"{k}{sfx}"].append((p, gr, gc, h, w))
             summary["tiles"].append(rec)
             log(f"{job.name}: {info['n_points']} pts, read {info.get('read_s')} s, predict {rec['predict_s']} s")
-            if progress:
-                progress((idx + 1) / len(jobs))
+            report((idx + 1) / len(jobs))
     except BaseException as e:            # cancel, Ctrl-C or an unexpected error: record and stop cleanly
         summary["cancelled"] = isinstance(e, (Cancelled, KeyboardInterrupt))
         if not summary["cancelled"]:
@@ -558,14 +600,24 @@ def run_batch(tiles: list, out_dir: str | Path, net, spec: RuntimeSpec, *, gsd: 
 
     # mosaics: VRT index over the tile files, then one compressed GeoTIFF each
     outputs = {}
+    n_mos = sum(1 for v in placed.values() if v)
+
+    def mosaic_step(i, name):
+        check_cancel()
+        say(f"Joining tiles into one raster: {name} ({i + 1}/{n_mos})")
+        if progress:
+            progress(TILES_SHARE + (1 - TILES_SHARE) * 0.9 * i / max(1, n_mos))
     try:
-        _mosaic(placed, outputs, out, G, gsd, crs)
+        _mosaic(placed, outputs, out, G, gsd, crs, step=mosaic_step)
     except BaseException as e:
         summary["error"] = f"writing mosaics failed: {e!r}"
         summary["outputs"] = outputs
         (out / "batch_summary.json").write_text(json.dumps(summary, indent=1))
         raise
     summary["outputs"] = outputs
+    say("Ranking priority blocks")
+    if progress:
+        progress(TILES_SHARE + (1 - TILES_SHARE) * 0.9)
     prio.add_mosaics(outputs, G)
     epsg = default_epsg if crs_is_default else epsg_of(crs)
     summary["priority"] = prio.write(out, gsd, epsg)
@@ -573,13 +625,28 @@ def run_batch(tiles: list, out_dir: str | Path, net, spec: RuntimeSpec, *, gsd: 
     if summary["failed"]:
         log(f"[warn] {len(summary['failed'])} tiles/blocks failed; see batch_summary.json")
     (out / "batch_summary.json").write_text(json.dumps(summary, indent=1))
+    if progress:
+        progress(1.0)
+    say(f"Done in {summary['seconds'] / 60:.0f} min" if summary["seconds"] >= 60 else f"Done in {summary['seconds']:.0f} s")
     return summary
 
 
-def _mosaic(placed: dict, outputs: dict, out: Path, G: Grid, gsd: float, crs):
-    for name, items in placed.items():
-        if not items:
-            continue
+def eta_text(elapsed: float, frac: float) -> str:
+    """' - about 14 min left' once there is enough progress to guess."""
+    if frac < 0.02 or elapsed < 20:
+        return ""
+    rem = elapsed * (1 - frac) / frac
+    if rem < 90:
+        return " - under 2 min left"
+    if rem < 5400:
+        return f" - about {rem / 60:.0f} min left"
+    return f" - about {rem / 3600:.1f} h left"
+
+
+def _mosaic(placed: dict, outputs: dict, out: Path, G: Grid, gsd: float, crs, step: Callable | None = None):
+    for i, (name, items) in enumerate((n, v) for n, v in placed.items() if v):
+        if step:
+            step(i, name)
         rgb = name.endswith("_overlay") or name.endswith("_overlay_rgb")
         tif = out / f"{name}.tif"
         if rgb:

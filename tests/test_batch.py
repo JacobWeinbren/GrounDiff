@@ -1,4 +1,5 @@
 import json
+import os
 
 import numpy as np
 import pytest
@@ -201,3 +202,16 @@ def test_dsm_only_model_gives_edit_map_on_lasground_tiles(tiles, tmp_path):
     s = run_batch(after, tmp_path / "p", keep_gate_net, spec, buffer_m=40.0, workers=1,
                   predict_kwargs={"batch_size": 4})
     assert "dtm" in s["outputs"] and "p_edit" not in s["outputs"] and "dz_before" not in s["outputs"]
+
+
+def test_expand_inputs_ignores_blanks_and_refuses_whole_disk(tmp_path, monkeypatch):
+    from groundiff.batch import expand_inputs
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "a.laz").write_bytes(b"")
+    (tmp_path / ".hidden").mkdir()
+    (tmp_path / ".hidden" / "b.laz").write_bytes(b"")
+    monkeypatch.chdir(tmp_path)
+    assert expand_inputs(["", "  "]) == []                    # not "the current folder"
+    assert [p.name for p in expand_inputs([str(tmp_path)])] == ["a.laz"]
+    with pytest.raises(ValueError, match="whole disk"):
+        expand_inputs([os.path.abspath(os.sep)])

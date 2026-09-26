@@ -177,6 +177,10 @@ class Feedback:
     def __init__(self, cancel_after=None):
         self.info, self.warnings, self.errors, self.progress = [], [], [], []
         self.cancel_after = cancel_after
+        self.texts = []
+
+    def setProgressText(self, t):
+        self.texts.append(t)
 
     def setProgress(self, p):
         self.progress.append(p)

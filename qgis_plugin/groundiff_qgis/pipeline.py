@@ -13,6 +13,7 @@ from pathlib import Path
 
 import numpy as np
 
+from .core.batch import eta_text  # noqa: F401  (used by the algorithms)
 from .core.io_raster import read_geotiff, write_geotiff
 from .core.overlay import write_overlays
 from .core.runtime import RuntimeSpec, lattice_anchor, predict_scene
@@ -134,7 +135,7 @@ def inspect_report(path: str, compare_to: str | None = None) -> str:
 def run_tiles(onnx_path: str, tiles: list, out_dir: str, providers: list | None = None, gsd: float | None = None,
               buffer_m: float | None = None, workers: int = 2, read_opts: dict | None = None, overlays: bool = True,
               predict_kwargs: dict | None = None, block_m: float = 100.0, progress=None, log=print,
-              cancelled=lambda: False) -> dict:
+              cancelled=lambda: False, status=None) -> dict:
     """tiles: LAS/LAZ/COPC files as lasground_new wrote them. gsd / buffer
     None: as trained / one network tile + 32 m."""
     from .core.backends import OnnxNet
@@ -147,6 +148,8 @@ def run_tiles(onnx_path: str, tiles: list, out_dir: str, providers: list | None 
     import scipy.ndimage  # noqa: F401
     if not any(b.is_available() for b in getattr(laspy, "LazBackend", [])):
         raise ImportError("no LAZ backend for laspy: install laspy[lazrs]")
+    if status:
+        status("Loading the model")
     spec = load_spec(onnx_path)
     net = OnnxNet(onnx_path, providers)
     log(f"ONNX Runtime providers: {net.providers}")
@@ -154,6 +157,6 @@ def run_tiles(onnx_path: str, tiles: list, out_dir: str, providers: list | None 
         log(f"[warn] {net.warning}")
     s = run_batch(tiles, out_dir, net, spec, gsd=gsd, buffer_m=buffer_m, workers=workers, read_opts=read_opts,
                   overlays=overlays, predict_kwargs=predict_kwargs, block_m=block_m, progress=progress, log=log,
-                  cancelled=cancelled)
+                  cancelled=cancelled, status=status)
     s["providers"] = net.providers
     return s

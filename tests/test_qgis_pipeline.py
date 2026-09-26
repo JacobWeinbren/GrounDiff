@@ -116,9 +116,14 @@ def test_algorithms_run_under_stub_qgis(trained, plugin, tmp_path, new_enums):  
     assert alg.params["BACKEND"].flags() and not alg.params["TILES"].flags()     # technical ones are 'Advanced'
     # second run: no model given -> the remembered one; no folder -> a temporary one
     ctx, fb = qgis_stub.install(new_enums).QgsProcessingContext(), qgis_stub.Feedback()
-    res2 = alg.processAlgorithm({"LAYERS": [meta["before_file"]], "BACKEND": 4, "BATCH": 4, "SAMPLES": 1,
-                                 "OUTPUT_FOLDER": "TEMPORARY_OUTPUT"}, ctx, fb)
+    # as QGIS 3.44 on macOS passes them: a 'pdal://' layer source and [''] for the empty file box
+    res2 = alg.processAlgorithm({"LAYERS": ["pdal://" + meta["before_file"]], "TILES": [""], "BACKEND": 4,
+                                 "BATCH": 4, "SAMPLES": 1, "OUTPUT_FOLDER": "TEMPORARY_OUTPUT"}, ctx, fb)
     assert os.path.exists(os.path.join(res2["OUTPUT_FOLDER"], "dtm.tif"))
+    assert fb.progress[-1] == 100 and max(fb.progress) <= 100
+    assert any("reading points" in t for t in fb.texts) and any("model" in t for t in fb.texts)
+    assert any("Joining tiles" in t for t in fb.texts) and fb.texts[-1].startswith("Done")
+    assert alg_mod.layer_file("file:///C:/data/a%20b.laz") == "C:/data/a b.laz"
 
     # rasters: std needs several samples; with SAMPLES=1 it is not producible -> warning, no output
     alg = alg_mod.PredictRastersAlgorithm().createInstance()

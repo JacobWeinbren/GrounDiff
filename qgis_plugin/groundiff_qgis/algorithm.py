@@ -1,4 +1,5 @@
 import os
+import time
 
 from qgis.core import (QgsProcessing, QgsProcessingAlgorithm, QgsProcessingContext, QgsProcessingException,
                        QgsProcessingLayerPostProcessorInterface, QgsProcessingParameterBoolean,
@@ -201,11 +202,13 @@ class PredictTilesAlgorithm(QgsProcessingAlgorithm):
         tiles = []
         if SOURCE_POINTCLOUD is not None:
             for lyr in self.parameterAsLayerList(parameters, "LAYERS", context) or []:
-                src = lyr.source().split("|")[0]
+                src = layer_file(lyr.source())
                 if not src.lower().endswith((".las", ".laz")):
                     raise QgsProcessingException(f"{lyr.name()}: not a LAS/LAZ file ({src})")
                 tiles.append(src)
-        tiles += self.parameterAsFileList(parameters, "TILES", context) or []
+        # an empty file box can come back as [''] (= the current folder, "/" on macOS): drop blanks
+        tiles += [layer_file(f) for f in (self.parameterAsFileList(parameters, "TILES", context) or [])
+                  if f and str(f).strip()]
         if not tiles:
             raise QgsProcessingException("Select point-cloud layers or LAS/LAZ files.")
         model = _model_path(self, parameters, context)
@@ -225,8 +228,8 @@ class PredictTilesAlgorithm(QgsProcessingAlgorithm):
                 overlays=self.parameterAsBool(parameters, "OVERLAYS", context),
                 predict_kwargs=_run_kwargs(self, parameters, context),
                 block_m=self.parameterAsDouble(parameters, "BLOCK", context),
-                progress=lambda f: feedback.setProgress(int(100 * f)),
-                log=feedback.pushInfo, cancelled=feedback.isCanceled)
+                progress=lambda f: feedback.setProgress(100 * f),
+                log=feedback.pushInfo, cancelled=feedback.isCanceled, status=_status(feedback))
         except Cancelled:
             raise QgsProcessingException("Cancelled")
         except ImportError as e:
@@ -247,6 +250,35 @@ class PredictTilesAlgorithm(QgsProcessingAlgorithm):
         for k, v in outputs.items():
             feedback.pushInfo(f"{k}: {v}")
         return {"OUTPUT_FOLDER": out}
+
+
+def layer_file(source: str) -> str:
+    """File path of a point-cloud layer source: drops 'pdal://' / 'file://' prefixes and '|options'."""
+    src = str(source).split("|")[0].strip()
+    for pre in ("pdal://", "copc://", "ept://", "file://"):
+        if src.lower().startswith(pre):
+            src = src[len(pre):]
+            break
+    if len(src) > 2 and src[0] == "/" and src[2] == ":":        # file:///C:/... on Windows
+        src = src[1:]
+    from urllib.parse import unquote
+    return unquote(src) if "%" in src and not os.path.exists(src) else src
+
+
+def _status(feedback):
+    """feedback.setProgressText, called at most twice a second (it repaints the dialog)."""
+    last = [0.0, None]
+
+    def say(text):
+        now = time.time()
+        new_stage = last[1] is None or text[:20] != last[1][:20]      # e.g. reading -> model
+        if text != last[1] and (new_stage or now - last[0] > 0.5):
+            last[0], last[1] = now, text
+            try:
+                feedback.setProgressText(text)
+            except AttributeError:
+                pass
+    return say
 
 
 class PredictRastersAlgorithm(QgsProcessingAlgorithm):
@@ -297,10 +329,13 @@ class PredictRastersAlgorithm(QgsProcessingAlgorithm):
                     feedback.pushWarning(f"{key}: this model does not produce it; skipped")
             arrs, info = pipe.rasters_from_files(paths)
 
+            t0, say = time.time(), _status(feedback)
+
             def progress(f):
                 if feedback.isCanceled():
                     raise QgsProcessingException("Cancelled")
-                feedback.setProgress(int(100 * f))
+                feedback.setProgress(100 * f)
+                say(f"Running the model: {100 * f:.0f} %{pipe.eta_text(time.time() - t0, f)}")
 
             written = pipe.run(model, arrs, info, outputs,
                                providers=PROVIDERS[self.parameterAsEnum(parameters, "BACKEND", context)][1],
