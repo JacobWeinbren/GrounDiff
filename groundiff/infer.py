@@ -30,6 +30,7 @@ import argparse
 import csv
 import json
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -107,6 +108,21 @@ def capture_at(rows: list[dict], fractions=(0.05, 0.1, 0.2)) -> dict:
     return out
 
 
+def _progress(name: str):
+    """Print '<scene>: 37% (12 min left)' on one line while a scene runs."""
+    t0 = time.time()
+    last = [-1]
+
+    def cb(f):
+        pct = int(f * 100)
+        if pct == last[0]:
+            return
+        last[0] = pct
+        left = (time.time() - t0) * (1 - f) / max(f, 1e-6)
+        print(f"\r{name}: {pct:3d}% ({left / 60:.0f} min left)   ", end="" if f < 1 else "\n", flush=True)
+    return cb
+
+
 def run_scene(scene_dir: Path, net, spec: RuntimeSpec, out_dir: Path, args) -> dict:
     meta = json.loads((scene_dir / "meta.json").read_text())
     g = meta["grid"]
@@ -114,7 +130,8 @@ def run_scene(scene_dir: Path, net, spec: RuntimeSpec, out_dir: Path, args) -> d
     arrs = {n: np.load(scene_dir / f"{n}.npy") for n in names if (scene_dir / f"{n}.npy").exists()}
     res = predict_scene(arrs, spec, net, stride=args.stride, blend=args.blend, prior=args.prior,
                         init=args.init, t_start=args.t_start, n_samples=args.samples, tta=args.tta,
-                        batch_size=args.batch_size, seed=args.seed, gsd=g["gsd"])
+                        batch_size=args.batch_size, seed=args.seed, gsd=g["gsd"],
+                        progress=_progress(scene_dir.name))
     out_dir.mkdir(parents=True, exist_ok=True)
     geo = (g["xmin"], g["ymax"], g["gsd"], meta.get("crs_wkt"))
     for k in ("dtm", "p_ground", "p_edit", "std", "dz_before", "prior"):
@@ -176,6 +193,7 @@ def main(argv=None):
     ap.add_argument("--block-m", type=float, default=100.0)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--no-overlays", action="store_true", help="skip the coloured RGBA overlays")
+    ap.add_argument("--max-scenes", type=int, help="evaluate only the first N scenes (quicker check)")
     ap.add_argument("--include-suspect", action="store_true", help="also evaluate scenes the quality gate flagged")
     a = ap.parse_args(argv)
 
@@ -189,6 +207,9 @@ def main(argv=None):
         if sus:
             print(f"[info] skipping {len(sus)} scenes flagged suspect by preprocess (--include-suspect to keep)")
             scenes = [s for s in scenes if s not in sus]
+    if a.max_scenes:
+        scenes = scenes[:a.max_scenes]
+    print(f"{len(scenes)} scenes, {a.samples} sample(s) each")
     all_rows = []
     for sd in scenes:
         summ = run_scene(sd, net, spec, a.out / sd.name, a)
