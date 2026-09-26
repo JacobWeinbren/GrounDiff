@@ -339,11 +339,20 @@ the palest visible step has ≥ 2.3 : 1 contrast with the background.
 `priority.shp` / `.geojson` give the same information as a work list of
 squares.
 
+Two colours show the two edit tools:
+
+* **purple**: `lasground_new` is too **high** there (points kept as ground
+  that should become unclassified: vegetation, buildings, noise);
+* **orange**: `lasground_new` is too **low** (ground it missed, e.g.
+  embankment crests, banks): points to classify as ground.
+
 | Overlay | Shows | Transparent below |
 |---|---|---|
-| `p_edit` | probability that editors change the ground | 0.2 |
-| `dz_before` | size of the predicted correction (either sign) | 0.15 m |
-| `std` | spread across samples / flips | 0.1 m |
+| `p_edit` | probability that editors change the ground, coloured by direction | 0.2 |
+| `dz_before` | size of the predicted correction, purple = lower, orange = raise | 0.15 m |
+| `std` | spread across samples / flips (purple only) | 0.1 m |
+
+The `dz_before` layer in QGIS gets the same two-colour style.
 
 ## QGIS plugin (QGIS 3.22 – 4.x, Windows and Mac)
 

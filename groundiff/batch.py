@@ -529,7 +529,8 @@ def run_batch(tiles: list, out_dir: str | Path, net, spec: RuntimeSpec, *, gsd: 
                 placed[k].append((p, gr, gc, h, w))
             for k in ov_keys:
                 if k in crop:
-                    rgba = render_rgba(crop[k], OUTPUT_PRESETS[k])
+                    rgba = render_rgba(crop[k], OUTPUT_PRESETS[k],
+                                       crop.get("dz_before") if k == "p_edit" else None)
                     for sfx, alpha in (("_overlay", True), ("_overlay_rgb", False)):
                         p = tiles_dir / f"{job.name}_{k}{sfx}.tif"
                         write_rgba_geotiff(p, rgba, *geo, alpha=alpha)

@@ -38,3 +38,17 @@ def test_write_overlays(tmp_path):
     tfw = (tmp_path / "p_edit_overlay.tfw").read_text().split()
     assert float(tfw[0]) == 0.5 and float(tfw[4]) == 400000.25
     ET.fromstring((tmp_path / "p_edit.qml").read_text().split("\n", 1)[1])   # valid XML after doctype
+
+
+def test_edit_direction_colours():
+    from groundiff.overlay import RAMP, RAMP_UP, _rgb, qml_style
+    dz = np.array([[-1.0, 1.0, 0.05]])
+    rgba = render_rgba(dz, "dz")
+    assert tuple(rgba[0, 0, :3]) != tuple(rgba[0, 1, :3])               # two hues
+    assert rgba[0, 0, 2] > rgba[0, 0, 1] and rgba[0, 1, 0] > rgba[0, 1, 2]  # purple (blue > green), orange (red > blue)
+    assert rgba[0, 2, 3] == 0                                              # small change: transparent
+    pe = np.array([[0.9, 0.9, 0.9]])
+    col = render_rgba(pe, "edit", direction=dz)
+    assert tuple(col[0, 0, :3]) != tuple(col[0, 1, :3])                   # p_edit coloured by direction
+    q = qml_style("dz")
+    assert RAMP[-1][0].lower() in q and RAMP_UP[-1][0].lower() in q and "add to ground" in q

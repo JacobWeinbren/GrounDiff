@@ -122,7 +122,8 @@ def run_scene(scene_dir: Path, net, spec: RuntimeSpec, out_dir: Path, args) -> d
             write_geotiff(out_dir / f"{k}.tif", res[k], *geo)
     if not getattr(args, "no_overlays", False):
         for k, preset in overlay_presets(res):
-            write_overlays(res[k], out_dir / k, preset, *geo)
+            write_overlays(res[k], out_dir / k, preset, *geo,
+                           direction=res.get("dz_before") if k == "p_edit" else None)
     summary = {"scene": meta["scene"]}
     true_dz = None
     if "gt_dtm" in arrs:

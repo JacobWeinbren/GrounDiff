@@ -25,6 +25,12 @@ from pathlib import Path
 import numpy as np
 
 RAMP = [("#B8198F", 0.62), ("#8E1080", 0.75), ("#750C76", 0.84), ("#580967", 0.91), ("#3A0650", 0.96)]
+# second hue for the other edit direction: burnt orange. Checked with the dataviz validator
+# against pale / mid light-green, white: >= 3:1 contrast, CVD separation from the purple dE >= 16.
+RAMP_UP = [("#B04A00", 0.62), ("#9A4000", 0.75), ("#843600", 0.84), ("#6B2B00", 0.91), ("#522000", 0.96)]
+# Edit direction (sign of dz_before = predicted DTM - lasground_new DTM):
+#   purple  dz < 0  lasground_new too HIGH: points kept as ground -> reclassify to unclassified
+#   orange  dz > 0  lasground_new too LOW: ground points missed -> classify to ground
 
 PRESETS = {
     # p_edit: probability that editors change the lasground_new DTM here
@@ -53,18 +59,27 @@ def prepare_values(values: np.ndarray, preset: str) -> np.ndarray:
     return v
 
 
-def render_rgba(values: np.ndarray, preset: str = "edit") -> np.ndarray:
-    """values [H, W] -> uint8 RGBA [H, W, 4]; transparent below the first stop and at NaN."""
+def render_rgba(values: np.ndarray, preset: str = "edit", direction: np.ndarray | None = None) -> np.ndarray:
+    """values [H, W] -> uint8 RGBA [H, W, 4]; transparent below the first stop and at NaN.
+    direction: signed raster (dz_before) choosing the hue per pixel, purple where
+    < 0 (remove from ground), orange where > 0 (add to ground). The "dz" preset
+    uses its own sign. Without a direction everything is purple."""
     stops = PRESETS[preset]["stops"]
+    if direction is None and PRESETS[preset].get("abs"):
+        direction = values
     v = prepare_values(values, preset)
-    cols = np.stack([_rgb(c) for c, _ in RAMP])
-    alph = np.array([a for _, a in RAMP])
     out = np.zeros(v.shape + (4,), np.float64)
     ok = np.isfinite(v) & (v >= stops[0])
-    vv = np.clip(v[ok], stops[0], stops[-1])
-    for ch in range(3):
-        out[..., ch][ok] = np.interp(vv, stops, cols[:, ch])
-    out[..., 3][ok] = np.interp(vv, stops, alph) * 255.0
+    up = ok & (np.nan_to_num(direction) > 0) if direction is not None else np.zeros_like(ok)
+    for ramp, sel in ((RAMP, ok & ~up), (RAMP_UP, up)):
+        if not sel.any():
+            continue
+        cols = np.stack([_rgb(c) for c, _ in ramp])
+        alph = np.array([a for _, a in ramp])
+        vv = np.clip(v[sel], stops[0], stops[-1])
+        for ch in range(3):
+            out[..., ch][sel] = np.interp(vv, stops, cols[:, ch])
+        out[..., 3][sel] = np.interp(vv, stops, alph) * 255.0
     return np.round(out).astype(np.uint8)
 
 
@@ -139,13 +154,16 @@ def qml_style(preset: str) -> str:
         items.append(f'<item alpha="0" value="{1 - stops[0] + 1e-6:.8g}" label="&gt; {1 - stops[0]:.6g}" '
                      f'color="{fc}"/>')
     else:
-        if p.get("abs"):                          # symmetric: -max .. -first, transparent gap, first .. max
+        if p.get("abs"):                          # negative side purple (remove), positive side orange (add)
             for s, c, a in reversed(ramp):
-                items.append(f'<item alpha="{a}" value="{-s:.6g}" label="{-s:.6g}" color="{c}"/>')
+                lab = f"{-s:.6g} (remove from ground)" if s == stops[-1] else f"{-s:.6g}"
+                items.append(f'<item alpha="{a}" value="{-s:.6g}" label="{lab}" color="{c}"/>')
             items.append(f'<item alpha="0" value="{-stops[0] + 1e-6:.8g}" label="" color="{fc}"/>')
+            ramp = [(s, c.lower(), int(round(a * 255))) for s, (c, a) in zip(stops, RAMP_UP)]
         items.append(f'<item alpha="0" value="{stops[0] - 1e-6:.8g}" label="&lt; {stops[0]}" color="{fc}"/>')
         for s, c, a in ramp:
-            items.append(f'<item alpha="{a}" value="{s:.6g}" label="{s:.6g}" color="{c}"/>')
+            lab = f"{s:.6g} (add to ground)" if (p.get("abs") and s == stops[-1]) else f"{s:.6g}"
+            items.append(f'<item alpha="{a}" value="{s:.6g}" label="{lab}" color="{c}"/>')
     lo = -stops[-1] if p.get("abs") else (1 - stops[-1] if p.get("invert") else stops[0])
     hi = (1 - stops[0] if p.get("invert") else stops[-1])
     note = ""
@@ -166,10 +184,11 @@ def qml_style(preset: str) -> str:
 
 
 def write_overlays(values: np.ndarray, out_stem: str | Path, preset: str, xmin: float, ymax: float,
-                   gsd: float, crs_wkt: str | None = None) -> list[Path]:
-    """Write <stem>_overlay.tif (RGBA), <stem>_overlay_rgb.tif (RGB+nodata) and <stem>.qml."""
+                   gsd: float, crs_wkt: str | None = None, direction: np.ndarray | None = None) -> list[Path]:
+    """Write <stem>_overlay.tif (RGBA), <stem>_overlay_rgb.tif (RGB+nodata) and <stem>.qml.
+    direction: dz_before, to colour p_edit by edit direction (see render_rgba)."""
     stem = Path(out_stem)
-    rgba = render_rgba(values, preset)
+    rgba = render_rgba(values, preset, direction)
     a = stem.with_name(stem.name + "_overlay.tif")
     b = stem.with_name(stem.name + "_overlay_rgb.tif")
     write_rgba_geotiff(a, rgba, xmin, ymax, gsd, crs_wkt, alpha=True)

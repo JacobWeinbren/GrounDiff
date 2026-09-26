@@ -109,7 +109,9 @@ def run(onnx_path: str, arrs: dict, info: dict, outputs: dict, providers: list |
                 stem = Path(path).with_suffix("")
                 written[f"{key}_overlays"] = [str(p) for p in
                                               write_overlays(res[key], stem, preset, info["xmin"], info["ymax"],
-                                                             info["gsd"], crs)]
+                                                             info["gsd"], crs,
+                                                             direction=res.get("dz_before") if key == "p_edit"
+                                                             else None)]
     written["providers"] = net.providers
     written["warning"] = net.warning
     return written
