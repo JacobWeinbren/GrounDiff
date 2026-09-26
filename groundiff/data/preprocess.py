@@ -1,8 +1,11 @@
 """Rasterise scenes into per-channel .npy files (memory-mappable).
 
-One scene = one point-cloud tile classified by lasground_new with default
-settings (the "before": every point 1 or 2) plus a target DTM for the same
-area, either
+One scene = one point-cloud tile plus a target DTM for the same area. The
+tile is either classified by lasground_new with default settings
+(--before-dir: every point 1 or 2; gives the before -> after model its
+lasground_new inputs) or used as points only (--points-dir: any tile, e.g.
+the published EA files as downloaded; classes ignored; for the DSM -> DTM
+model, which needs no LAStools). The target is either
 
   * the EA's published DTM raster (--dtm-dir: GeoTIFF/ASCII grids/VRTs in any
     tiling; the EA builds it from its hand-edited ground class), or
@@ -15,6 +18,8 @@ on the published tiles first (groundiff.data.lasground).
 
     python -m groundiff.data.preprocess --before-dir before/ --dtm-dir ea_dtm/ \\
         --out data/scenes_1m --gsd 1.0 --workers 6
+    python -m groundiff.data.preprocess --points-dir data/laz/ea --dtm-dir ea_dtm/ \\
+        --out data/scenes_1m --gsd 1.0 --workers 6          # no LAStools needed
 
 Output layout:
     <out>/<scene>/meta.json
@@ -23,14 +28,17 @@ Channels: dsm_max, dsm_min, dsm_last, density, z_std, echoes, has_return,
 in_survey, dtm_before (+ before_valid), sem_ground, sem_nonground, gt_dtm
 (+ gt_valid), and with --after-dir also top_ground.
 
-Quality gate: a scene whose target disagrees with lasground_new on the cells
-lasground_new calls ground (different survey, misregistration, wrong
-product) is marked "suspect" in meta.json and skipped by training.
+Quality gate: a scene whose target disagrees with the points (different
+survey, misregistration, wrong product) is marked "suspect" in meta.json and
+skipped by training. Measured on the cells lasground_new calls ground, or,
+for points-only scenes, on open ground (single returns, height spread
+< 5 cm), where the lowest return should sit on the DTM.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
 from concurrent.futures import ProcessPoolExecutor
@@ -96,16 +104,29 @@ def quality(arrs: dict, alpha: float = 0.2) -> dict:
     q["target_coverage"] = float(ok[survey].mean()) if survey.any() else 0.0
     if "dtm_before" in arrs:
         g = ok & (np.nan_to_num(arrs["sem_ground"]) > 0.5) & np.isfinite(arrs["dtm_before"])
-        q["n_ground_cells"] = int(g.sum())
-        if g.any():
-            d = (arrs["gt_dtm"] - arrs["dtm_before"])[g].astype(np.float64)
-            q["median_dz"] = float(np.median(d))
-            q["agree_frac"] = float((np.abs(d) < alpha).mean())
+        ref = arrs["dtm_before"]
+    else:                                    # points only: open ground, lowest return ~ ground
+        g = (ok & np.isfinite(arrs["dsm_min"]) & (np.nan_to_num(arrs["z_std"], nan=9.0) < 0.05)
+             & (np.nan_to_num(arrs.get("echoes", np.ones_like(arrs["dsm_min"])), nan=9.0) <= 1.05))
+        ref = arrs["dsm_min"]
+    # a DSM given as the target would follow canopy/roof tops where points have several echoes
+    tall = (ok & np.isfinite(arrs["dsm_max"]) & (np.nan_to_num(arrs.get("echoes", np.zeros(1)), nan=0) >= 1.5)
+            & (np.nan_to_num(arrs["z_std"], nan=0) > 1.0))
+    if tall.sum() >= 200:
+        q["canopy_gap_m"] = float(np.median((arrs["dsm_max"] - arrs["gt_dtm"])[tall]))
+    q["n_ground_cells"] = int(g.sum())
+    if g.sum() >= 50:
+        d = (arrs["gt_dtm"] - ref)[g].astype(np.float64)
+        q["median_dz"] = float(np.median(d))
+        q["agree_frac"] = float((np.abs(d) < alpha).mean())
     return q
 
 
 def is_suspect(q: dict, min_agree: float = 0.6, max_offset: float = 0.15, min_coverage: float = 0.5) -> list:
     why = []
+    if q.get("canopy_gap_m") is not None and q["canopy_gap_m"] < 1.0:
+        why.append(f"target follows the tree/building tops (median {q['canopy_gap_m']:.2f} m below the highest "
+                   "return where there are several echoes): a DSM, not a DTM?")
     if q.get("target_coverage", 0) < min_coverage:
         why.append(f"target covers {q.get('target_coverage', 0):.0%} of the survey area")
     if "agree_frac" in q and q["agree_frac"] < min_agree:
@@ -137,6 +158,13 @@ def process_scene(before: Path, out_root: Path, *, dtm_paths: list | None = None
     if meta_path.exists() and not overwrite:
         meta = json.loads(meta_path.read_text())
         if meta.get("cache_key") == key:
+            if geotiff:                        # cached scene, GeoTIFFs asked for now: write them from the .npy
+                from ..io_raster import write_geotiff
+                g = meta["grid"]
+                for f in sorted(out.glob("*.npy")):
+                    if not f.with_suffix(".tif").exists():
+                        write_geotiff(f.with_suffix(".tif"), np.load(f), g["xmin"], g["ymax"], g["gsd"],
+                                      meta.get("crs_wkt"))
             return None
     if not dtm_paths and after is None:
         raise ValueError(f"{name}: no target (no DTM raster covers it and no after file)")
@@ -168,7 +196,12 @@ def process_scene(before: Path, out_root: Path, *, dtm_paths: list | None = None
     q = quality(arrs)
     why = is_suspect(q, **(gate or {}))
     meta["quality"] = {**q, "suspect": bool(why), "reasons": why}
+    meta["coverage_close_m"] = coverage_close_m
     out.mkdir(parents=True, exist_ok=True)
+    meta_path.unlink(missing_ok=True)          # a failed rerun must not leave the old meta pointing at new files
+    for f in list(out.glob("*.npy")) + list(out.glob("*.tif")):
+        if f.stem not in arrs:                 # channels from an earlier run with other settings
+            f.unlink()
     for k, v in arrs.items():
         _save(out, k, v)
     if geotiff:
@@ -210,26 +243,43 @@ def index_rasters(folder: Path, cache: Path | None = None) -> list[dict]:
     return rows
 
 
-def rasters_for(bounds, index: list[dict]) -> list[str]:
+PRODUCT_RANK = ("lidar_tiles_dtm", "national_lidar_programme_dtm", "lidar_composite_dtm")
+
+
+YEAR_IN_PATH = re.compile(r"(?:^|[_/\\-])((?:19|20)\d{2})(?=[_/\\.-])")
+
+
+def _raster_rank(path: str, year: str | None) -> tuple:
+    """Prefer rasters of the point cloud's survey year, then the survey's own
+    DTM over the NLP DTM over the mixed-year composite (as groundiff.data.ea_dtm
+    names its folders: <product>_<year>_<res>/)."""
+    low = path.lower()
+    years = set(YEAR_IN_PATH.findall(low))
+    year_ok = 0 if (year is None or not years or year in years) else 1
+    prod = next((i for i, p in enumerate(PRODUCT_RANK) if p in low), len(PRODUCT_RANK))
+    return year_ok, prod
+
+
+def rasters_for(bounds, index: list[dict], year: str | None = None) -> list[str]:
+    """Rasters covering bounds, best first (earlier ones win where they overlap)."""
     x0, y0, x1, y1 = bounds
     hits = [r for r in index if r["xmin"] < x1 and r["xmax"] > x0 and r["ymin"] < y1 and r["ymax"] > y0]
-    hits.sort(key=lambda r: (r["res"], r["path"]))       # finest first, then by name
+    hits.sort(key=lambda r: _raster_rank(r["path"], year) + (r["res"], r["path"]))
     return [r["path"] for r in hits]
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--before-dir", type=Path, required=True,
-                    help="point tiles classified by lasground_new (default settings)")
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument("--before-dir", type=Path, help="point tiles classified by lasground_new (default settings)")
+    src.add_argument("--points-dir", type=Path, help="point tiles used as points only, classes ignored "
+                     "(e.g. the published EA files; for the DSM -> DTM model, no LAStools needed)")
     tg = ap.add_mutually_exclusive_group(required=True)
     tg.add_argument("--dtm-dir", type=Path, help="EA DTM rasters (target)")
     tg.add_argument("--after-dir", type=Path, help="hand-edited tiles with the same names (target = ground class)")
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--gsd", type=float, default=1.0, help="cell size in metres (EA DTM: 1 m)")
     ap.add_argument("--ground-classes", type=int, nargs="+", default=[2], help="target ground classes (--after-dir)")
-    ap.add_argument("--not-lasground", action="store_true",
-                    help="before tiles are not lasground_new output: no dtm_before/sem_* channels "
-                         "(only for the DSM-only paper model)")
     ap.add_argument("--workers", type=int, default=1)
     ap.add_argument("--drop-overlap", action="store_true", help="drop overlap-flagged / class 12 points")
     ap.add_argument("--drop-synthetic", action="store_true", help="drop synthetic-flagged points")
@@ -240,7 +290,8 @@ def main(argv=None):
     ap.add_argument("--overwrite", action="store_true")
     a = ap.parse_args(argv)
 
-    before = find_laz(a.before_dir)
+    before = find_laz(a.before_dir or a.points_dir)
+    lasground = a.before_dir is not None
     a.out.mkdir(parents=True, exist_ok=True)
     ro = {"drop_overlap": a.drop_overlap, "drop_synthetic": a.drop_synthetic, "drop_withheld": not a.keep_withheld}
     gate = {"min_agree": a.min_agree, "max_offset": a.max_offset}
@@ -255,7 +306,8 @@ def main(argv=None):
             except Exception as e:
                 print(f"  {p.name}: FAILED reading header {e!r}", file=sys.stderr)
                 continue
-            hits = rasters_for(b, index)
+            from .ea_dtm import survey_year
+            hits = rasters_for(b, index, survey_year(p.name))
             if not hits:
                 print(f"[warn] {k}: no DTM raster covers it; skipped")
                 continue
@@ -270,7 +322,7 @@ def main(argv=None):
     failures, suspect = 0, 0
     with ProcessPoolExecutor(max_workers=max(1, a.workers)) as ex:
         futures = {ex.submit(process_scene, p, a.out, gsd=a.gsd, ground_classes=tuple(a.ground_classes),
-                             lasground=not a.not_lasground, overwrite=a.overwrite, read_opts=ro, gate=gate,
+                             lasground=lasground, overwrite=a.overwrite, read_opts=ro, gate=gate,
                              geotiff=a.geotiff, **kw): p for p, kw in jobs}
         for fut in futures:
             name = futures[fut].name

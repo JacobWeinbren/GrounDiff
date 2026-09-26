@@ -70,14 +70,15 @@ def load_model(path: str | Path, device: str | torch.device = "cpu", use_ema: bo
 def init_from_checkpoint(model: nn.Module, cfg: Config, path: str | Path) -> list[str]:
     """Fine-tune start: copy matching weights from another checkpoint.
 
-    The first convolution's input weights are always mapped by channel name
+    GrounDiff models: the first convolution's input weights are always mapped by channel name
     (g_t plus the conditioning channels), so reordered, added or dropped
     channels line up; channels the old model lacked start at zero. The new
     model reproduces the old one exactly only if the gate channel,
     normalisation and no-data filling are also unchanged; the returned notes
     say when they are not (e.g. paper_dsm2dtm -> before_after changes the
     gate from dsm_max to dtm_before, so it starts from the old features, not
-    the old output)."""
+    the old output). ResDepth models: weights are copied where shapes match
+    (by position; no channel-name mapping)."""
     ck = torch.load(path, map_location="cpu", weights_only=False)
     old_cfg = config_from_dict(ck["config"])
     src = ck.get("ema") or ck["model"]

@@ -209,20 +209,26 @@ def _res_m(r: str) -> float:
         return float("inf")
 
 
-def choose(avail: list[dict], tile: str, year: str, product: str = "auto", res: str = "auto",
-           max_res_m: float = 1.0) -> dict | None:
-    """Pick one catalogue entry for (tile, year)."""
+RES_PREFERENCE = (1.0, 0.5, 2.0)        # 1 m = the training grid; 50 cm averages exactly onto it
+
+
+def choose(avail: list[dict], tile: str, year: str, product: str = "auto", res: str = "auto") -> dict | None:
+    """Pick one catalogue entry for (tile, year): products in AUTO_ORDER (or
+    the one named), resolution 1 m, else 50 cm, else 2 m (25 cm tiles are
+    ~16x larger than 1 m and are only taken when named with --res)."""
     rows = [r for r in avail if r["tile"] == tile and r["year"] == year]
     products = AUTO_ORDER if product == "auto" else (product,)
     for p in products:
         cand = [r for r in rows if r["product"] == p]
         if res != "auto":
             cand = [r for r in cand if r["res"] == res]
-        else:
-            fine = [r for r in cand if _res_m(r["res"]) <= max_res_m + 1e-9]
-            cand = sorted(fine or cand, key=lambda r: _res_m(r["res"]) if fine else -_res_m(r["res"]))
-        if cand:
-            return cand[0]
+            if cand:
+                return cand[0]
+            continue
+        for want in RES_PREFERENCE:
+            hit = [r for r in cand if abs(_res_m(r["res"]) - want) < 1e-6]
+            if hit:
+                return hit[0]
     return None
 
 
@@ -241,7 +247,7 @@ def run(point_files: list, out: Path, product: str = "auto", year: str | None = 
     if not check and (product == "auto" or res == "auto"):
         raise ValueError("without the catalogue search, name --product and --res")
     done = {(v.get("tile"), v.get("year")) for v in manifest.values()
-            if v.get("files") and all(Path(p).exists() for p in v["files"])}
+            if v.get("request") == product and v.get("files") and all(Path(p).exists() for p in v["files"])}
     todo = [(tid, y, t) for (tid, y), t in sorted(want.items()) if (tid, y) not in done]
     log(f"{len(want) - len(todo)} already downloaded, {len(todo)} to fetch (about 50-150 MB each)")
     if dry_run:
@@ -277,14 +283,16 @@ def run(point_files: list, out: Path, product: str = "auto", year: str | None = 
                 tid, y, rec, err = f.result()
             except Exception as e:
                 (tid, y, _), rec, err = item, None, repr(e)
-            key = f"{tid}/{y}"
+            key = f"{tid}/{y}/{product}"
             if err:
                 failed[key] = err
                 log(f"  [{i}/{len(todo)}] FAILED {err}")
             else:
-                manifest[key] = {"tile": tid, "year": y, **rec}
+                manifest[key] = {"tile": tid, "year": y, "request": product, **rec}
                 manifest_path.parent.mkdir(parents=True, exist_ok=True)
-                manifest_path.write_text(json.dumps(manifest, indent=1))
+                tmp = manifest_path.with_suffix(".tmp")
+                tmp.write_text(json.dumps(manifest, indent=1))
+                tmp.replace(manifest_path)                     # never a half-written manifest
                 log(f"  [{i}/{len(todo)}] {key}: {rec['product']} {rec['res']}: "
                     f"{', '.join(Path(p).name for p in rec['files'])}")
     return {"manifest": manifest, "failed": failed}

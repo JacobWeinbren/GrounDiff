@@ -127,3 +127,21 @@ def test_osgrid_and_neighbours():
             "SU6572_z.laz", "NX9410_a.laz", "NX9610_b.laz"]
     got = neighbours(["TL4378nw_P_1_a.laz", "SU6571_x.laz", "NX9410_a.laz"], keys, 3)
     assert set(got) == set(keys)                                  # both surveys, 1 km and 2 km neighbours
+
+
+def test_points_only_scene_needs_no_lasground(laz):
+    """--points-dir: the published file as downloaded (classes ignored), DTM target."""
+    root, after, _ = laz
+    d = _dtm(root, name="dtm_p")
+    meta = process_scene(after, root / "scenes_pts", dtm_paths=rasters_for((X0, Y0, X0 + 96, Y0 + 96),
+                                                                             index_rasters(d)),
+                         gsd=1.0, lasground=False)
+    sd = root / "scenes_pts" / "SX0000_dtm"
+    assert not (sd / "dtm_before.npy").exists() and (sd / "dsm_min.npy").exists()
+    q = meta["quality"]
+    assert not q["suspect"] and q["agree_frac"] > 0.8 and q["n_ground_cells"] > 50
+    d2 = _dtm(root, offset=0.5, name="dtm_p_off")
+    meta2 = process_scene(after, root / "scenes_pts2", dtm_paths=rasters_for((X0, Y0, X0 + 96, Y0 + 96),
+                                                                               index_rasters(d2)),
+                          gsd=1.0, lasground=False)
+    assert meta2["quality"]["suspect"]

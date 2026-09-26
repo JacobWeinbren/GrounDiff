@@ -146,6 +146,39 @@ def _read_window(path, xmin, ymin, xmax, ymax):
     return a, info["xmin"] + c0 * res, info["ymax"] - r0 * res, res
 
 
+def _mosaic_windows(paths: list, xmin, ymin, xmax, ymax):
+    """Windows of the rasters over the bbox, with rasters that share a pixel
+    grid (same size and alignment, e.g. abutting 5 km EA tiles) merged into
+    one array so interpolation does not stop at tile edges. Earlier paths win."""
+    groups: dict = {}
+    order = []
+    for p in paths:
+        got = _read_window(p, xmin, ymin, xmax, ymax)
+        if got is None:
+            continue
+        a, x0, y0, res = got
+        key = (round(res, 9), round((x0 / res) % 1, 6), round((y0 / res) % 1, 6))
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(got)
+    for key in order:
+        parts = groups[key]
+        res = parts[0][3]
+        gx0 = min(p[1] for p in parts)
+        gy0 = max(p[2] for p in parts)
+        gx1 = max(p[1] + p[0].shape[1] * res for p in parts)
+        gy1 = min(p[2] - p[0].shape[0] * res for p in parts)
+        W, H = int(round((gx1 - gx0) / res)), int(round((gy0 - gy1) / res))
+        m = np.full((H, W), np.nan)
+        for a, x0, y0, _ in parts:
+            c0, r0 = int(round((x0 - gx0) / res)), int(round((gy0 - y0) / res))
+            sub = m[r0:r0 + a.shape[0], c0:c0 + a.shape[1]]
+            empty = ~np.isfinite(sub)
+            sub[empty] = a[empty]
+        yield m, gx0, gy0, res
+
+
 def sample_rasters(paths: list, xs: np.ndarray, ys: np.ndarray) -> np.ndarray:
     """Values of a mosaic of rasters at points (cell centres of our grid:
     xs [W] eastings, ys [H] northings) -> [H, W], NaN where no raster has
@@ -157,11 +190,7 @@ def sample_rasters(paths: list, xs: np.ndarray, ys: np.ndarray) -> np.ndarray:
 
     out = np.full((ys.size, xs.size), np.nan)
     xmin, xmax, ymin, ymax = xs.min(), xs.max(), ys.min(), ys.max()
-    for p in paths:
-        got = _read_window(p, xmin, ymin, xmax, ymax)
-        if got is None:
-            continue
-        a, x0, y0, res = got
+    for a, x0, y0, res in _mosaic_windows(paths, xmin, ymin, xmax, ymax):
         fc = (xs - x0) / res - 0.5
         fr = (y0 - ys) / res - 0.5
         inside_c = (fc >= -1e-6) & (fc <= a.shape[1] - 1 + 1e-6)
@@ -277,3 +306,31 @@ def build_overviews(path: str | Path, resampling: str = "average", min_size: int
     if factors:
         ds.BuildOverviews(resampling.upper(), factors)
     ds = None
+
+
+def iter_rows(path: str | Path, rows: int = 1024):
+    """Yield (row0, block [h, W] float64 with NaN for no-data) down a raster."""
+    try:
+        import rasterio
+        from rasterio.windows import Window
+        with rasterio.open(str(path)) as src:
+            nd = src.nodata
+            for r0 in range(0, src.height, rows):
+                h = min(rows, src.height - r0)
+                a = src.read(1, window=Window(0, r0, src.width, h)).astype(np.float64)
+                if nd is not None:
+                    a[a == nd] = np.nan
+                yield r0, a
+        return
+    except ImportError:
+        pass
+    from osgeo import gdal
+    ds = gdal.Open(str(path))
+    band = ds.GetRasterBand(1)
+    nd = band.GetNoDataValue()
+    for r0 in range(0, ds.RasterYSize, rows):
+        h = min(rows, ds.RasterYSize - r0)
+        a = band.ReadAsArray(0, r0, ds.RasterXSize, h).astype(np.float64)
+        if nd is not None:
+            a[a == nd] = np.nan
+        yield r0, a

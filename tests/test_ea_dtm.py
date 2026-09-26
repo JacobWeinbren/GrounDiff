@@ -58,8 +58,8 @@ def test_run_downloads_extracts_and_resumes(tmp_path, monkeypatch):
     pts = [tmp_path / n for n in NAMES]
     r = ea_dtm.run(pts, tmp_path / "dtm", log=lambda *a: None)
     assert not r["failed"] and calls["search"] == 1 and calls["fetch"] == 1
-    rec = r["manifest"]["TL4075/2022"]
-    assert rec["product"] == "lidar_tiles_dtm" and rec["res"] == "0.5"          # survey's own DTM, finest <= 1 m
+    rec = r["manifest"]["TL4075/2022/auto"]
+    assert rec["product"] == "lidar_tiles_dtm" and rec["res"] == "0.5"          # survey's own DTM; 1 m, else 50 cm
     assert rec["files"][0].endswith("TL47nw_DTM_1m.tif")
     assert json.loads((tmp_path / "dtm" / "manifest.json").read_text())
     r2 = ea_dtm.run(pts, tmp_path / "dtm", log=lambda *a: None)                  # resumes: nothing to do

@@ -31,6 +31,19 @@ rises.*
 
 ---
 
+## Two models: pick by whether you have a LAStools licence
+
+| | `configs/no_lastools.json` (**default**) | `configs/before_after.json` |
+|---|---|---|
+| Needs LAStools to train | no | yes, licensed `lasground_new` (in Docker on the Mac) |
+| Learns | the EA DTM from the point clouds (GrounDiff DSM → DTM + ALS2DTM rasters) | what editors change in the `lasground_new` result |
+| In QGIS, on your `lasground_new` tiles | predicted DTM; `dz_before` = predicted − `lasground_new` DTM; `p_edit` = share of diffusion samples that differ from `lasground_new` by > 0.2 m | the same, with `p_edit` from the trained confidence head |
+
+Unlicensed `lasground_new` may be used free for non-profit personal and
+educational purposes, but its output is distorted above a point limit (a few
+million points), and full EA 500 m tiles have a median of ~6M points, so it
+cannot make usable training data. Without a licence, use `no_lastools`.
+
 ## What is learned from what
 
 **Production chain.** Tiles are classified by `lasground_new` with default
@@ -38,11 +51,12 @@ settings (every point becomes 1 = non-ground or 2 = ground), then edited by
 hand in LP360 using only unclassified, ground, bridge and low noise. The EA
 DTM is built from the edited ground class.
 
-**Inputs** (per 1 m cell), all from the `lasground_new` output, so training
-and production see the same thing: highest / lowest / lowest-last return,
+**Inputs, before → after model** (per 1 m cell), all from the `lasground_new`
+output, so training and production see the same thing: highest / lowest / lowest-last return,
 point density, height spread, echoes, the `lasground_new` DTM (TIN of its
 ground points) and its ground / non-ground raster. No point is dropped by
-class.
+class. The `no_lastools` model uses only the point rasters (no classes at all),
+so it trains on the published tiles as downloaded.
 
 **Target: the EA's published DTM raster.** The classes in the EA's published
 LAZ/COPC files come from a different, automated process (they contain 1–7
@@ -51,7 +65,14 @@ rasters, so they are never used. `groundiff.data.ea_dtm` downloads the DTM
 for each training tile; alternatively, your own LP360-edited tiles can be the
 target (`--after-dir`: TIN of class 2).
 
-**Model.** GrounDiff's gate (Eq. 5) is anchored on the `lasground_new` DTM:
+**No-LAStools model.** GrounDiff as published (gate on the highest-return
+DSM) with the ALS2DTM point rasters, trained on the EA DTM. At inference on
+`lasground_new` tiles, each of N diffusion samples is compared with their
+ground: `p_edit` is the share of samples whose DTM is more than α = 0.2 m from
+`lasground_new`'s, `dz_before` the difference of the mean prediction. Use
+several samples (QGIS default 4).
+
+**Before → after model.** GrounDiff's gate (Eq. 5) is anchored on the `lasground_new` DTM:
 
     DTM = σ(ℓ) · DTM_lasground + (1 − σ(ℓ)) · (DTM_lasground − r̂)
 
@@ -63,20 +84,19 @@ own loss. `dz_before = DTM_pred − DTM_lasground` is the size and sign of the
 predicted correction (negative: `lasground_new` kept something as ground that
 editors remove; positive: it cut off real ground, e.g. an embankment crest).
 
-**Quality gate.** A tile whose DTM raster disagrees with `lasground_new` on
-the cells `lasground_new` calls ground (a different survey, misregistration)
-is flagged *suspect* by `preprocess` and left out of training and evaluation.
+**Quality gate.** A tile whose DTM raster disagrees with its points (a
+different survey, misregistration) is flagged *suspect* by `preprocess` and
+left out of training and evaluation. It is measured where `lasground_new`
+says ground, or, without `lasground_new`, on open ground (single returns,
+< 5 cm height spread), where the lowest return should lie on the DTM.
 
 ---
 
 ## Mac quickstart (MacBook Pro M3 Max, 36 GB)
 
 Everything up to the trained model happens on the Mac; the Windows PC only
-runs the model in QGIS. One-off installs: Python 3.10–3.12 and
-[Docker Desktop](https://www.docker.com/products/docker-desktop/) (for
-LAStools' Linux build; in its settings keep "Use Rosetta for x86_64/amd64
-emulation" on and set Resources → Memory to 16 GB or more). Have your
-`lastoolslicense.txt` to hand.
+runs the model in QGIS. No LAStools needed (the `no_lastools` model; for the
+before → after model with a licence see *The "before" classification* below).
 
 ```bash
 # 0. one-off setup
@@ -94,41 +114,36 @@ python -m groundiff.data.download --out data/laz/ea --target 300 --min-per-grid 
 python -m groundiff.data.ea_dtm --tiles data/laz/ea --out data/ea_dtm --dry-run
 python -m groundiff.data.ea_dtm --tiles data/laz/ea --out data/ea_dtm
 
-# 3. "before" tiles: lasground_new, default settings, in Docker on the Mac (builds the image
-#    the first time; re-run to continue after an interruption; checks the results at the end)
-python -m groundiff.data.lasground docker --in data/laz/ea --out data/laz/before \
-    --license ~/lastools/lastoolslicense.txt --cores 6
-
-# 4. rasterise at 1 m (the EA DTM grid) and split by 10 km blocks
-python -m groundiff.data.preprocess --before-dir data/laz/before --dtm-dir data/ea_dtm \
+# 3. rasterise at 1 m (the EA DTM grid) straight from the downloaded tiles, and split by 10 km blocks
+python -m groundiff.data.preprocess --points-dir data/laz/ea --dtm-dir data/ea_dtm \
     --out data/scenes_1m --gsd 1.0 --workers 4
 python -m groundiff.data.split --root data/scenes_1m --out data/split.json
 
-# 5. five-minute smoke test
-python -m groundiff.train configs/before_after.json --set train.out_dir=runs/smoke \
+# 4. five-minute smoke test
+python -m groundiff.train configs/no_lastools.json --set train.out_dir=runs/smoke \
     optim.total_steps=50 train.val_every=50 train.val_max_tiles=16
 
-# 6. full run in the background; caffeinate keeps the Mac awake (keep it on power)
+# 5. full run in the background; caffeinate keeps the Mac awake (keep it on power)
 mkdir -p runs
-caffeinate -dimsu nohup python -m groundiff.train configs/before_after.json \
-    --set train.num_workers=6 > runs/before_after.out 2>&1 &
+caffeinate -dimsu nohup python -m groundiff.train configs/no_lastools.json \
+    --set train.num_workers=6 > runs/no_lastools.out 2>&1 &
 
-# 7. watch it
-python -m groundiff.monitor runs/before_after --follow   # step, time left, loss curve, memory, validation
-tail -f runs/before_after.out                            # raw log
-# stop: pkill -f groundiff.train      resume: run step 6 again (continues from last.pt)
+# 6. watch it
+python -m groundiff.monitor runs/no_lastools --follow    # step, time left, loss curve, memory, validation
+tail -f runs/no_lastools.out                             # raw log
+# stop: pkill -f groundiff.train      resume: run step 5 again (continues from last.pt)
 
-# 8. evaluate on the held-out tiles, export for the PC / QGIS
-python -m groundiff.infer --checkpoint runs/before_after/best.pt --scenes data/scenes_1m \
-    --split-file data/split.json --split test --out results/test
-python -m groundiff.export runs/before_after/best.pt --out models/before_after   # .onnx + .json
+# 7. evaluate on the held-out tiles, export for the PC / QGIS
+python -m groundiff.infer --checkpoint runs/no_lastools/best.pt --scenes data/scenes_1m \
+    --split-file data/split.json --split test --out results/test --samples 4
+python -m groundiff.export runs/no_lastools/best.pt --out models/no_lastools      # .onnx + .json
 python tools/build_qgis_plugin.py                                                # dist/groundiff_qgis.zip
 ```
 
 `environment.data.gov.uk` (step 2) must be reachable; it is from a normal
-connection. Step 4 needs roughly 1-3 GB RAM per worker for 500 m tiles and
+connection. Step 3 needs roughly 1-3 GB RAM per worker for 500 m tiles and
 more for the 2 km tiles the archive also contains; lower `--workers` if the
-Mac starts swapping. Tiles flagged *suspect* are listed at the end of step 4.
+Mac starts swapping. Tiles flagged *suspect* are listed at the end of step 3.
 
 Configs default to batch 4 × 4 accumulation (≈ batch 16, as in the paper).
 If MPS runs out of memory: `--set train.batch_size=2 train.grad_accum=8`, or
@@ -171,10 +186,12 @@ its web page) is undocumented and may change.
 in any tiling, so rasters downloaded by hand from
 <https://environment.data.gov.uk/survey> work too.
 
-### The "before" classification
+### The "before" classification (before → after model; needs a LAStools licence)
 
 Production runs `lasground_new` with **default settings**, which reclassifies
-every point to 1 or 2 regardless of the classes it had.
+every point to 1 or 2 regardless of the classes it had. With a licence, and
+Docker Desktop on the Mac (keep "Use Rosetta for x86_64/amd64 emulation" on;
+Resources → Memory 16 GB+):
 
 ```bash
 python -m groundiff.data.lasground docker --in data/laz/ea --out data/laz/before --license lastoolslicense.txt
@@ -194,7 +211,8 @@ the x86-64 build runs under Rosetta emulation, slower than native; `--cores`
 tiles are processed in parallel. `--lastools-tar` uses a downloaded `LAStools.tar.gz` instead
 of fetching it; `--rebuild` picks up a new release. With LAStools on Windows
 instead: `python -m groundiff.data.lasground script --windows ...` writes a
-`.bat`.
+`.bat`. Then preprocess with `--before-dir data/laz/before` and train
+`configs/before_after.json`.
 
 ### Files from different producers
 
@@ -222,8 +240,9 @@ python -m groundiff.data.split --root data/scenes_1m --out data/split.json --blo
 `preprocess` refuses "before" files with classes other than 1/2 (plus 7/18) —
 usually a sign that the published EA file was given instead of the
 `lasground_new` output. The TIN of `lasground_new` ground and the target are
-cut to the LiDAR coverage (returns plus voids narrower than 60 m and enclosed
-voids such as lakes). Re-running only redoes tiles whose inputs or settings
+cut to the LiDAR coverage (returns plus voids narrower than 60 m, e.g. rivers
+and small ponds; larger water bodies are left out, consistently in training
+and in batch). Re-running only redoes tiles whose inputs or settings
 changed. `--geotiff` also writes every channel as GeoTIFF (for the raster tool
 in QGIS). Splits assign whole 10 km blocks, balancing the three sets by size.
 
@@ -231,15 +250,16 @@ in QGIS). Splits assign whole 10 km blocks, balancing the three sets by size.
 
 | Config | What |
 |---|---|
-| `configs/before_after.json` | GrounDiff, before → after (recommended) |
+| `configs/no_lastools.json` | GrounDiff DSM → DTM + ALS2DTM rasters, no LAStools (default) |
+| `configs/before_after.json` | GrounDiff, before → after (needs licensed `lasground_new`) |
 | `configs/paper_dsm2dtm.json` | GrounDiff as published (DSM → DTM) |
 | `configs/resdepth_before_after.json` | ResDepth baseline, as published (fp32) |
 
 ```bash
 # M3 Max, 36 GB (fp32; batch 4 x 4 is the default)
-python -m groundiff.train configs/before_after.json --set train.num_workers=6
+python -m groundiff.train configs/no_lastools.json --set train.num_workers=6
 # 16 GB CUDA GPU (bf16 automatic on RTX 30xx and newer)
-python -m groundiff.train configs/before_after.json --set train.num_workers=8
+python -m groundiff.train configs/no_lastools.json --set train.num_workers=8
 #   batch 8 needs model.use_checkpoint=true on 16 GB
 # fine-tune from another checkpoint (input channels are matched by name; new ones start at zero)
 python -m groundiff.train configs/before_after.json --init-from runs/paper_dsm2dtm/best.pt
@@ -263,7 +283,7 @@ exactly, batch 16 (loss means are per micro-batch). Inference needs ≈ 0.5 GB.
 ### Evaluate on held-out scenes
 
 ```bash
-python -m groundiff.infer --checkpoint runs/before_after/best.pt --scenes data/scenes_1m \
+python -m groundiff.infer --checkpoint runs/no_lastools/best.pt --scenes data/scenes_1m \
     --split-file data/split.json --split test --out results/test --samples 4
 ```
 
@@ -276,8 +296,8 @@ neither paper defines one.
 ### Run on new tiles (command line, no QGIS)
 
 ```bash
-python -m groundiff.export runs/before_after/best.pt --out models/before_after   # checked vs PyTorch
-python -m groundiff.batch --onnx models/before_after.onnx --tiles "lasground/*.laz" --out results/area1 --workers 3
+python -m groundiff.export runs/no_lastools/best.pt --out models/no_lastools     # checked vs PyTorch
+python -m groundiff.batch --onnx models/no_lastools.onnx --tiles "lasground/*.laz" --out results/area1 --workers 2 --samples 4
 ```
 
 Inputs are tiles as `lasground_new` wrote them (quote wildcards; folders work
@@ -337,7 +357,7 @@ add the runtime to QGIS's Python:
 * macOS: `/Applications/QGIS.app/Contents/MacOS/bin/python3 -m pip install scipy "laspy[lazrs]" onnxruntime`
 * pyproj is optional.
 
-Copy `models/before_after.onnx` and `models/before_after.json` together.
+Copy the model's `.onnx` and `.json` (e.g. `models/no_lastools.*`) together.
 The plugin's input is the tiles as they come out of `lasground_new` in your
 normal production chain (no extra processing on the PC).
 Processing Toolbox → GrounDiff:

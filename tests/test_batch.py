@@ -166,3 +166,38 @@ def test_batch_cancel(tiles, tmp_path):
                   cancelled=cancelled)
     s = json.loads((tmp_path / "c" / "batch_summary.json").read_text())
     assert s["cancelled"] and not (tmp_path / "c" / "dtm.tif").exists()
+
+
+def spec_dsm_only(tile=32):
+    from groundiff.schedule import build_schedule
+    s = build_schedule("cosine", 10)
+    return RuntimeSpec(kind="groundiff", cond_channels=["dsm_max", "dsm_min", "density"], gate_channel="dsm_max",
+                       norm_channels=["dsm_max", "dsm_min"], prior_channel=None, norm_mode="minmax", norm_std=None,
+                       min_range=2.0, tile=tile, alpha=0.2, T=10, alphas_bar=s.alphas_bar.tolist(),
+                       coef_x0=s.coef_x0.tolist(), coef_xt=s.coef_xt.tolist(), posterior_var=s.posterior_var.tolist(),
+                       fill_empty="nearest", gsd=1.0)
+
+
+def test_dsm_only_model_gives_edit_map_on_lasground_tiles(tiles, tmp_path):
+    """A model that never saw lasground_new: on lasground_new tiles the batch
+    compares every sample with their ground -> dz_before and sampled p_edit.
+    Stand-in net keeps the DSM, so trees (canopy vs lasground ground) need an
+    edit and open ground does not."""
+    _, after, before = tiles
+    spec = spec_dsm_only()
+    run_batch(before, tmp_path / "o", keep_gate_net, spec, buffer_m=40.0, workers=1,
+              predict_kwargs={"batch_size": 4, "n_samples": 2})
+    pe, tr = read(tmp_path / "o" / "p_edit.tif")
+    dz, _ = read(tmp_path / "o" / "dz_before.tif")
+    xs = tr.c + (np.arange(pe.shape[1]) + 0.5)
+    ys = tr.f - (np.arange(pe.shape[0]) + 0.5)
+    X, Y = np.meshgrid(xs - 400000.0, ys - 200000.0)
+    trees = (X > 85) & (X < 105) & (Y > 75) & (Y < 105)
+    open_ground = (X > 120) & (X < 150) & (Y > 120) & (Y < 150)
+    assert np.nanmean(pe[trees]) > 0.8 and np.nanmean(dz[trees]) > 5.0
+    assert np.nanmean(pe[open_ground]) < 0.1
+    assert (tmp_path / "o" / "p_edit_overlay.tif").exists() and (tmp_path / "o" / "std.tif").exists()
+    # published-style classes: no lasground reference -> DTM only, no error
+    s = run_batch(after, tmp_path / "p", keep_gate_net, spec, buffer_m=40.0, workers=1,
+                  predict_kwargs={"batch_size": 4})
+    assert "dtm" in s["outputs"] and "p_edit" not in s["outputs"] and "dz_before" not in s["outputs"]

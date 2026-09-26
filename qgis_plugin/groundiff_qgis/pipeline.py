@@ -27,9 +27,14 @@ def load_spec(onnx_path: str) -> RuntimeSpec:
     return RuntimeSpec.from_json(js)
 
 
-def producible(spec: RuntimeSpec, n_samples: int = 1, tta: bool = False) -> list[str]:
+def producible(spec: RuntimeSpec, n_samples: int = 1, tta: bool = False, has_before: bool = True) -> list[str]:
+    """Outputs the model can give. For DSM -> DTM models dz_before and p_edit
+    need the lasground_new DTM (a dtm_before raster, or lasground_new tiles)."""
     from .core.batch import output_keys
-    return output_keys(spec, {"n_samples": n_samples, "tta": tta})
+    keys = output_keys(spec, {"n_samples": n_samples, "tta": tta})
+    if not has_before and not spec.needs_before:
+        keys = [k for k in keys if k not in ("dz_before", "p_edit")]
+    return keys
 
 
 def rasters_from_files(paths: dict) -> tuple[dict, dict]:

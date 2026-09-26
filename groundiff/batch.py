@@ -50,7 +50,8 @@ from .data.laz import class_histogram, concat, data_bounds, header_info, read_po
 from .data.osgrid import parse_tile
 from .data.preprocess import check_lasground_classes, scene_name
 from .data.rasterise import Grid, input_rasters
-from .io_raster import build_overviews, build_vrt, crs_wkt_from_epsg, epsg_of, vrt_to_geotiff, write_geotiff
+from .io_raster import (build_overviews, build_vrt, crs_wkt_from_epsg, epsg_of, iter_rows, vrt_to_geotiff,
+                        write_geotiff)
 from .overlay import _write_sidecars, qml_style, render_rgba, write_rgba_geotiff
 from .runtime import RuntimeSpec, lattice_anchor, predict_scene
 
@@ -82,7 +83,8 @@ def expand_inputs(paths: list) -> list[Path]:
     out, seen = [], set()
     for p in paths:
         p = str(p)
-        hits = sorted(glob.glob(p)) if any(ch in p for ch in "*?[") else [p]
+        # a real path is used as is (names may contain [ ] which glob would treat as a pattern)
+        hits = [p] if Path(p).exists() else sorted(glob.glob(p))
         for h in hits:
             hp = Path(h)
             files = (sorted(q for q in hp.rglob("*") if q.suffix.lower() in (".las", ".laz"))
@@ -151,7 +153,7 @@ def plan(tiles: list, gsd: float, buffer_m: float, max_block_m: float = 1000.0,
                 blk = (xs[i], ys[j], xs[i + 1], ys[j + 1])
                 buf = _snap((blk[0] - buffer_m, blk[1] - buffer_m, blk[2] + buffer_m, blk[3] + buffer_m), gsd)
                 src = [q for q, e in extents.items() if _intersects(e, buf)]
-                name = scene_name(p) + (f"_b{i}{j}" if nx * ny > 1 else "")
+                name = scene_name(p) + (f"_b{i}_{j}" if nx * ny > 1 else "")
                 jobs.append(Job(name, blk, buf, src, p.name))
     if not jobs:
         return [], (0.0, 0.0, 0.0, 0.0), problems
@@ -161,8 +163,12 @@ def plan(tiles: list, gsd: float, buffer_m: float, max_block_m: float = 1000.0,
     return jobs, union, problems
 
 
-def prepare_job(job: Job, gsd: float, read_opts: dict | None = None, lasground: bool = True,
+def prepare_job(job: Job, gsd: float, read_opts: dict | None = None, lasground: bool | str = True,
                 before_ground_classes=(2,)) -> tuple[dict, Grid, dict]:
+    """lasground: True = the model needs lasground_new classes (error if the
+    tiles do not look like lasground_new output); "optional" = build the
+    lasground_new rasters only if they do (for dz_before / p_edit of models
+    that do not use them as inputs); False = never."""
     read_opts = dict(read_opts or {})
     t0 = time.time()
     pts = concat([read_points_bbox(f, job.buffered, **read_opts) for f in job.files])
@@ -171,12 +177,15 @@ def prepare_job(job: Job, gsd: float, read_opts: dict | None = None, lasground: 
     info = {"n_points": len(pts), "crs_wkt": pts.crs_wkt}
     if len(pts) == 0:
         return {}, grid, info
+    use_classes = False
     if lasground:
         hist = class_histogram(pts.cls)
         problem = check_lasground_classes(hist)
-        if problem:
+        if problem and lasground is True:
             raise ValueError(f"{problem} (classes {hist}); this model needs tiles classified by lasground_new")
-    arrs = input_rasters(grid, pts, lasground, before_ground_classes)
+        use_classes = problem is None
+        info["lasground_classes"] = use_classes
+    arrs = input_rasters(grid, pts, use_classes, before_ground_classes)
     info["read_s"] = round(time.time() - t0, 1)
     return {k: v.astype(np.float64) for k, v in arrs.items()}, grid, info
 
@@ -187,8 +196,10 @@ def output_keys(spec: RuntimeSpec, predict_kwargs: dict | None = None) -> list[s
     keys = ["dtm"]
     edit = spec.kind == "groundiff" and bool(spec.prior_channel) and spec.gate_channel == spec.prior_channel
     if spec.kind == "groundiff":
-        keys.append("p_edit" if edit else "p_ground")
-    if spec.prior_channel:
+        # DSM -> DTM models: p_edit (share of samples differing from lasground_new by > alpha) and
+        # dz_before exist when the input tiles carry lasground_new classes
+        keys += ["p_edit"] if edit else ["p_ground", "p_edit"]
+    if spec.kind == "groundiff" or spec.prior_channel:
         keys.append("dz_before")
     if predict_kwargs.get("n_samples", 1) > 1 or predict_kwargs.get("tta"):
         keys.append("std")
@@ -240,6 +251,18 @@ class Priorities:
             a = self.acc.setdefault((int(kx), int(ky)), {})
             for c, v in cols.items():
                 a[c] = max(a.get(c, 0.0), float(v[i])) if c == "max_dz" else a.get(c, 0.0) + float(v[i])
+
+    def add_mosaics(self, outputs: dict, G: Grid, rows: int = 1024):
+        """Accumulate from the finished mosaics (one value per cell, so tiles
+        whose extents overlap are never counted twice)."""
+        names = [k for k in ("dz_before", "p_edit", "std") if k in outputs]
+        if not ({"dz_before", "p_edit"} & set(names)):
+            return
+        its = {k: iter_rows(outputs[k], rows) for k in names}
+        for r0 in range(0, G.height, rows):
+            blocks = {k: next(its[k])[1] for k in names}
+            self.add(G.xmin, G.ymax - r0 * G.gsd, G.gsd, blocks.get("dz_before"), blocks.get("p_edit"),
+                     blocks.get("std"))
 
     def rows(self, gsd: float) -> list[dict]:
         out = []
@@ -309,10 +332,17 @@ def run_batch(tiles: list, out_dir: str | Path, net, spec: RuntimeSpec, *, gsd: 
     gsd = float(gsd or spec.gsd or 1.0)
     if spec.gsd and abs(gsd - spec.gsd) > 1e-9:
         log(f"[warn] the model was trained at {spec.gsd} m cells; running at {gsd} m")
+    if not spec.gsd:
+        log(f"[warn] the model file does not record its training cell size; using {gsd} m (re-export the model "
+            "with this version to record it)")
+    need = (spec.tile - 1) * gsd
     buffer_m = float(buffer_m) if buffer_m is not None else spec.tile * gsd + 32.0
+    if buffer_m < need:
+        log(f"[warn] buffer {buffer_m:g} m is smaller than one network tile ({need:g} m): values may differ "
+            "slightly where tiles meet")
     ro = dict(spec.read_opts or {})
     ro.update(read_opts or {})
-    lasground = spec.needs_before
+    lasground = True if spec.needs_before else "optional"
     predict_kwargs = dict(predict_kwargs or {})
     seed = int(predict_kwargs.pop("seed", 0))
     files = expand_inputs(tiles)
@@ -418,19 +448,24 @@ def run_batch(tiles: list, out_dir: str | Path, net, spec: RuntimeSpec, *, gsd: 
                         p = tiles_dir / f"{job.name}_{k}{sfx}.tif"
                         write_rgba_geotiff(p, rgba, *geo, alpha=alpha)
                         placed[f"{k}{sfx}"].append((p, gr, gc, h, w))
-            prio.add(job.core[0], job.core[3], gsd, crop.get("dz_before"), crop.get("p_edit"), crop.get("std"))
             summary["tiles"].append(rec)
             log(f"{job.name}: {info['n_points']} pts, read {info.get('read_s')} s, predict {rec['predict_s']} s")
             if progress:
                 progress((idx + 1) / len(jobs))
-    except Cancelled:
-        summary["cancelled"] = True
+    except BaseException as e:            # cancel, Ctrl-C or an unexpected error: record and stop cleanly
+        summary["cancelled"] = isinstance(e, (Cancelled, KeyboardInterrupt))
+        if not summary["cancelled"]:
+            summary["error"] = repr(e)
         summary["seconds"] = round(time.time() - t_start, 1)
         (out / "batch_summary.json").write_text(json.dumps(summary, indent=1))
         ex.shutdown(wait=False, cancel_futures=True)
         raise
     ex.shutdown(wait=True)
+    if lasground == "optional" and not any(t.get("lasground_classes") for t in summary["tiles"]):
+        log("[info] the tiles do not look like lasground_new output (classes other than 1/2), so there is no "
+            "predicted edit (dz_before / p_edit), only the predicted DTM")
     if not any("skipped" not in t for t in summary["tiles"]):
+        (out / "batch_summary.json").write_text(json.dumps(summary, indent=1))
         errs = "; ".join(f"{f.get('job', f['file'])}: {f['error']}" for f in summary["failed"][:5])
         raise ValueError(f"no tile could be processed. {errs}")
 
@@ -457,6 +492,7 @@ def run_batch(tiles: list, out_dir: str | Path, net, spec: RuntimeSpec, *, gsd: 
         _write_sidecars(tif, G.xmin, G.ymax, gsd, crs)
         outputs[name] = str(tif)
     summary["outputs"] = outputs
+    prio.add_mosaics(outputs, G)
     epsg = default_epsg if crs_is_default else epsg_of(crs)
     summary["priority"] = prio.write(out, gsd, epsg)
     summary["seconds"] = round(time.time() - t_start, 1)

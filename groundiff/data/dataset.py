@@ -141,7 +141,7 @@ def _starts(n: int, t: int, stride: int) -> list:
 def _own(starts: list, i: int, t: int, stride: int) -> tuple:
     """Part of tile i (in tile coordinates) not already covered by tile i-1,
     so pooled metrics count every pixel once."""
-    lo = 0 if i == 0 else max(0, starts[i - 1] + min(stride, t) - starts[i])
+    lo = 0 if i == 0 else max(0, starts[i - 1] + t - starts[i])
     return lo, t
 
 

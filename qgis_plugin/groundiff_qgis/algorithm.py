@@ -23,7 +23,7 @@ CHANNELS = [
     ("dsm_max", "DSM, highest return per cell"),
     ("dsm_min", "DSM, lowest return per cell"),
     ("dsm_last", "DSM, lowest last return per cell"),
-    ("dtm_before", "lasground_new DTM (before editing)"),
+    ("dtm_before", "lasground_new DTM (before editing; also gives the predicted edit for DSM-only models)"),
     ("sem_ground", "lasground_new ground share raster"),
     ("sem_nonground", "lasground_new non-ground share raster"),
     ("density", "Return density (per m²)"),
@@ -41,7 +41,7 @@ PROVIDERS = [
 ]
 BLENDS = ["linear", "min", "mean"]
 PRIORS = ["auto", "global", "channel", "none"]
-OUTPUTS = [("dtm", "Predicted DTM"), ("p_edit", "Edit probability (before->after models)"),
+OUTPUTS = [("dtm", "Predicted DTM"), ("p_edit", "Edit probability"),
            ("dz_before", "Predicted edit vs lasground_new (m)"), ("std", "Uncertainty (m)"),
            ("p_ground", "Probability the DSM is ground (DSM-only models)")]
 
@@ -84,8 +84,9 @@ def _run_params(alg):
                                                 options=[p[0] for p in PROVIDERS], defaultValue=0))
     alg.addParameter(QgsProcessingParameterEnum("BLEND", "Tile blending", options=BLENDS, defaultValue=0))
     alg.addParameter(QgsProcessingParameterEnum("PRIOR", "Prior (PrioStitch)", options=PRIORS, defaultValue=0))
-    alg.addParameter(QgsProcessingParameterNumber("SAMPLES", "Diffusion samples (uncertainty if > 1)",
-                                                  type=NUM_INT, defaultValue=1, minValue=1, maxValue=16))
+    alg.addParameter(QgsProcessingParameterNumber(
+        "SAMPLES", "Diffusion samples (more = smoother edit probability and an uncertainty map; time x samples)",
+        type=NUM_INT, defaultValue=4, minValue=1, maxValue=16))
     alg.addParameter(QgsProcessingParameterBoolean("TTA", "Average 8 flips/rotations", defaultValue=False))
     alg.addParameter(QgsProcessingParameterNumber("BATCH", "Network tiles per batch", type=NUM_INT,
                                                   defaultValue=8, minValue=1, maxValue=128))
@@ -119,7 +120,7 @@ class PredictTilesAlgorithm(QgsProcessingAlgorithm):
         return "Predict DTM and edit priorities from point-cloud tiles"
 
     def shortHelpString(self):
-        return ("Select the tiles as lasground_new wrote them (default settings: classes 1 and 2), any number, "
+        return ("Select the tiles as lasground_new wrote them in your production chain (classes 1 and 2), any number, "
                 "with the … button ('Add File(s)…' or 'Add Directory…', which includes subfolders). Each tile "
                 "is processed with a buffer of neighbouring points, so the combined rasters have no seams; "
                 "several tiles are read at once while the GPU works on the previous one. The output folder "
@@ -139,8 +140,9 @@ class PredictTilesAlgorithm(QgsProcessingAlgorithm):
                                                        defaultValue=0.0, minValue=0.0))
         self.addParameter(QgsProcessingParameterNumber("BUFFER", "Neighbour buffer (m, -1 = automatic)",
                                                        type=NUM_DOUBLE, defaultValue=-1.0, minValue=-1.0))
-        self.addParameter(QgsProcessingParameterNumber("WORKERS", "Tiles prepared in parallel", type=NUM_INT,
-                                                       defaultValue=max(1, min(4, (os.cpu_count() or 2) - 1)),
+        self.addParameter(QgsProcessingParameterNumber("WORKERS", "Tiles prepared in parallel (each needs a few GB RAM)",
+                                                       type=NUM_INT,
+                                                       defaultValue=2,
                                                        minValue=1, maxValue=32))
         self.addParameter(QgsProcessingParameterNumber("BLOCK", "Priority block size (m)", type=NUM_DOUBLE,
                                                        defaultValue=100.0, minValue=5.0))
@@ -235,7 +237,7 @@ class PredictRastersAlgorithm(QgsProcessingAlgorithm):
         kw = _run_kwargs(self, parameters, context)
         try:
             spec = pipe.load_spec(model)
-            can = pipe.producible(spec, kw["n_samples"], kw["tta"])
+            can = pipe.producible(spec, kw["n_samples"], kw["tta"], has_before="dtm_before" in paths)
             outputs = {}
             for key, _ in OUTPUTS:
                 requested = parameters.get(key.upper())

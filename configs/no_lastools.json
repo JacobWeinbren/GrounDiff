@@ -1,0 +1,51 @@
+{
+ "notes": "No LAStools needed. GrounDiff DSM -> DTM (paper section 3) trained on the EA DTM raster, with the extra point rasters of ALS2DTM/DeepTerRa (Le et al. 2022: lowest return, lowest last return, density, height spread, echoes). Inputs come from the points only (classes ignored), so the published EA tiles can be used as downloaded. Gate: the highest-return DSM, as in the paper. At inference on lasground_new tiles, the predicted DTM is compared with their ground: dz_before = DTM_pred - DTM_lasground, and p_edit = share of diffusion samples whose DTM differs from lasground_new's by more than alpha (use several samples). Deviations from the paper as in paper_dsm2dtm.json, plus nearest-filled empty cells with the loss over them (the EA DTM is complete) and 0.1/99.9 % quantile normalisation.",
+ "data": {
+  "root": "data/scenes_1m",
+  "split_file": "data/split.json",
+  "cond_channels": [
+   "dsm_max",
+   "dsm_min",
+   "dsm_last",
+   "density",
+   "z_std",
+   "echoes"
+  ],
+  "gate_channel": "dsm_max",
+  "norm_channels": [
+   "dsm_max",
+   "dsm_min"
+  ],
+  "norm_quantile": 0.001,
+  "tile": 256,
+  "alpha": 0.2,
+  "loss_mask": "gt",
+  "fill_empty": "nearest"
+ },
+ "model": {
+  "kind": "groundiff"
+ },
+ "diffusion": {
+  "T": 10,
+  "schedule": "cosine"
+ },
+ "loss": {
+  "lam_l1": 1.0,
+  "lam_l2": 1.0,
+  "lam_grad": 0.1,
+  "lam_conf": 0.1
+ },
+ "optim": {
+  "name": "adamw",
+  "lr": 0.0001,
+  "weight_decay": 0.01,
+  "warmup_steps": 500,
+  "total_steps": 20000
+ },
+ "train": {
+  "out_dir": "runs/no_lastools",
+  "batch_size": 4,
+  "grad_accum": 4,
+  "val_init": "dsm_noise"
+ }
+}

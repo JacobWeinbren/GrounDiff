@@ -49,7 +49,7 @@ def test_plugin_runs_from_rasters_and_points(trained, plugin, tmp_path):  # noqa
     arrs, info = pipe.rasters_from_files(paths)
     can = pipe.producible(spec)
     edit = spec.gate_channel == spec.prior_channel
-    assert set(can) == ({"dtm", "p_edit", "dz_before"} if edit else {"dtm", "p_ground", "dz_before"})
+    assert set(can) == ({"dtm", "p_edit", "dz_before"} if edit else {"dtm", "p_ground", "p_edit", "dz_before"})
     outs = {"dtm": str(tmp_path / "dtm.tif"), "p_edit": str(tmp_path / "pe.tif"), "std": "",
             "dz_before": str(tmp_path / "dz.tif")}
     written = pipe.run(str(onnx_path), arrs, info, outs, providers=["CPUExecutionProvider"], batch_size=4,
@@ -112,24 +112,22 @@ def test_algorithms_run_under_stub_qgis(trained, plugin, tmp_path, new_enums):  
     styled = [d for d in loaded.values() if d.post is not None]
     assert styled and all(d.post.qml.endswith(".qml") for d in styled)
 
-    # rasters: this test model is DSM-gated, so p_edit is not producible -> warning, no output
+    # rasters: std needs several samples; with SAMPLES=1 it is not producible -> warning, no output
     alg = alg_mod.PredictRastersAlgorithm().createInstance()
     alg.initAlgorithm()
     ctx, fb = qgis_stub.install(new_enums).QgsProcessingContext(), qgis_stub.Feedback()
     spec = importlib.import_module("groundiff_qgis.pipeline").load_spec(str(onnx_path))
     sd, g = root / "scenes" / "S2", meta["grid"]
-    params = {"MODEL": str(onnx_path), "BACKEND": 4, "BATCH": 4,
+    params = {"MODEL": str(onnx_path), "BACKEND": 4, "BATCH": 4, "SAMPLES": 1,
               "DTM": str(tmp_path / "r_dtm.tif"), "P_EDIT": str(tmp_path / "r_pe.tif"),
-              "DZ_BEFORE": str(tmp_path / "r_dz.tif")}
+              "DZ_BEFORE": str(tmp_path / "r_dz.tif"), "STD": str(tmp_path / "r_std.tif")}
     for ch in spec.needed_channels:
         p = tmp_path / f"in_{ch}.tif"
         write_geotiff(p, np.load(sd / f"{ch}.npy"), g["xmin"], g["ymax"], g["gsd"], meta["crs_wkt"])
         params[ch.upper()] = str(p)
     res = alg.processAlgorithm(params, ctx, fb)
-    edit = spec.gate_channel == spec.prior_channel
-    assert "DTM" in res and ("P_EDIT" in res) == edit
-    if not edit:
-        assert any("p_edit" in w for w in fb.warnings) and str(tmp_path / "r_pe.tif") not in ctx.to_load
+    assert "DTM" in res and "P_EDIT" in res and "STD" not in res
+    assert any("std" in w for w in fb.warnings) and str(tmp_path / "r_std.tif") not in ctx.to_load
     assert ctx.to_load[str(tmp_path / "r_dz.tif")].post is not None          # dz styled with its .qml
 
     # inspect

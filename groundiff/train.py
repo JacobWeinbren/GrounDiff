@@ -176,6 +176,8 @@ def _rng_state() -> dict:
     st = {"torch": torch.get_rng_state(), "numpy": np.random.get_state(), "python": random.getstate()}
     if torch.cuda.is_available():
         st["cuda"] = torch.cuda.get_rng_state_all()
+    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        st["mps"] = torch.mps.get_rng_state()
     return st
 
 
@@ -186,6 +188,11 @@ def _set_rng_state(st: dict):
     if "cuda" in st and torch.cuda.is_available():
         try:
             torch.cuda.set_rng_state_all(st["cuda"])
+        except RuntimeError:
+            pass
+    if "mps" in st and getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        try:
+            torch.mps.set_rng_state(st["mps"])
         except RuntimeError:
             pass
 
@@ -206,7 +213,11 @@ def train(cfg: Config, init_from: str | None = None) -> dict:
                          max_tiles=cfg.train.val_max_tiles)
     dmeta = data_meta(train_ds)
     if cfg.data.norm_mode == "mean_std" and cfg.data.norm_std is None:
-        cfg.data.norm_std = estimate_norm_std(train_ds)
+        prev = out / "last.pt"
+        if prev.exists():                  # resuming: keep the value the weights were trained with
+            cfg.data.norm_std = torch.load(prev, map_location="cpu", weights_only=False)["config"]["data"]["norm_std"]
+        else:
+            cfg.data.norm_std = estimate_norm_std(train_ds)
     (out / "config.json").write_text(json.dumps(cfg.to_dict(), indent=1))
 
     model = build_model(cfg).to(device)

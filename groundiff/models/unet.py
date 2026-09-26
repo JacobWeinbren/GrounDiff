@@ -136,8 +136,8 @@ class ResBlock(nn.Module):
                 b, _, hh, ww = x.shape
                 if self.updown:
                     hh, ww = (hh * 2, ww * 2) if isinstance(self.h_upd, Upsample) else (hh // 2, ww // 2)
-                keep = 1.0 - self.dropout
-                mask = torch.empty(b, self.out_channel, hh, ww, device=x.device).bernoulli_(keep) / keep
+                # boolean: a quarter of the memory of a float mask (kept alive for the recomputation)
+                mask = torch.rand(b, self.out_channel, hh, ww, device=x.device) < (1.0 - self.dropout)
             return checkpoint(self._forward, x, emb, mask, use_reentrant=False, preserve_rng_state=False)
         return self._forward(x, emb)
 
@@ -155,7 +155,7 @@ class ResBlock(nn.Module):
             h = act(norm(h) * (1 + scale) + shift)
         else:
             h = act(norm(h + emb_out))
-        h = h * mask.to(h.dtype) if mask is not None else drop(h)
+        h = h * (mask.to(h.dtype) / (1.0 - self.dropout)) if mask is not None else drop(h)
         return self.skip_connection(x) + conv(h)
 
 

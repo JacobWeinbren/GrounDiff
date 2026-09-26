@@ -46,7 +46,7 @@ def block_split(centres: dict[str, tuple[float, float]], block_m: float = 10_000
         out[n] += sorted(blocks[k])
         got[i] += len(blocks[k])
     for k in keys:
-        i = int(np.argmax((target - got) / np.maximum(target, 1e-9)))
+        i = int(np.argmax(target - got))                      # largest absolute shortfall
         out[names[i]] += sorted(blocks[k])
         got[i] += len(blocks[k])
     return out

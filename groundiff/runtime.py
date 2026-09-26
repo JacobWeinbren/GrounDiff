@@ -321,7 +321,11 @@ def predict_scene(arrs: dict, spec: RuntimeSpec, net: Callable, *, stride: int |
         raise ValueError(f"prior must be auto, global, channel or none, got {prior!r}")
     rng = np.random.default_rng(seed)
     if prior == "auto":
-        prior = "channel" if spec.prior_channel else "global"
+        # PrioStitch's global prior depends on the extent processed, so it cannot be seamless
+        # across separately processed blocks (anchor): there, models without a prior channel
+        # start from the DSM as in the paper's default (with Palette's cosine schedule the
+        # prior barely reaches the network anyway)
+        prior = "channel" if spec.prior_channel else ("none" if anchor is not None else "global")
     is_diff = spec.kind == "groundiff"
 
     prior_full = None
@@ -339,13 +343,20 @@ def predict_scene(arrs: dict, spec: RuntimeSpec, net: Callable, *, stride: int |
     elif prior == "channel" or not is_diff:
         if not spec.prior_channel:
             raise ValueError("prior='channel' needs a prior channel in the spec")
-        prior_full = arrs[spec.prior_channel].astype(np.float64)
-        if spec.fill_empty == "nearest":
-            prior_full = fill_nearest(prior_full)          # as in training (dataset._finish)
+        prior_full = arrs[spec.prior_channel].astype(np.float64)   # filled per tile below, as in training
     if init is None:
         init = "prior" if (is_diff and prior_full is not None) else "dsm_noise"
     if is_diff and init not in INITS:
         raise ValueError(f"init must be one of {INITS}, got {init!r}")
+
+    # Reference DTM for models that do not take lasground_new as an input (DSM -> DTM):
+    # when the tiles carry lasground_new classes, their ground TIN (dtm_before) is
+    # compared with every sample to give dz_before and a sampled edit probability.
+    edit_gated = bool(spec.prior_channel) and spec.gate_channel == spec.prior_channel
+    ref = None
+    if is_diff and not edit_gated and "dtm_before" in arrs:
+        ref = arrs["dtm_before"].astype(np.float64)
+    pe_acc = np.zeros((H, W)) if ref is not None else None
 
     ar, ac = anchor if anchor is not None else (None, None)
     r0g, c0g, hg, wg = region if region is not None else (0, 0, H, W)
@@ -370,7 +381,10 @@ def predict_scene(arrs: dict, spec: RuntimeSpec, net: Callable, *, stride: int |
             los.append(lo)
             scs.append(sc)
             if prior_full is not None:
-                pn = channel_transform("dtm_before", window(prior_full, r, c), lo, sc)
+                pw = window(prior_full, r, c)
+                if spec.fill_empty == "nearest" and prior == "channel":
+                    pw = fill_nearest(pw)                  # per tile, as dataset._finish does
+                pn = channel_transform("dtm_before", pw, lo, sc)
                 priors.append(np.where(np.isfinite(pn), pn, 0.0).astype(np.float32)[None])
         cond = np.stack(tiles)
         pri = np.stack(priors) if priors else None
@@ -395,6 +409,13 @@ def predict_scene(arrs: dict, spec: RuntimeSpec, net: Callable, *, stride: int |
         mean, std = P.mean(0), (P.std(0) if P.shape[0] > 1 else np.zeros_like(P[0]))
         pg = np.stack(probs).mean(0) if probs else None
         for i, (r, c) in enumerate(chunk):
+            if pe_acc is not None:
+                ra_, ca_, rb_, cb_ = max(r, 0), max(c, 0), min(r + t, H), min(c + t, W)
+                if rb_ > ra_ and cb_ > ca_:
+                    tl_ = (slice(ra_ - r, rb_ - r), slice(ca_ - c, cb_ - c))
+                    bw = ref[ra_:rb_, ca_:cb_]
+                    ms = (P[:, i, 0][(slice(None),) + tl_].astype(np.float64) + 1) * 0.5 * scs[i] + los[i]
+                    pe_acc[ra_:rb_, ca_:cb_] += (np.abs(ms - bw) > spec.alpha).mean(0)
             # part of the tile inside the array
             ra, ca, rb, cb = max(r, 0), max(c, 0), min(r + t, H), min(c + t, W)
             if rb <= ra or cb <= ca:
@@ -426,6 +447,11 @@ def predict_scene(arrs: dict, spec: RuntimeSpec, net: Callable, *, stride: int |
             out["p_edit"] = (1.0 - out["p_ground"]).astype(np.float32)
     if n_samples > 1 or tta:
         out["std"] = np.where(has_data, sd_acc / np.maximum(cnt, 1), np.nan).astype(np.float32)
+    if pe_acc is not None:
+        # share of samples (x TTA views) whose DTM differs from lasground_new's by more than alpha
+        ok = has_data & np.isfinite(ref)
+        out["p_edit"] = np.where(ok, pe_acc / np.maximum(cnt, 1), np.nan).astype(np.float32)
+        out["dz_before"] = np.where(ok, out["dtm"] - ref, np.nan).astype(np.float32)
     if spec.prior_channel and spec.prior_channel in arrs:
         # only where lasground_new has a DTM of its own (not the filled prior)
         out["dz_before"] = (out["dtm"] - arrs[spec.prior_channel]).astype(np.float32)

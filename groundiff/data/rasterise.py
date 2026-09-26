@@ -14,7 +14,7 @@ Channels produced (all float32, metres unless stated):
   z_std      std of return heights in the cell      (ALS2DTM statistic raster)
   echoes     mean number_of_returns in the cell     (ALS2DTM statistic raster)
   has_return 1 where the cell holds at least one return
-  in_survey  1 inside the LiDAR coverage (returns plus narrow/enclosed voids
+  in_survey  1 inside the LiDAR coverage (returns plus voids narrower than 60 m
              such as water; see normalise.coverage_mask)
 A TIN DTM is built from the points of chosen classes (see `tin_dtm`) and is
 cut to in_survey, so no triangle spanning open sea or the survey edge

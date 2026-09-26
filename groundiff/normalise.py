@@ -79,10 +79,12 @@ def channel_transform(name: str, x: np.ndarray, lo: float, scale: float) -> np.n
 
 
 def coverage_mask(has_data: np.ndarray, gsd: float, close_m: float = 30.0) -> np.ndarray:
-    """Cells inside LiDAR coverage: data cells, plus voids narrower than
-    2 * close_m (morphological closing) and any void fully enclosed by data
-    (lakes, shadows). Areas outside the survey stay outside."""
-    from scipy.ndimage import binary_fill_holes, distance_transform_edt
+    """Cells inside LiDAR coverage: data cells plus voids narrower than
+    2 * close_m (morphological closing; e.g. rivers, small ponds, shadows).
+    Local by construction, so separately processed neighbouring blocks agree
+    (hole filling would depend on each block's extent). Larger voids (big
+    lakes, sea, outside the survey) stay outside."""
+    from scipy.ndimage import distance_transform_edt
     m = np.asarray(has_data, bool)
     if not m.any():
         return m
@@ -90,4 +92,4 @@ def coverage_mask(has_data: np.ndarray, gsd: float, close_m: float = 30.0) -> np
     if r > 0:
         dilated = distance_transform_edt(~m) <= r
         m = m | (distance_transform_edt(dilated) > r)
-    return binary_fill_holes(m)
+    return m
