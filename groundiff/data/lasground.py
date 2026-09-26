@@ -81,8 +81,9 @@ def check(before_dir: Path, after_dir: Path) -> list[str]:
         if not classes <= {1, 2, 7, 18}:
             msgs.append(f"{name}: before file has classes {sorted(classes)}; expected only 1/2 from lasground_new")
         share = float((pb.cls == 2).mean())
-        if not 0.02 < share < 0.98:
-            msgs.append(f"{name}: ground share {share:.1%} looks wrong (unlicensed LAStools distorts large files)")
+        if not 0.005 < share < 0.999:      # open farmland can legitimately exceed 98 % ground
+            msgs.append(f"{name}: ground share {share:.1%} is extreme; check the log and the output visually "
+                        "(unlicensed LAStools distorts files above ~1.5M points)")
     return msgs
 
 
