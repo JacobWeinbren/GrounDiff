@@ -1,0 +1,19 @@
+{
+  "notes": "GrounDiff conditioned on the lasground_new result: predicts the EA hand-edited DTM. Extra inputs follow ALS2DTM/DeepTerRa (Le et al. 2022): lowest-return rasters, statistic rasters (density, z_std, echoes) and the 2-channel ground/non-ground raster (their 'sem2'), here built from lasground_new classes; the lasground_new DTM is an input channel and the PrioStitch-style prior.",
+  "data": {
+    "root": "data/scenes_05m",
+    "split_file": "data/split.json",
+    "cond_channels": ["dsm_max", "dsm_min", "dsm_last", "dtm_before", "sem_ground", "sem_nonground", "density", "z_std", "echoes"],
+    "gate_channel": "dsm_max",
+    "norm_channels": ["dsm_max", "dsm_min", "dtm_before"],
+    "prior_channel": "dtm_before",
+    "tile": 256,
+    "alpha": 0.2,
+    "loss_mask": "gt"
+  },
+  "model": {"kind": "groundiff"},
+  "diffusion": {"T": 10, "schedule": "cosine"},
+  "loss": {"lam_l1": 1.0, "lam_l2": 1.0, "lam_grad": 0.1, "lam_conf": 0.1},
+  "optim": {"name": "adamw", "lr": 1e-4, "weight_decay": 0.01, "warmup_steps": 500, "total_steps": 20000},
+  "train": {"out_dir": "runs/before_after", "batch_size": 16, "grad_accum": 1, "val_init": "dsm_noise"}
+}

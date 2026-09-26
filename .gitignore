@@ -1,2 +1,11 @@
-.DS_Store
-*.npz
+__pycache__/
+*.pyc
+.pytest_cache/
+runs/
+data/scenes*/
+*.pt
+*.onnx
+*.laz
+*.las
+*.tif
+!tests/**

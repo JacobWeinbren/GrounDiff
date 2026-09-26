@@ -1,0 +1,18 @@
+{
+  "notes": "GrounDiff as published: DSM (max rasterisation) -> DTM. Paper §3, supplement §7. Deviations: normalisation range from the DSM only (the GT DTM is unknown at inference), min_range floor, EMA (Palette), alpha=0.2 m (not given).",
+  "data": {
+    "root": "data/scenes_05m",
+    "split_file": "data/split.json",
+    "cond_channels": ["dsm_max"],
+    "gate_channel": "dsm_max",
+    "norm_channels": ["dsm_max"],
+    "tile": 256,
+    "alpha": 0.2,
+    "loss_mask": "gt_and_dsm"
+  },
+  "model": {"kind": "groundiff"},
+  "diffusion": {"T": 10, "schedule": "cosine"},
+  "loss": {"lam_l1": 1.0, "lam_l2": 1.0, "lam_grad": 0.1, "lam_conf": 0.1},
+  "optim": {"name": "adamw", "lr": 1e-4, "weight_decay": 0.01, "warmup_steps": 500, "total_steps": 20000},
+  "train": {"out_dir": "runs/paper_dsm2dtm", "batch_size": 16, "grad_accum": 1, "val_init": "dsm_noise"}
+}

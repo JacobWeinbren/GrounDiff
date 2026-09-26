@@ -1,0 +1,19 @@
+{
+  "notes": "ResDepth (Stucker & Schindler 2022) as published, with the lasground_new DTM as the initial raster (channel 0) and LiDAR rasters as guidance: per-tile mean centring + global std, L1 in metres, Adam 2e-4, batch 20, StepLR. ResDepth trains 20000 samples per epoch with the LR divided by 10 every 200 epochs; here step_size is in iterations (200 epochs x 1000 iterations).",
+  "data": {
+    "root": "data/scenes_05m",
+    "split_file": "data/split.json",
+    "cond_channels": ["dtm_before", "dsm_max", "dsm_min", "dsm_last", "sem_ground", "sem_nonground", "density", "z_std", "echoes"],
+    "gate_channel": "dsm_max",
+    "norm_channels": ["dtm_before"],
+    "norm_mode": "mean_std",
+    "prior_channel": "dtm_before",
+    "tile": 256,
+    "alpha": 0.2,
+    "loss_mask": "gt",
+    "samples_per_epoch": 20000
+  },
+  "model": {"kind": "resdepth", "resdepth_depth": 5, "resdepth_start_kernel": 64},
+  "optim": {"name": "adam", "lr": 2e-4, "weight_decay": 0.0, "schedule": "step", "step_size": 200000, "step_gamma": 0.1, "total_steps": 400000, "ema_decay": null},
+  "train": {"out_dir": "runs/resdepth_before_after", "batch_size": 20, "grad_accum": 1}
+}
