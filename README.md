@@ -71,8 +71,15 @@ is flagged *suspect* by `preprocess` and left out of training and evaluation.
 
 ## Mac quickstart (MacBook Pro M3 Max, 36 GB)
 
+Everything up to the trained model happens on the Mac; the Windows PC only
+runs the model in QGIS. One-off installs: Python 3.10–3.12 and
+[Docker Desktop](https://www.docker.com/products/docker-desktop/) (for
+LAStools' Linux build; in its settings keep "Use Rosetta for x86_64/amd64
+emulation" on and set Resources → Memory to 16 GB or more). Have your
+`lastoolslicense.txt` to hand.
+
 ```bash
-# 0. one-off setup (Python 3.10-3.12)
+# 0. one-off setup
 git clone -b claude/rewrite-before-after https://github.com/JacobWeinbren/GrounDiff.git && cd GrounDiff
 python3.11 -m venv .venv && source .venv/bin/activate
 pip install --upgrade pip && pip install torch && pip install -e ".[onnx,dev]"
@@ -87,11 +94,10 @@ python -m groundiff.data.download --out data/laz/ea --target 300 --min-per-grid 
 python -m groundiff.data.ea_dtm --tiles data/laz/ea --out data/ea_dtm --dry-run
 python -m groundiff.data.ea_dtm --tiles data/laz/ea --out data/ea_dtm
 
-# 3. "before" tiles: lasground_new, default settings, on the PC with licensed LAStools
-python -m groundiff.data.lasground --in data/laz/ea --out data/laz/before --cores 8 --verbose --windows
-#    copy data/laz/ea and run_lasground_new.bat to the PC, run the .bat,
-#    copy data/laz/before back (paths inside the .bat can be edited), then:
-python -m groundiff.data.lasground check --before data/laz/before --after data/laz/ea
+# 3. "before" tiles: lasground_new, default settings, in Docker on the Mac (builds the image
+#    the first time; re-run to continue after an interruption; checks the results at the end)
+python -m groundiff.data.lasground docker --in data/laz/ea --out data/laz/before \
+    --license ~/lastools/lastoolslicense.txt --cores 6
 
 # 4. rasterise at 1 m (the EA DTM grid) and split by 10 km blocks
 python -m groundiff.data.preprocess --before-dir data/laz/before --dtm-dir data/ea_dtm \
@@ -168,12 +174,27 @@ in any tiling, so rasters downloaded by hand from
 ### The "before" classification
 
 Production runs `lasground_new` with **default settings**, which reclassifies
-every point to 1 or 2 regardless of the classes it had. `groundiff.data.lasground`
-writes the command (outputs keep the input file names, so tiles pair up), and
-`check` confirms equal point counts and 1/2-only classes. Keep the `-v` log:
-the `lasground_new` README gives two default steps (25 m in the text, 5.0 in
-the argument list) and the log shows which your binary used. Unlicensed
-LAStools distorts files above ~1.5M points.
+every point to 1 or 2 regardless of the classes it had.
+
+```bash
+python -m groundiff.data.lasground docker --in data/laz/ea --out data/laz/before --license lastoolslicense.txt
+```
+
+builds (once) a Docker image with the LAStools Linux release and the
+libraries its README lists, then runs
+`lasground_new64 -lof <tiles> -odir <out> -olaz -cores N -v` with your
+licence mounted read-only (`LAStoolsLicenseFile`). Outputs keep the input
+names, so tiles pair up; tiles already done are skipped; the `-v` log goes to
+`<out>/lasground_new.log` (the `lasground_new` README gives two default steps,
+25 m in the text and 5.0 in the argument list; the log shows which the binary
+used). It then runs `check`: equal point counts, **unchanged coordinates**
+(LAStools without a valid licence perturbs files above its free point limit,
+~1.5–5M points), classes 1/2 only and a sane ground share. On Apple Silicon
+the x86-64 build runs under Rosetta emulation, slower than native; `--cores`
+tiles are processed in parallel. `--lastools-tar` uses a downloaded `LAStools.tar.gz` instead
+of fetching it; `--rebuild` picks up a new release. With LAStools on Windows
+instead: `python -m groundiff.data.lasground script --windows ...` writes a
+`.bat`.
 
 ### Files from different producers
 
@@ -317,6 +338,8 @@ add the runtime to QGIS's Python:
 * pyproj is optional.
 
 Copy `models/before_after.onnx` and `models/before_after.json` together.
+The plugin's input is the tiles as they come out of `lasground_new` in your
+normal production chain (no extra processing on the PC).
 Processing Toolbox → GrounDiff:
 
 * **Predict DTM and edit priorities from point-cloud tiles**: select any
