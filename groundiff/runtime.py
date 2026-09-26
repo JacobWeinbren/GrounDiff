@@ -26,7 +26,7 @@ from typing import Callable
 
 import numpy as np
 
-from .normalise import NEAREST_CHANNELS, channel_transform, tile_range
+from .normalise import FILL_CHANNELS, NEAREST_CHANNELS, channel_transform, fill_nearest, tile_range
 
 
 @dataclass
@@ -47,6 +47,7 @@ class RuntimeSpec:
     coef_xt: list = field(default_factory=list)
     posterior_var: list = field(default_factory=list)
     clip_x0: float | None = None
+    fill_empty: str = "zero"
 
     def to_json(self, path: str | Path):
         Path(path).write_text(json.dumps(asdict(self), indent=1))
@@ -65,7 +66,7 @@ class RuntimeSpec:
                    norm_mode=d.norm_mode, norm_std=d.norm_std, min_range=d.min_range, tile=d.tile,
                    alpha=d.alpha, T=dc.T, alphas_bar=sch.alphas_bar.tolist(), coef_x0=sch.coef_x0.tolist(),
                    coef_xt=sch.coef_xt.tolist(), posterior_var=sch.posterior_var.tolist(),
-                   clip_x0=dc.clip_x0)
+                   clip_x0=dc.clip_x0, fill_empty=d.fill_empty)
 
     @property
     def needed_channels(self) -> list:
@@ -88,7 +89,10 @@ def tile_norm(arrs: dict, spec: RuntimeSpec) -> tuple[float, float]:
 
 def prepare(arrs: dict, spec: RuntimeSpec, lo: float, scale: float) -> np.ndarray:
     def prep(name):
-        x = channel_transform(name, arrs[name].astype(np.float64), lo, scale)
+        a = arrs[name].astype(np.float64)
+        if spec.fill_empty == "nearest" and name in FILL_CHANNELS:
+            a = fill_nearest(a)
+        x = channel_transform(name, a, lo, scale)
         return np.where(np.isfinite(x), x, 0.0).astype(np.float32)
     return np.stack([prep(n) for n in spec.cond_channels])
 
@@ -203,7 +207,9 @@ def predict_scene(arrs: dict, spec: RuntimeSpec, net: Callable, *, stride: int |
                   batch_size: int = 8, seed: int = 0, progress: Callable | None = None) -> dict:
     """arrs: full-scene rasters in metres (NaN = no data), at least
     spec.needed_channels. Returns metre-space rasters:
-        dtm, p_ground (GrounDiff), std (if n_samples > 1 or tta), dz_before
+        dtm, p_ground (GrounDiff: sigmoid(l), probability that the gate
+        surface is already right), p_edit (1 - p_ground, when the gate is the
+        lasground_new DTM), std (if n_samples > 1 or tta), dz_before
         (dtm - prior channel, if present), coverage."""
     missing = [c for c in spec.needed_channels if c not in arrs]
     if missing:
@@ -297,6 +303,9 @@ def predict_scene(arrs: dict, spec: RuntimeSpec, net: Callable, *, stride: int |
            "coverage": cnt.astype(np.float32)}
     if is_diff:
         out["p_ground"] = np.where(has_data, pg_acc / np.maximum(cnt, 1), np.nan).astype(np.float32)
+        if spec.prior_channel and spec.gate_channel == spec.prior_channel:
+            # gate on the lasground_new DTM: sigmoid(l) = "keep lasground_new here"
+            out["p_edit"] = (1.0 - out["p_ground"]).astype(np.float32)
     if n_samples > 1 or tta:
         out["std"] = np.where(has_data, sd_acc / np.maximum(cnt, 1), np.nan).astype(np.float32)
     if spec.prior_channel and spec.prior_channel in arrs:

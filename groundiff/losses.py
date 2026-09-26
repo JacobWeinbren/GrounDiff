@@ -17,6 +17,9 @@ class LossConfig:
     lam_l2: float = 1.0      # λ2
     lam_grad: float = 0.1    # λ∇
     lam_conf: float = 0.1    # λc
+    # "normalised": per-tile [-1, 1] units as in the paper; "metres": the same
+    # terms in metres, so high-relief tiles are not under-weighted
+    units: str = "normalised"
 
 
 def _masked_mean(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -31,8 +34,15 @@ def gradient_magnitude(x: torch.Tensor):
 
 
 def groundiff_loss(g0_hat: torch.Tensor, logit: torch.Tensor, g0: torch.Tensor,
-                   m_alpha: torch.Tensor, valid: torch.Tensor, cfg: LossConfig) -> dict:
+                   m_alpha: torch.Tensor, valid: torch.Tensor, cfg: LossConfig,
+                   half_scale: torch.Tensor | None = None) -> dict:
+    """half_scale [B]: metres per normalised unit (scale / 2), needed for units="metres"."""
     valid = valid.to(g0_hat.dtype)
+    if cfg.units == "metres":
+        if half_scale is None:
+            raise ValueError("units='metres' needs half_scale")
+        hs = half_scale.view(-1, 1, 1, 1).to(g0_hat.dtype)
+        g0_hat, g0 = g0_hat * hs, g0 * hs
     err = g0_hat - g0
     l1 = _masked_mean(err.abs(), valid)                                    # Eq. 12
     l2 = _masked_mean(err * err, valid)                                    # Eq. 12

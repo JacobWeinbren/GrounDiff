@@ -115,6 +115,23 @@ def class_mode_onehot(grid: Grid, x, y, is_ground) -> np.ndarray:
     return np.stack([ground, nonground]).reshape(2, grid.height, grid.width).astype(np.float32)
 
 
+def top_return_is(grid: Grid, x, y, z, flag) -> np.ndarray:
+    """1 where the highest return in the cell has `flag` set, 0 where not,
+    NaN for empty cells. Used as an alternative M_alpha target ("the DSM is
+    ground here"), which avoids the |s - g| < alpha rule labelling steep
+    ground as non-ground."""
+    n_cells = grid.width * grid.height
+    idx, ok = _flat_index(grid, x, y)
+    idx, z, flag = idx[ok], z[ok], flag[ok]
+    order = np.lexsort((z, idx))
+    last = np.ones(order.size, bool)
+    last[:-1] = idx[order][1:] != idx[order][:-1]
+    top = order[last]
+    out = np.full(n_cells, np.nan)
+    out[idx[top]] = flag[top].astype(np.float64)
+    return out.reshape(grid.height, grid.width).astype(np.float32)
+
+
 def tin_dtm(grid: Grid, x, y, z, max_points: int = 4_000_000, seed: int = 0):
     """Linear interpolation on a Delaunay triangulation (TIN) of the given
     points, evaluated at cell centres. Returns (dtm, valid) where valid is

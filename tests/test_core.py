@@ -154,3 +154,29 @@ def test_dtm_metrics_basic():
     assert math.isclose(m["rmse"], 0.1) and math.isclose(m["mae"], 0.1)
     assert m["type1_pct"] == 0.0 and m["type2_pct"] == 0.0
     assert surface_roughness_deg(np.zeros((5, 5)), np.ones((5, 5), bool), 1.0) == 0.0
+
+
+def test_metres_loss_is_rescaled_normalised_loss():
+    torch.manual_seed(1)
+    g, gh = torch.randn(2, 1, 8, 8), torch.randn(2, 1, 8, 8)
+    m, v, logit = torch.ones_like(g), torch.ones_like(g), torch.zeros_like(g)
+    hs = torch.tensor([2.0, 2.0])
+    n = groundiff_loss(gh, logit, g, m, v, LossConfig())
+    mt = groundiff_loss(gh, logit, g, m, v, LossConfig(units="metres"), half_scale=hs)
+    assert torch.isclose(mt["l1"], 2 * n["l1"]) and torch.isclose(mt["l2"], 4 * n["l2"])
+    assert torch.isclose(mt["grad"], 2 * n["grad"], rtol=1e-4) and torch.isclose(mt["conf"], n["conf"])
+
+
+def test_fill_nearest():
+    from groundiff.normalise import fill_nearest
+    a = np.array([[1.0, np.nan, 3.0], [np.nan, np.nan, np.nan]])
+    f = fill_nearest(a)
+    assert np.isfinite(f).all() and f[0, 0] == 1.0 and f[0, 2] == 3.0 and f[1, 0] == 1.0
+    assert np.isnan(fill_nearest(np.full((2, 2), np.nan))).all()
+
+
+def test_unet_head_fp32_under_autocast():
+    m = UNet(in_channel=3, inner_channel=32, channel_mults=(1, 2), dropout=0.0)
+    x, g = torch.randn(1, 3, 16, 16), torch.rand(1)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        assert m(x, g).dtype == torch.float32

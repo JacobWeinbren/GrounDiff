@@ -8,7 +8,7 @@ lasground_new ("before"). Output layout:
     <out>/<scene>/<channel>.npy          float32 [H, W], NaN = no data
 
 Channels: dsm_max, dsm_min, dsm_last, density, z_std, echoes, has_return,
-gt_dtm (+ gt_valid), and with a "before" file also dtm_before
+gt_dtm (+ gt_valid), top_ground (highest return is a target-ground class), and with a "before" file also dtm_before
 (+ before_valid), sem_ground, sem_nonground (DeepTerRa's 2-channel semantic
 raster built from the lasground_new classes).
 
@@ -29,9 +29,9 @@ from pathlib import Path
 import numpy as np
 
 from .laz import NOISE_CLASSES, class_histogram, read_points
-from .rasterise import Grid, class_mode_onehot, rasterise_points, tin_dtm
+from .rasterise import Grid, class_mode_onehot, rasterise_points, tin_dtm, top_return_is
 
-SCHEMA = 1
+SCHEMA = 2
 LAZ_SUFFIXES = (".laz", ".las")
 
 
@@ -70,6 +70,7 @@ def process_scene(after: Path, out_root: Path, before: Path | None = None, gsd: 
     gt, gt_valid = tin_dtm(grid, pts.x[g], pts.y[g], pts.z[g])
     _save(out, "gt_dtm", gt)
     _save(out, "gt_valid", gt_valid.astype(np.float32))
+    _save(out, "top_ground", top_return_is(grid, pts.x, pts.y, pts.z, g))
     meta = {
         "schema": SCHEMA, "scene": name, "gsd": gsd, "grid": grid.to_dict(),
         "crs_wkt": pts.crs_wkt, "after_file": str(after), "n_points": len(pts),

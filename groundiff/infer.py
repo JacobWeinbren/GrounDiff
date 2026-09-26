@@ -6,7 +6,8 @@
 
 Outputs per scene (GeoTIFF, same grid as the inputs):
     dtm.tif          predicted DTM (m)
-    p_ground.tif     GrounDiff ground confidence sigmoid(l) (0-1)
+    p_ground.tif     GrounDiff confidence sigmoid(l) (0-1) that the gate surface is right
+    p_edit.tif       1 - p_ground when the gate is the lasground_new DTM: edit probability
     std.tif          spread across samples / TTA views (m), with --samples > 1 or --tta
     dz_before.tif    predicted DTM - lasground_new DTM (m): the predicted edit
     error.tif        predicted DTM - reference DTM (m), when a reference exists
@@ -48,7 +49,8 @@ def load_net(checkpoint: str | None, onnx: str | None, device: str = "auto"):
 
 
 def block_priorities(dz: np.ndarray, gsd: float, block_m: float, std: np.ndarray | None = None,
-                     true_dz: np.ndarray | None = None, alpha: float = 0.2) -> list[dict]:
+                     true_dz: np.ndarray | None = None, alpha: float = 0.2,
+                     p_edit: np.ndarray | None = None) -> list[dict]:
     b = max(1, int(round(block_m / gsd)))
     H, W = dz.shape
     rows = []
@@ -63,6 +65,8 @@ def block_priorities(dz: np.ndarray, gsd: float, block_m: float, std: np.ndarray
                    "pred_edit_frac": float((ad > alpha).mean()), "n": int(ok.sum())}
             if std is not None:
                 row["std_mean_m"] = float(np.nanmean(std[r:r + b, c:c + b]))
+            if p_edit is not None:
+                row["p_edit_mean"] = float(np.nanmean(p_edit[r:r + b, c:c + b]))
             if true_dz is not None:
                 td = np.abs(true_dz[r:r + b, c:c + b])
                 row["true_edit_mean_m"] = float(np.nanmean(td)) if np.isfinite(td).any() else float("nan")
@@ -93,7 +97,7 @@ def run_scene(scene_dir: Path, net, spec: RuntimeSpec, out_dir: Path, args) -> d
                         batch_size=args.batch_size, seed=args.seed)
     out_dir.mkdir(parents=True, exist_ok=True)
     geo = (g["xmin"], g["ymax"], g["gsd"], meta.get("crs_wkt"))
-    for k in ("dtm", "p_ground", "std", "dz_before", "prior"):
+    for k in ("dtm", "p_ground", "p_edit", "std", "dz_before", "prior"):
         if k in res:
             write_geotiff(out_dir / f"{k}.tif", res[k], *geo)
     summary = {"scene": meta["scene"]}
@@ -111,7 +115,8 @@ def run_scene(scene_dir: Path, net, spec: RuntimeSpec, out_dir: Path, args) -> d
                                                    gsd=g["gsd"])
             true_dz = gt - before
     if "dz_before" in res:
-        rows = block_priorities(res["dz_before"], g["gsd"], args.block_m, res.get("std"), true_dz, spec.alpha)
+        rows = block_priorities(res["dz_before"], g["gsd"], args.block_m, res.get("std"), true_dz, spec.alpha,
+                                res.get("p_edit"))
         with open(out_dir / "priority.csv", "w", newline="") as f:
             if rows:
                 w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))

@@ -112,3 +112,19 @@ def test_block_split_is_spatial():
               for k, v in sp.items()}
     assert not (blocks["train"] & blocks["val"]) and not (blocks["train"] & blocks["test"])
     assert sp["val"] and sp["test"] and sum(len(v) for v in sp.values()) == 900
+
+
+def test_top_return_is():
+    from groundiff.data.rasterise import top_return_is
+    g = Grid.from_bounds(0, 0, 2, 1, 1.0)
+    x = np.array([0.5, 0.5, 1.5]); y = np.array([0.5, 0.5, 0.5]); z = np.array([1.0, 5.0, 2.0])
+    t = top_return_is(g, x, y, z, np.array([True, False, True]))
+    assert t[0, 0] == 0.0 and t[0, 1] == 1.0          # highest return in cell 0 is non-ground
+
+
+def test_top_class_m_alpha_and_fill(scene_dir):
+    cfg = DataConfig(root=str(scene_dir.parent), tile=64, samples_per_epoch=10, m_alpha_mode="top_class",
+                     fill_empty="nearest", cond_channels=["dsm_max", "dsm_min"], augment=False)
+    ds = TileDataset(cfg, split=None, mode="train")
+    it = ds[0]
+    assert it["m_alpha"].sum() > 0 and torch.isfinite(it["cond"]).all()

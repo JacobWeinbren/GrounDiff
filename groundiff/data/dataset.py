@@ -27,7 +27,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from ..normalise import HEIGHT_CHANNELS, NEAREST_CHANNELS, channel_transform, tile_range
+from ..normalise import FILL_CHANNELS, NEAREST_CHANNELS, channel_transform, fill_nearest, tile_range
 
 
 
@@ -45,6 +45,10 @@ class DataConfig:
     norm_mode: str = "minmax"                # "minmax" (GrounDiff §7.2) or "mean_std" (ResDepth)
     norm_std: float | None = None            # metres, mean_std mode (estimated from training tiles if None)
     loss_mask: str = "gt_and_dsm"            # or "gt": also learn to fill no-return cells
+    m_alpha_mode: str = "residual"           # "residual": |s - g| < alpha (paper Eq. 14);
+                                             # "top_class": highest return is ground (DSM gate only)
+    fill_empty: str = "zero"                 # "zero" (paper §7.2) or "nearest": fill empty cells of
+                                             # height inputs with the nearest value (has_return/density tell the net)
     augment: bool = True
     p_rot90: float = 0.5
     p_jitter: float = 0.5
@@ -116,7 +120,8 @@ class TileDataset(Dataset):
         self.epoch = 0
         self.scenes = scenes if scenes is not None else load_scenes(cfg, split)
         self.needed = sorted(set(cfg.cond_channels) | set(cfg.norm_channels) | {cfg.gate_channel, "gt_dtm", "gt_valid"}
-                             | ({cfg.prior_channel} if cfg.prior_channel else set()))
+                             | ({cfg.prior_channel} if cfg.prior_channel else set())
+                             | ({"top_ground"} if cfg.m_alpha_mode == "top_class" else set()))
         if mode == "eval":
             t, stride = cfg.tile, cfg.val_stride or cfg.tile
             self.index = []
@@ -214,7 +219,10 @@ class TileDataset(Dataset):
         gt = arrs["gt_dtm"]
         gt_ok = np.isfinite(gt) & (np.nan_to_num(arrs["gt_valid"]) > 0.5)
         valid = gt_ok & np.isfinite(gate) if cfg.loss_mask == "gt_and_dsm" else gt_ok
-        m_alpha = gt_ok & np.isfinite(gate) & (np.abs(np.nan_to_num(gate) - np.nan_to_num(gt)) < cfg.alpha)
+        if cfg.m_alpha_mode == "top_class":
+            m_alpha = gt_ok & (np.nan_to_num(arrs["top_ground"]) > 0.5)
+        else:
+            m_alpha = gt_ok & np.isfinite(gate) & (np.abs(np.nan_to_num(gate) - np.nan_to_num(gt)) < cfg.alpha)
         if cfg.norm_mode == "mean_std":
             # ResDepth: centre on the tile's mean height of the initial raster,
             # divide by a global std: x_n = (x - mean) / std
@@ -227,11 +235,14 @@ class TileDataset(Dataset):
             ref = np.stack([arrs[n] for n in cfg.norm_channels])
             lo, scale = tile_range(ref, np.isfinite(ref).all(0), cfg.min_range)
 
-        def prep(name):
-            x = channel_transform(name, arrs[name].astype(np.float64), lo, scale)
+        def prep(name, fill=False):
+            a = arrs[name].astype(np.float64)
+            if fill and name in FILL_CHANNELS:
+                a = fill_nearest(a)
+            x = channel_transform(name, a, lo, scale)
             return np.where(np.isfinite(x), x, 0.0).astype(np.float32)
 
-        cond = np.stack([prep(n) for n in cfg.cond_channels])
+        cond = np.stack([prep(n, cfg.fill_empty == "nearest") for n in cfg.cond_channels])
         target = np.where(gt_ok, prep("gt_dtm"), 0.0).astype(np.float32)
         prior = prep(cfg.prior_channel) if cfg.prior_channel else np.zeros_like(target)
         return {

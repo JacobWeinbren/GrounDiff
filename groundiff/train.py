@@ -215,7 +215,8 @@ def train(cfg: Config, init_from: str | None = None) -> dict:
             with autocast(device, amp_dtype):
                 if is_diff:
                     o = model.training_forward(target, cond)
-                    losses = groundiff_loss(o["g0_hat"], o["logit"], target, b["m_alpha"].to(device), valid, cfg.loss)
+                    losses = groundiff_loss(o["g0_hat"], o["logit"], target, b["m_alpha"].to(device), valid, cfg.loss,
+                                            half_scale=0.5 * b["scale"].to(device))
                 else:
                     pred = model(b["prior"].to(device), cond)
                     losses = resdepth_loss(pred.float(), target, valid, 0.5 * b["scale"].to(device))

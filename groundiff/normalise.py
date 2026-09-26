@@ -46,7 +46,18 @@ def denormalise(xn, lo, scale):
 
 
 HEIGHT_CHANNELS = {"dsm_max", "dsm_min", "dsm_last", "dtm_before", "gt_dtm"}
-NEAREST_CHANNELS = {"has_return", "sem_ground", "sem_nonground", "gt_valid", "before_valid"}
+NEAREST_CHANNELS = {"has_return", "sem_ground", "sem_nonground", "gt_valid", "before_valid", "top_ground"}
+FILL_CHANNELS = {"dsm_max", "dsm_min", "dsm_last", "dtm_before"}
+
+
+def fill_nearest(a: np.ndarray) -> np.ndarray:
+    """Replace NaNs by the nearest valid value (no-op if none are valid)."""
+    bad = ~np.isfinite(a)
+    if not bad.any() or bad.all():
+        return a
+    from scipy.ndimage import distance_transform_edt
+    idx = distance_transform_edt(bad, return_distances=False, return_indices=True)
+    return a[tuple(idx)]
 
 
 def channel_transform(name: str, x: np.ndarray, lo: float, scale: float) -> np.ndarray:

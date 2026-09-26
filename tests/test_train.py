@@ -88,3 +88,37 @@ def test_resdepth_trains(scenes, tmp_path):
     assert best["rmse"] < float("inf")
     saved = json.loads((out / "config.json").read_text())
     assert saved["data"]["norm_std"] and saved["data"]["norm_std"] > 0
+
+
+def test_validation_restores_live_weights():
+    from groundiff.train import EMA, load_plain_state
+    m = build_model(config_from_dict({"model": TINY_MODEL, "data": {"cond_channels": ["dsm_max"],
+                                                                    "norm_channels": ["dsm_max"]}}))
+    before = {k: v.clone() for k, v in m.state_dict().items()}
+    ema = EMA(m, 0.9)
+    with torch.no_grad():
+        for p in m.parameters():
+            p.add_(1.0)
+    live = {k: v.clone() for k, v in m.state_dict().items()}
+    backup = load_plain_state(m, ema.state_dict(m))
+    k = next(k for k in before if k.endswith("weight"))
+    assert torch.equal(m.state_dict()[k], before[k])          # EMA weights swapped in
+    m.load_state_dict(backup)
+    assert all(torch.equal(m.state_dict()[k], live[k]) for k in live)   # and restored
+
+
+def test_before_after_gate_on_lasground(scenes, tmp_path):
+    from groundiff.runtime import RuntimeSpec, predict_scene
+    from groundiff.backends import TorchNet
+    import numpy as np
+    out = tmp_path / "ba"
+    cfg = base_cfg(scenes, out, data={"gate_channel": "dtm_before", "fill_empty": "nearest", "loss_mask": "gt"},
+                   loss={"units": "metres"}, optim={"total_steps": 3, "warmup_steps": 1, "lr": 1e-3})
+    train(cfg)
+    model, cfg2, _ = load_model(out / "last.pt")
+    spec = RuntimeSpec.from_config(cfg2)
+    assert spec.fill_empty == "nearest" and spec.gate_channel == "dtm_before"
+    sd = scenes / "scenes" / "S2"
+    arrs = {n: np.load(sd / f"{n}.npy") for n in spec.needed_channels}
+    res = predict_scene(arrs, spec, TorchNet(model, "cpu"), batch_size=4)
+    assert "p_edit" in res and np.allclose(res["p_edit"] + res["p_ground"], 1.0, equal_nan=True)

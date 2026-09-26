@@ -14,11 +14,14 @@ Changes from Palette, none of which alter the maths:
     and CPU) and is off unless `use_checkpoint=True`;
   * attention uses F.scaled_dot_product_attention (same result as the
     legacy einsum path, less memory);
-  * no dtype casts inside forward: mixed precision is handled by autocast in
-    the training loop, and GroupNorm always runs in float32.
+  * mixed precision comes from autocast in the training loop; GroupNorm, the
+    input convolution and the output head always run in float32, so bf16 does
+    not quantise input heights or the predicted residual (bf16 keeps ~3
+    significant digits: ~8 cm steps on a 20 m-relief tile).
 """
 from __future__ import annotations
 
+import contextlib
 import math
 
 import torch
@@ -237,12 +240,25 @@ class UNet(nn.Module):
 
     def forward(self, x: torch.Tensor, gammas: torch.Tensor) -> torch.Tensor:
         emb = self.cond_embed(gamma_embedding(gammas.reshape(-1), self.inner_channel))
-        hs = []
-        h = x
-        for module in self.input_blocks:
+        with _fp32(x):
+            h = self.input_blocks[0](x.float(), emb)
+        hs = [h]
+        for module in self.input_blocks[1:]:
             h = module(h, emb)
             hs.append(h)
         h = self.middle_block(h, emb)
         for module in self.output_blocks:
             h = module(torch.cat([h, hs.pop()], dim=1), emb)
-        return self.out(h)
+        with _fp32(x):
+            return self.out(h.float())
+
+
+def _fp32(x: torch.Tensor):
+    """Disable autocast locally (no-op when autocast is off)."""
+    try:
+        if torch.is_autocast_enabled(x.device.type):
+            return torch.autocast(device_type=x.device.type, enabled=False)
+    except TypeError:                     # older torch: is_autocast_enabled() takes no args
+        if torch.is_autocast_enabled():
+            return torch.autocast(device_type=x.device.type, enabled=False)
+    return contextlib.nullcontext()
