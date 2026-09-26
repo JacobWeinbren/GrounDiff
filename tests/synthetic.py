@@ -1,9 +1,10 @@
 """Synthetic ALS scenes for tests: terrain + embankment + building + trees + noise.
 
-`write_scene` writes an "after" LAS (EA-like classes: 2 ground, 5 vegetation,
-6 building, 7/18 noise) and a "before" LAS with the same points where two
-typical lasground_new mistakes are planted: the building roof is kept as
-ground, and the embankment crest is dropped from ground.
+`write_scene` writes an "after" LAS (hand-edited classes: 2 ground, 5
+vegetation, 6 building, 7/18 noise) and a "before" LAS with the same points
+classified like lasground_new output (1/2 only) where two typical
+lasground_new mistakes are planted: the building roof is kept as ground, and
+the embankment crest is dropped from ground.
 """
 from __future__ import annotations
 
@@ -70,8 +71,7 @@ def write_scene(folder: Path, name: str = "SX0000_test", seed: int = 0, size: fl
     x, y, z, cls, rn, nr = make_points(size=size, seed=seed)
     write_las(folder / "after" / f"{name}.las", x, y, z, cls, rn, nr)
     lx, ly = x - x.min(), y - y.min()
-    before = np.where(np.isin(cls, (2,)), 2, 1).astype(np.uint8)
-    before[np.isin(cls, (7, 18))] = cls[np.isin(cls, (7, 18))]
+    before = np.where(np.isin(cls, (2,)), 2, 1).astype(np.uint8)   # lasground_new writes only 1/2
     roof = cls == 6
     before[roof] = 2                                              # roof kept as ground
     crest = (cls == 2) & (np.abs(lx - 60) < 2)

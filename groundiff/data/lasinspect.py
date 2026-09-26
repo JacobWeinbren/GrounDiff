@@ -75,15 +75,21 @@ def inspect(path: str | Path, max_points: int | None = None) -> dict:
         warn("point format >= 6 but the global-encoding WKT bit is not set: PDAL/QGIS may refuse this "
              "file (read it by path with laspy, or rewrite it with `las2las -set_global_encoding_wkt` "
              "or PDAL writers.las a_srs)")
-    crs_vlrs = [v for v in rep["vlrs"] if v.startswith(("LASF_Projection:2112", "LASF_Projection:34735"))]
+    crs_vlrs = [v for v in rep["vlrs"] + rep.get("evlrs", [])
+                if v.startswith(("LASF_Projection:2112", "LASF_Projection:34735"))]
     rep["crs_storage"] = ("WKT" if any(":2112" in v for v in crs_vlrs) else
                           "GeoTIFF keys" if any(":34735" in v for v in crs_vlrs) else "none")
-    try:
-        crs = h.parse_crs()
-        rep["crs"] = crs.name if crs is not None else None
-    except Exception as e:     # pyproj missing or malformed VLR
-        rep["crs"] = None
-        rep["crs_error"] = repr(e)
+    from .laz import crs_from_header
+    wkt, note = crs_from_header(h)          # works without pyproj
+    rep["crs"] = None
+    if wkt:
+        try:
+            from pyproj import CRS
+            rep["crs"] = CRS.from_wkt(wkt).name
+        except Exception:
+            rep["crs"] = wkt.split('"')[1] if '"' in wkt else wkt[:60]
+    if note:
+        rep["crs_error"] = note
     if rep["crs_storage"] == "none":
         warn("no CRS VLR: outputs will have no CRS unless you set one")
     if pf >= 6 and rep["crs_storage"] == "GeoTIFF keys":

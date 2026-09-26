@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import argparse
 import random
-import re
 import sys
 import time
 import urllib.parse
@@ -32,31 +31,8 @@ from pathlib import Path
 BUCKET_URL = "https://open-lidar-data.s3.eu-central-1.amazonaws.com"
 PREFIX = "data/UK/DEFRA/LIDAR_2022/copc/"
 NS = "{http://s3.amazonaws.com/doc/2006-03-01/}"
-# 1 km square + optional quadrant, e.g. SU6570 or SU6570ne
-TILE_RE = re.compile(r"(?<![A-Z])([A-Z]{2})(\d{2})(\d{2})(ne|nw|se|sw)?", re.IGNORECASE)
-QUAD_OFFSET = {"sw": (0, 0), "se": (500, 0), "nw": (0, 500), "ne": (500, 500)}
-LETTERS = "ABCDEFGHJKLMNOPQRSTUVWXYZ"          # OS grid letters (no I)
 
-
-def parse_tile(name: str) -> dict | None:
-    m = TILE_RE.search(Path(name).name)
-    if not m:
-        return None
-    sq, e, n, q = m.group(1).upper(), int(m.group(2)), int(m.group(3)), (m.group(4) or "").lower()
-    return {"grid": sq, "square": f"{sq}{m.group(2)}{m.group(3)}", "quad": q or None,
-            "origin": os_origin(sq, e, n, q)}
-
-
-def os_origin(sq: str, e_km: int, n_km: int, quad: str | None = None) -> tuple[int, int] | None:
-    """South-west corner (BNG metres) of a 1 km square or 500 m quadrant."""
-    try:
-        l1, l2 = LETTERS.index(sq[0]), LETTERS.index(sq[1])
-    except ValueError:
-        return None
-    e100 = ((l1 - 2) % 5) * 5 + (l2 % 5)
-    n100 = (19 - (l1 // 5) * 5) - (l2 // 5)
-    dx, dy = QUAD_OFFSET.get(quad or "", (0, 0))
-    return e100 * 100_000 + e_km * 1000 + dx, n100 * 100_000 + n_km * 1000 + dy
+from .osgrid import os_origin, parse_tile  # noqa: E402  (re-exported)
 
 
 def list_keys(cache: Path | None = None, refresh: bool = False, timeout: float = 60) -> list[tuple[str, int]]:
@@ -117,24 +93,24 @@ def floor_fill(keys: list[str], target: int, min_per_grid: int, seed: int = 42) 
 
 
 def neighbours(keys: list[str], all_keys: list[str], size: int = 3) -> list[str]:
-    """Add the size x size block of 500 m quadrants centred on each chosen tile."""
-    by_origin = {}
+    """Add the size x size block of same-sized tiles (500 m quadrants or 1 km
+    squares) centred on each chosen tile, with every file (survey) found at
+    each position."""
+    by_pos = defaultdict(list)
     for k in all_keys:
         t = parse_tile(k)
-        if t and t["origin"] and t["quad"]:
-            by_origin.setdefault(t["origin"], k)
+        if t:
+            by_pos[(t["origin"], t["size"])].append(k)
     out = set(keys)
     r = size // 2
     for k in keys:
         t = parse_tile(k)
-        if not t or not t["origin"]:
+        if not t:
             continue
-        x, y = t["origin"]
+        (x, y), step = t["origin"], t["size"]
         for i in range(-r, r + 1):
             for j in range(-r, r + 1):
-                nb = by_origin.get((x + 500 * i, y + 500 * j))
-                if nb:
-                    out.add(nb)
+                out.update(by_pos.get(((x + step * i, y + step * j), step), []))
     return sorted(out)
 
 

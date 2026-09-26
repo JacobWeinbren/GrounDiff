@@ -5,7 +5,8 @@ Production runs lasground_new with its DEFAULT settings, i.e. exactly
     lasground_new64 -i tile.laz -o tile_before.laz
 
 which (per the lasground_new README) re-classifies every point as ground (2)
-or non-ground (1), considers only last returns, and uses the default step,
+or non-ground (1), whatever class it had (without -non_ground_unchanged or
+-ignore_class nothing is kept), considers only last returns, and uses the default step,
 granularity, offset (0.05 m), spike (1 m) and bulge (step/10 clamped to
 1-2 m). The README gives two different default steps (25 m in the text,
 5.0 in the argument list): run once with --verbose and keep the log, which
@@ -16,6 +17,10 @@ keeping file names so "before" and "after" tiles pair up by name:
 
     python -m groundiff.data.lasground --in EA_tiles --out before --cores 8 --verbose
     # then run the written script on the machine with licensed LAStools
+
+Run it on the EA's published tiles to recreate the "before": their own
+classes (1-7 incl. vegetation/buildings) come from a different process and
+are overwritten, which is what we want - the model never uses them.
 
 Notes
   * LAStools without a licence distorts files above ~1.5M points (diagonal
@@ -51,9 +56,12 @@ def command(inputs: str, out_dir: str, *, exe: str = "lasground_new64", cores: i
 
 
 def write_script(in_dir: Path, out_dir: Path, script: Path, windows: bool, **kw) -> str:
-    pattern = str(in_dir / "*.laz") if windows else str(in_dir / "*.laz")
-    cmd = command(pattern.replace("/", "\\") if windows else pattern,
-                  str(out_dir).replace("/", "\\") if windows else str(out_dir), **kw)
+    exts = sorted({p.suffix.lower() for p in Path(in_dir).iterdir() if p.suffix.lower() in (".laz", ".las")}) \
+        if Path(in_dir).is_dir() else [".laz"]
+    sep = "\\" if windows else "/"
+    base = str(in_dir).replace("/", sep) if windows else str(in_dir)
+    patterns = '" "'.join(f"{base}{sep}*{e}" for e in (exts or [".laz"]))
+    cmd = command(patterns, str(out_dir).replace("/", sep) if windows else str(out_dir), **kw)
     if windows:
         text = f'@echo off\r\nif not exist "{out_dir}" mkdir "{out_dir}"\r\n{cmd} > "{out_dir}\\lasground_new.log" 2>&1\r\n'
     else:

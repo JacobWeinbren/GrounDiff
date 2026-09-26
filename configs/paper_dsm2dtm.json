@@ -1,7 +1,7 @@
 {
  "notes": "GrounDiff as published: DSM (max rasterisation) -> DTM (paper \u00a73, supplement \u00a77). Deviations: the normalisation range uses dsm_max and dsm_min (the paper uses DSM and GT DTM; the GT is unknown at inference and dsm_min is the closest available stand-in for its minimum), a 2 m minimum range, EMA (Palette), alpha = 0.2 m (not given in the paper).",
  "data": {
-  "root": "data/scenes_05m",
+  "root": "data/scenes_1m",
   "split_file": "data/split.json",
   "cond_channels": [
    "dsm_max"
@@ -37,8 +37,8 @@
  },
  "train": {
   "out_dir": "runs/paper_dsm2dtm",
-  "batch_size": 16,
-  "grad_accum": 1,
+  "batch_size": 4,
+  "grad_accum": 4,
   "val_init": "dsm_noise"
  }
 }

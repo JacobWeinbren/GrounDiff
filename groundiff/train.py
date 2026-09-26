@@ -4,7 +4,7 @@
     python -m groundiff.train configs/before_after.json --set train.batch_size=4 train.grad_accum=4
 
 Resumes automatically from <out_dir>/last.pt. Writes:
-    last.pt         full state (model, EMA, optimiser, scheduler, step)
+    last.pt         full state (model, EMA, optimiser, scheduler, grad scaler, RNG, step)
     best.pt         weights (raw + EMA) with the best validation RMSE
     log.jsonl       one JSON line per log / validation event
     config.json     the resolved config
@@ -105,21 +105,30 @@ def make_optimizer(cfg: Config, model: torch.nn.Module):
 
 
 def estimate_norm_std(ds: TileDataset, n: int = 200) -> float:
-    """ResDepth (train.py, compute_local_dsm_std_per_centered_patch): std of
-    the initial raster after centring each patch on its mean."""
-    saved = (ds.cfg.norm_mode, ds.cfg.norm_std)
-    ds.cfg.norm_mode, ds.cfg.norm_std = "mean_std", 1.0
-    vals = []
-    for i in range(min(n, len(ds))):
-        it = ds[i]
-        v = it["valid"][0] > 0
-        vals.append(it["prior"][0][v].numpy())         # already mean-centred (std = 1)
-    ds.cfg.norm_mode, ds.cfg.norm_std = saved
-    return float(np.concatenate(vals).std()) if vals else 1.0
+    """ResDepth (utils.compute_local_dsm_std_per_centered_patch): the std of
+    each un-augmented patch of the initial raster after centring it on its
+    mean, trimmed to the 5-95th percentile of patches, averaged."""
+    saved = (ds.cfg.norm_mode, ds.cfg.norm_std, ds.cfg.augment)
+    ds.cfg.norm_mode, ds.cfg.norm_std, ds.cfg.augment = "mean_std", 1.0, False
+    stds = []
+    try:
+        for i in range(min(n, len(ds))):
+            it = ds[i]
+            v = it["prior_valid"][0] > 0
+            if int(v.sum()) > 1:
+                x = it["prior"][0][v].double()            # metres, mean-centred (norm_std = 1)
+                stds.append(float((x - x.mean()).std()))
+    finally:
+        ds.cfg.norm_mode, ds.cfg.norm_std, ds.cfg.augment = saved
+    if not stds:
+        return 1.0
+    lo, hi = np.percentile(stds, [5, 95])
+    kept = [s for s in stds if lo <= s <= hi] or stds
+    return max(float(np.mean(kept)), 1e-3)
 
 
-def infinite_batches(ds: TileDataset, cfg: Config, device: torch.device):
-    epoch = 0
+def infinite_batches(ds: TileDataset, cfg: Config, device: torch.device, start_epoch: int = 0):
+    epoch = start_epoch
     while True:
         ds.set_epoch(epoch)
         dl = DataLoader(ds, batch_size=cfg.train.batch_size, shuffle=False, drop_last=True,
@@ -137,7 +146,52 @@ def log_event(path: Path, event: dict):
         f.write(line + "\n")
 
 
+def _raise_fd_limit():
+    """macOS allows 256 open files per process by default; memmapped scenes
+    and DataLoader workers need more. Harmless elsewhere."""
+    try:
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        want = 10240 if hard == resource.RLIM_INFINITY else min(hard, 10240)
+        if soft < want:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (want, hard))
+    except (ImportError, ValueError, OSError):
+        pass
+
+
+def data_meta(ds: TileDataset) -> dict:
+    """How the training rasters were made; exported with the model so batch
+    inference and the QGIS plugin use the same settings."""
+    keys = ("gsd", "ground_classes", "before_ground_classes", "read_opts", "lasground", "target")
+    metas = [{k: sc.meta.get(k) for k in keys} for sc in ds.scenes]
+    first = metas[0] if metas else {}
+    for k in keys:
+        if any(m[k] != first.get(k) for m in metas):
+            print(f"[warn] training scenes differ in {k}: {sorted({json.dumps(m[k]) for m in metas})}; "
+                  f"recording {first.get(k)!r}")
+    return first
+
+
+def _rng_state() -> dict:
+    st = {"torch": torch.get_rng_state(), "numpy": np.random.get_state(), "python": random.getstate()}
+    if torch.cuda.is_available():
+        st["cuda"] = torch.cuda.get_rng_state_all()
+    return st
+
+
+def _set_rng_state(st: dict):
+    torch.set_rng_state(st["torch"])
+    np.random.set_state(st["numpy"])
+    random.setstate(st["python"])
+    if "cuda" in st and torch.cuda.is_available():
+        try:
+            torch.cuda.set_rng_state_all(st["cuda"])
+        except RuntimeError:
+            pass
+
+
 def train(cfg: Config, init_from: str | None = None) -> dict:
+    _raise_fd_limit()
     out = Path(cfg.train.out_dir)
     out.mkdir(parents=True, exist_ok=True)
     device = pick_device(cfg.train.device)
@@ -148,7 +202,9 @@ def train(cfg: Config, init_from: str | None = None) -> dict:
     torch.manual_seed(cfg.train.seed)
 
     train_ds = TileDataset(cfg.data, "train" if cfg.data.split_file else None, mode="train")
-    val_ds = TileDataset(cfg.data, "val" if cfg.data.split_file else None, mode="eval")
+    val_ds = TileDataset(cfg.data, "val" if cfg.data.split_file else None, mode="eval",
+                         max_tiles=cfg.train.val_max_tiles)
+    dmeta = data_meta(train_ds)
     if cfg.data.norm_mode == "mean_std" and cfg.data.norm_std is None:
         cfg.data.norm_std = estimate_norm_std(train_ds)
     (out / "config.json").write_text(json.dumps(cfg.to_dict(), indent=1))
@@ -167,9 +223,19 @@ def train(cfg: Config, init_from: str | None = None) -> dict:
         model.load_state_dict(ck["model"])
         opt.load_state_dict(ck["optimizer"])
         sched.load_state_dict(ck["scheduler"])
-        if ema and ck.get("ema"):
-            ema.load(ck["ema"])
+        if ema:
+            if ck.get("ema"):
+                ema.load(ck["ema"])
+            else:                       # EMA newly enabled: start it from the loaded weights
+                ema = EMA(model, cfg.optim.ema_decay)
+        if scaler and ck.get("scaler"):
+            scaler.load_state_dict(ck["scaler"])
         step, best = ck["step"], ck.get("best", best)
+        if ck.get("rng"):
+            _set_rng_state(ck["rng"])
+        else:                           # older checkpoint: at least do not replay the first run's noise
+            torch.manual_seed(cfg.train.seed + step)
+            np.random.seed((cfg.train.seed + step) % 2 ** 32)
         print(f"resumed from {last} at step {step}")
     elif init_from:
         for note in init_from_checkpoint(model, cfg, init_from):
@@ -186,7 +252,11 @@ def train(cfg: Config, init_from: str | None = None) -> dict:
     log_event(log_path, {"event": "start", "device": str(device), "amp": str(amp_dtype),
                          "params_M": n_params / 1e6, "train_tiles_per_epoch": len(train_ds),
                          "val_tiles": len(val_ds), "step": step})
-    batches = infinite_batches(train_ds, cfg, device)
+    # continue with fresh tiles after a resume instead of replaying epoch 0
+    start_epoch = step * cfg.train.batch_size * cfg.train.grad_accum // max(cfg.data.samples_per_epoch, 1)
+    if step:
+        start_epoch += 1
+    batches = infinite_batches(train_ds, cfg, device, start_epoch)
     is_diff = is_diff_model(model)
     val_loader = DataLoader(val_ds, batch_size=cfg.train.batch_size, shuffle=False,
                             num_workers=cfg.train.num_workers)
@@ -205,8 +275,9 @@ def train(cfg: Config, init_from: str | None = None) -> dict:
         return results
 
     model.train()
-    t0, acc, n_acc = time.time(), {}, 0
+    busy, acc, n_acc = 0.0, {}, 0        # busy: training time only (no validation / saving)
     while step < cfg.optim.total_steps:
+        ts = time.time()
         opt.zero_grad(set_to_none=True)
         for _ in range(cfg.train.grad_accum):
             b = next(batches)
@@ -240,13 +311,13 @@ def train(cfg: Config, init_from: str | None = None) -> dict:
         step += 1
         if ema:
             ema.update(model, step)
+        busy += time.time() - ts
 
         if step % cfg.train.log_every == 0 or step == 1 or step == cfg.optim.total_steps:
-            dt = time.time() - t0
             log_event(log_path, {"event": "train", "step": step, "lr": sched.get_last_lr()[0],
                                  **{k: v / n_acc for k, v in acc.items()},
-                                 "sec_per_step": dt / n_acc, **memory_gb(device)})
-            t0, acc, n_acc = time.time(), {}, 0
+                                 "sec_per_step": busy / n_acc, **memory_gb(device)})
+            busy, acc, n_acc = 0.0, {}, 0
         if step % cfg.train.val_every == 0 or step == cfg.optim.total_steps:
             res = validate(step)
             log_event(log_path, {"event": "val", "step": step, **res})
@@ -255,10 +326,12 @@ def train(cfg: Config, init_from: str | None = None) -> dict:
                 if rmse < best["rmse"]:
                     best = {"rmse": rmse, "step": step, "weights": name, "metrics": r}
                     sd = cpu_state(model) if name == "raw" else ema.state_dict(model)
-                    save_checkpoint(out / "best.pt", cfg, sd, step=step, weights=name, metrics=r)
+                    save_checkpoint(out / "best.pt", cfg, sd, step=step, weights=name, metrics=r,
+                                    data_meta=dmeta)
         if step % cfg.train.save_every == 0 or step == cfg.optim.total_steps:
             save_checkpoint(last, cfg, cpu_state(model), ema=ema.state_dict(model) if ema else None,
-                            optimizer=opt.state_dict(), scheduler=sched.state_dict(), step=step, best=best)
+                            optimizer=opt.state_dict(), scheduler=sched.state_dict(), step=step, best=best,
+                            scaler=scaler.state_dict() if scaler else None, rng=_rng_state(), data_meta=dmeta)
     log_event(log_path, {"event": "done", "step": step, "best": {k: v for k, v in best.items() if k != "metrics"}})
     return best
 

@@ -15,7 +15,7 @@ from tests.synthetic import terrain, write_scene
 def scene_dir(tmp_path_factory):
     root = tmp_path_factory.mktemp("scenes")
     after, before = write_scene(root / "laz", name="SX0000_test", size=128.0)
-    meta = process_scene(after, root / "scenes", before=before, gsd=1.0)
+    meta = process_scene(before, root / "scenes", after=after, gsd=1.0)
     assert meta is not None
     return root / "scenes" / "SX0000_test"
 
@@ -49,7 +49,8 @@ def test_tin_recovers_plane():
 
 def test_preprocess_scene_contents(scene_dir):
     meta = json.loads((scene_dir / "meta.json").read_text())
-    assert meta["class_hist_after"].get("7") is None and meta["class_hist_after"].get("18") is None
+    assert meta["target"] == "after_points" and "quality" in meta
+    assert set(meta["class_hist_before"]) <= {"1", "2"}   # lasground_new-style before file
     sc = Scene(scene_dir)
     xs, ys = (np.arange(sc.width) + 0.5) + meta["grid"]["xmin"], meta["grid"]["ymax"] - (np.arange(sc.height) + 0.5)
     X, Y = np.meshgrid(xs, ys)
@@ -59,8 +60,9 @@ def test_preprocess_scene_contents(scene_dir):
     inner = ok & (lx > 2) & (lx < 126) & (ly > 2) & (ly < 126)
     assert np.nanmean(np.abs(gt - truth)[inner]) < 0.05
     dmax = sc.array("dsm_max")
-    assert np.nanmax(dmax - truth) < 20.0                  # high noise (+60 m) excluded
-    assert np.nanmin(sc.array("dsm_min") - truth) > -1.0   # low noise (-15 m) excluded
+    # every point is kept in the inputs, as in production lasground_new output: noise shows up
+    assert np.nanmax(dmax - truth) > 50.0                  # high noise (+60 m)
+    assert np.nanmin(sc.array("dsm_min") - truth) < -10.0  # low noise (-15 m)
     roof = (lx > 22) & (lx < 38) & (ly > 22) & (ly < 38)
     assert np.nanmedian((dmax - truth)[roof]) > 7.5
     trees = (lx > 82) & (lx < 108) & (ly > 72) & (ly < 108)

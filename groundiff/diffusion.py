@@ -12,6 +12,12 @@ Initialisation of the reverse process (`init`):
                                         provide this prior DTM as the initial
                                         state for the denoiser")
   prior_noise  g_T ~ N(prior, I)        PrioStitch analogue of dsm_noise
+  dsm_q        g_T ~ q(g_T | s) = N(sqrt(abar_T) s, (1 - abar_T) I)
+  prior_q      the same from the prior. Extensions, NOT in the paper: with
+               schedules whose abar_T is far from 0 (cosine_range, linear)
+               the paper's N(s, I) is off the training distribution for the
+               first steps; these match it. Identical to *_noise in practice
+               for Palette's cosine (abar_T = 2.4e-5).
 
 `t_start` (extension, NOT in the paper): begin the reverse chain at an
 intermediate step t_start < T from q(g_{t_start} | init surface). With
@@ -28,7 +34,15 @@ import torch.nn as nn
 
 from .schedule import build_schedule
 
-INITS = ("dsm_noise", "noise", "dsm", "prior", "prior_noise")
+INITS = ("dsm_noise", "noise", "dsm", "prior", "prior_noise", "dsm_q", "prior_q")
+
+
+def _randn(shape, device, generator: torch.Generator | None = None) -> torch.Tensor:
+    """Normal noise on `device`; a generator on another device (e.g. a CPU
+    generator for reproducible validation on CUDA/MPS) draws there first."""
+    if generator is not None and generator.device.type != torch.device(device).type:
+        return torch.randn(shape, generator=generator, device=generator.device).to(device)
+    return torch.randn(shape, device=device, generator=generator)
 
 
 def gating(r_hat: torch.Tensor, logit: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
@@ -44,8 +58,9 @@ class DiffusionConfig:
     beta_start: float = 1e-4
     beta_end: float = 2e-2
     cosine_s: float = 8e-3
-    # Palette samples a continuous noise level between abar_t and abar_{t-1};
-    # "discrete" uses abar_t exactly.
+    # "continuous" follows Palette: t ~ U{1..T-1}, gamma ~ U(abar_{t+1}, abar_t),
+    # i.e. gamma in [abar_T, abar_1] (the levels the sampler visits).
+    # "discrete": gamma = abar_t exactly, t ~ U{1..T}.
     gamma_sampling: str = "continuous"
     # Optional clamp of the predicted clean DTM during sampling, in normalised
     # units (Palette clamps to [-1, 1]). None disables it.
@@ -92,13 +107,13 @@ class GrounDiff(nn.Module):
     # ------------------------------------------------------------------ training
 
     def sample_gammas(self, batch: int, device, generator: torch.Generator | None = None):
-        t = torch.randint(1, self.T + 1, (batch,), device=device, generator=generator)
-        lo = self.alphas_bar[t - 1]
-        if self.cfg.gamma_sampling == "discrete":
-            return lo, t
-        hi = self.alphas_bar_prev[t - 1]
+        if self.cfg.gamma_sampling == "discrete" or self.T < 2:
+            t = torch.randint(1, self.T + 1, (batch,), device=device, generator=generator)
+            return self.alphas_bar[t - 1], t
+        t = torch.randint(1, self.T, (batch,), device=device, generator=generator)
+        lo, hi = self.alphas_bar[t], self.alphas_bar[t - 1]          # abar_{t+1}, abar_t
         u = torch.rand(batch, device=device, generator=generator)
-        return lo + (hi - lo) * u, t
+        return lo + (hi - lo) * u, t + 1
 
     def q_sample(self, g0: torch.Tensor, gamma: torch.Tensor, noise: torch.Tensor | None = None):
         """Eq. 2."""
@@ -129,10 +144,10 @@ class GrounDiff(nn.Module):
             base = torch.zeros_like(s)
         else:
             base = s
-        noise = torch.randn(s.shape, device=s.device, generator=generator)
+        noise = _randn(s.shape, s.device, generator)
         if not add_noise:
             noise = torch.zeros_like(noise)
-        if t_start < self.T:
+        if t_start < self.T or init.endswith("_q"):
             # Extension: q(g_{t_start} | base) instead of the paper's g_T.
             return self.q_sample(base, self.alphas_bar[t_start - 1].expand(s.shape[0]), noise)
         if init in ("dsm", "prior"):
@@ -158,7 +173,7 @@ class GrounDiff(nn.Module):
                 g0_hat = g0_hat.clamp(-self.cfg.clip_x0, self.cfg.clip_x0)
             if t > 1:
                 mean = self.coef_x0[t - 1] * g0_hat + self.coef_xt[t - 1] * g_t
-                noise = torch.randn(g_t.shape, device=g_t.device, generator=generator)
+                noise = _randn(g_t.shape, g_t.device, generator)
                 if not add_noise:
                     noise = torch.zeros_like(noise)
                 g_t = mean + self.posterior_var[t - 1].sqrt() * noise

@@ -12,7 +12,13 @@ from pathlib import Path
 
 import numpy as np
 
-# ASPRS: 7 = low point (noise), 18 = high noise. Excluded from every raster.
+# Class codes. EA production editing (lasground_new, then LP360) uses only
+# 1 unclassified, 2 ground, bridge and 7 low noise, and builds the DTM from
+# ground. The classes in the published EA LAZ/COPC files come from a different
+# process (they include 3-6 vegetation/buildings) and do not match the
+# published DTM rasters, so they are never used: input rasters take every
+# point, and only lasground_new's own 1/2 split feeds dtm_before / sem_*.
+# NOISE_CLASSES is only for reading hand-edited tiles (drop_classes=...).
 NOISE_CLASSES = (7, 18)
 LEGACY_OVERLAP_CLASS = 12
 
@@ -35,12 +41,52 @@ class Points:
                       self.return_number[mask], self.number_of_returns[mask], self.crs_wkt)
 
 
-def _crs_wkt(header) -> str | None:
+PROJECTED_CS_KEY, GEOGRAPHIC_CS_KEY = 3072, 2048
+WKT_RECORD, GEOKEY_RECORD = 2112, 34735
+
+
+def _crs_vlrs(header) -> list:
+    vlrs = list(getattr(header, "vlrs", []) or []) + list(getattr(header, "evlrs", None) or [])
+    return [v for v in vlrs if getattr(v, "user_id", "").rstrip("\0") == "LASF_Projection"
+            and getattr(v, "record_id", None) in (WKT_RECORD, GEOKEY_RECORD)]
+
+
+def crs_from_header(header) -> tuple[str | None, str | None]:
+    """(WKT or None, note or None). Uses pyproj through laspy when available,
+    otherwise reads the WKT VLR text or the GeoTIFF EPSG key directly (QGIS's
+    Python often lacks pyproj). VLRs and EVLRs are both searched."""
+    vlrs = _crs_vlrs(header)
+    if not vlrs:
+        return None, None
     try:
         crs = header.parse_crs()
-        return crs.to_wkt() if crs is not None else None
+        if crs is not None:
+            return crs.to_wkt(), None
     except Exception:
-        return None
+        pass
+    for v in vlrs:
+        if v.record_id == WKT_RECORD:
+            text = getattr(v, "string", None)
+            if isinstance(text, bytes):
+                text = text.decode("utf-8", "replace")
+            text = (text or "").strip().rstrip("\0").strip()
+            if text:
+                return text, None
+    for v in vlrs:
+        if v.record_id == GEOKEY_RECORD:
+            for key in getattr(v, "geo_keys", []):
+                if key.id in (PROJECTED_CS_KEY, GEOGRAPHIC_CS_KEY) and key.tiff_tag_location == 0 \
+                        and 1024 <= key.value_offset < 32767:
+                    from ..io_raster import crs_wkt_from_epsg
+                    wkt = crs_wkt_from_epsg(int(key.value_offset))
+                    if wkt:
+                        return wkt, None
+                    return None, f"CRS VLR names EPSG:{key.value_offset} but it could not be converted"
+    return None, "file has a CRS VLR that could not be parsed"
+
+
+def _crs_wkt(header) -> str | None:
+    return crs_from_header(header)[0]
 
 
 def _read(path: Path):
@@ -91,7 +137,7 @@ def _from_record(rec, crs_wkt, drop_classes, drop_withheld, drop_overlap, drop_s
     return pts if keep.all() else pts.subset(keep)
 
 
-def read_points(path: str | Path, drop_classes=NOISE_CLASSES, drop_withheld: bool = True,
+def read_points(path: str | Path, drop_classes=(), drop_withheld: bool = True,
                 drop_overlap: bool = False, drop_synthetic: bool = False) -> Points:
     path = Path(path)
     las = _read(path)
@@ -108,20 +154,87 @@ def header_bounds(path: str | Path) -> tuple[float, float, float, float]:
     return float(mn[0]), float(mn[1]), float(mx[0]), float(mx[1])
 
 
-def read_points_bbox(path: str | Path, bbox, drop_classes=NOISE_CLASSES, drop_withheld: bool = True,
-                     drop_overlap: bool = False, drop_synthetic: bool = False,
-                     chunk_size: int = 2_000_000) -> Points:
-    """Points with xmin <= x < xmax, ymin <= y < ymax, read in chunks so that
-    only the kept points are held in memory. May return 0 points."""
+def header_info(path: str | Path) -> dict:
+    import laspy
+    with laspy.open(str(path)) as f:
+        h = f.header
+        mn, mx = h.mins, h.maxs
+        return {"bounds": (float(mn[0]), float(mn[1]), float(mx[0]), float(mx[1])),
+                "point_count": int(h.point_count), "is_copc": _is_copc(h)}
+
+
+def data_bounds(path: str | Path, chunk_size: int = 2_000_000) -> tuple[float, float, float, float] | None:
+    """Bounds of the points themselves (one pass over x/y), for files whose
+    header bounds cannot be trusted. None if the file has no points."""
+    import laspy
+    b = [np.inf, np.inf, -np.inf, -np.inf]
+    with laspy.open(str(path)) as f:
+        for rec in f.chunk_iterator(chunk_size):
+            x, y = np.asarray(rec.x), np.asarray(rec.y)
+            ok = np.isfinite(x) & np.isfinite(y)
+            if ok.any():
+                b = [min(b[0], x[ok].min()), min(b[1], y[ok].min()), max(b[2], x[ok].max()), max(b[3], y[ok].max())]
+    return None if not np.isfinite(b[0]) else tuple(float(v) for v in b)
+
+
+def _is_copc(header) -> bool:
+    return any(getattr(v, "user_id", "").rstrip("\0") == "copc" for v in getattr(header, "vlrs", []) or [])
+
+
+def _bbox_copc(path: Path, bbox, opts) -> Points:
+    import laspy
+    from laspy.copc import Bounds
+    with laspy.CopcReader.open(str(path)) as r:
+        crs = _crs_wkt(r.header)
+        rec = r.query(bounds=Bounds(mins=np.array(bbox[:2], float), maxs=np.array(bbox[2:], float)))
+        return _from_record(rec, crs, *opts, bbox)          # exact half-open filter on top of the octree
+
+
+def _bbox_chunks(path: Path, bbox, opts, chunk_size: int, laz_backend=None) -> Points:
     import laspy
     parts = []
-    with laspy.open(str(path)) as f:
+    kw = {"laz_backend": laz_backend} if laz_backend is not None else {}
+    with laspy.open(str(path), **kw) as f:
         crs = _crs_wkt(f.header)
         for rec in f.chunk_iterator(chunk_size):
-            pts = _from_record(rec, crs, drop_classes, drop_withheld, drop_overlap, drop_synthetic, bbox)
+            pts = _from_record(rec, crs, *opts, bbox)
             if len(pts):
                 parts.append(pts)
     return concat(parts, crs)
+
+
+def read_points_bbox(path: str | Path, bbox, drop_classes=(), drop_withheld: bool = True,
+                     drop_overlap: bool = False, drop_synthetic: bool = False,
+                     chunk_size: int = 2_000_000) -> Points:
+    """Points with xmin <= x < xmax, ymin <= y < ymax. COPC files are queried
+    through their octree (only the needed nodes are decompressed); others are
+    read in chunks so only the kept points are held in memory. Falls back to
+    other LAZ backends like read_points. May return 0 points. Errors name the
+    file."""
+    import laspy
+    path = Path(path)
+    opts = (drop_classes, drop_withheld, drop_overlap, drop_synthetic)
+    try:
+        with laspy.open(str(path)) as f:
+            copc = _is_copc(f.header)
+    except Exception as e:
+        raise RuntimeError(f"cannot open {path.name}: {e!r}") from e
+    if copc:
+        try:
+            return _bbox_copc(path, bbox, opts)
+        except Exception:
+            pass                                            # e.g. no lazrs: read it the ordinary way
+    try:
+        return _bbox_chunks(path, bbox, opts, chunk_size)
+    except Exception as first:
+        if path.suffix.lower() == ".laz":
+            for backend in getattr(laspy, "LazBackend", []):
+                try:
+                    if backend.is_available():
+                        return _bbox_chunks(path, bbox, opts, chunk_size, backend)
+                except Exception:
+                    continue
+        raise RuntimeError(f"cannot read {path.name}: {first!r}") from first
 
 
 def concat(parts: list, crs_wkt: str | None = None) -> Points:

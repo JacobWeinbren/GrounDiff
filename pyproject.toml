@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "groundiff"
-version = "0.2.0"
+version = "0.3.0"
 description = "GrounDiff (WACV 2026) and ResDepth for LiDAR DTM production: lasground_new result -> hand-edited DTM, editing priorities, QGIS/LP360 outputs"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -16,7 +16,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-train = ["torch>=2.2"]
+train = ["torch>=2.3"]
 onnx = ["onnx>=1.15", "onnxruntime>=1.17", "onnxscript"]
 dev = ["pytest>=7"]
 

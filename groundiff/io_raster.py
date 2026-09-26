@@ -16,9 +16,10 @@ def crs_wkt_from_epsg(epsg: int = 27700) -> str | None:
     try:
         from osgeo import osr
         srs = osr.SpatialReference()
-        srs.ImportFromEPSG(epsg)
-        return srs.ExportToWkt()
-    except ImportError:
+        if srs.ImportFromEPSG(int(epsg)) != 0:
+            return None
+        return srs.ExportToWkt() or None
+    except (ImportError, RuntimeError):
         return None
 
 
@@ -49,32 +50,131 @@ def write_geotiff(path: str | Path, arr: np.ndarray, xmin: float, ymax: float, g
     ds.FlushCache()
 
 
+def _north_up(a: np.ndarray, gt: tuple, path) -> tuple[np.ndarray, tuple]:
+    """gt = GDAL geotransform. Flips south-up rasters; rejects rotation and
+    non-square pixels (relative tolerance 1e-6)."""
+    x0, px, rx, y0, ry, py = gt
+    if rx or ry or px <= 0:
+        raise ValueError(f"{path}: rotated or mirrored rasters are not supported")
+    if abs(abs(px) - abs(py)) > 1e-6 * abs(px):
+        raise ValueError(f"{path}: only square pixels are supported ({px} x {abs(py)})")
+    if py > 0:                                   # south-up: row 0 is the southern edge
+        a = a[..., ::-1, :]
+        y0 = y0 + a.shape[-2] * py
+    return a, (x0, px, 0.0, y0, 0.0, -abs(px))
+
+
 def read_geotiff(path: str | Path) -> tuple[np.ndarray, dict]:
-    """Returns (array with NaN for no-data, info{xmin, ymax, gsd, crs_wkt})."""
+    """Returns (array with NaN for no-data, info{xmin, ymax, gsd, crs_wkt}).
+    Reads anything GDAL reads (GeoTIFF, ASCII grid, VRT...)."""
     try:
         import rasterio
         with rasterio.open(str(path)) as src:
             a = src.read(1).astype(np.float64)
             if src.nodata is not None:
                 a[a == src.nodata] = np.nan
-            tr = src.transform
-            if abs(tr.a) != abs(tr.e) or tr.b or tr.d:
-                raise ValueError(f"{path}: only north-up rasters with square pixels are supported")
-            return a, {"xmin": tr.c, "ymax": tr.f, "gsd": tr.a,
-                       "crs_wkt": src.crs.to_wkt() if src.crs else None}
+            gt = src.transform.to_gdal()
+            crs = src.crs.to_wkt() if src.crs else None
     except ImportError:
-        pass
-    from osgeo import gdal
-    ds = gdal.Open(str(path))
-    band = ds.GetRasterBand(1)
-    a = band.ReadAsArray().astype(np.float64)
-    nd = band.GetNoDataValue()
-    if nd is not None:
-        a[a == nd] = np.nan
-    gt = ds.GetGeoTransform()
-    if gt[2] or gt[4] or abs(gt[1]) != abs(gt[5]):
-        raise ValueError(f"{path}: only north-up rasters with square pixels are supported")
-    return a, {"xmin": gt[0], "ymax": gt[3], "gsd": gt[1], "crs_wkt": ds.GetProjection() or None}
+        from osgeo import gdal
+        ds = gdal.Open(str(path))
+        if ds is None:
+            raise ValueError(f"cannot open {path}")
+        band = ds.GetRasterBand(1)
+        a = band.ReadAsArray().astype(np.float64)
+        nd = band.GetNoDataValue()
+        if nd is not None:
+            a[a == nd] = np.nan
+        gt = ds.GetGeoTransform()
+        crs = ds.GetProjection() or None
+    a[~(np.abs(a) < 1e30)] = np.nan          # EA rasters use -3.4e38 (float32 min) as nodata
+    a, gt = _north_up(a, gt, path)
+    return a, {"xmin": gt[0], "ymax": gt[3], "gsd": gt[1], "crs_wkt": crs}
+
+
+def raster_info(path: str | Path) -> dict:
+    """Extent and pixel size without reading the data."""
+    try:
+        import rasterio
+        with rasterio.open(str(path)) as src:
+            gt, w, h = src.transform.to_gdal(), src.width, src.height
+    except ImportError:
+        from osgeo import gdal
+        ds = gdal.Open(str(path))
+        if ds is None:
+            raise ValueError(f"cannot open {path}")
+        gt, w, h = ds.GetGeoTransform(), ds.RasterXSize, ds.RasterYSize
+    x0, px, _, y0, _, py = gt
+    ys = sorted((y0, y0 + h * py))
+    return {"xmin": x0, "xmax": x0 + w * px, "ymin": ys[0], "ymax": ys[1], "res": abs(px),
+            "width": w, "height": h}
+
+
+def _read_window(path, xmin, ymin, xmax, ymax):
+    """Pixels of `path` covering the bbox (plus one pixel), as (array NaN=no-data,
+    x0 of the window's left edge, y0 of its top edge, res)."""
+    info = raster_info(path)
+    res = info["res"]
+    c0 = max(0, int(np.floor((xmin - info["xmin"]) / res)) - 1)
+    c1 = min(info["width"], int(np.ceil((xmax - info["xmin"]) / res)) + 1)
+    r0 = max(0, int(np.floor((info["ymax"] - ymax) / res)) - 1)
+    r1 = min(info["height"], int(np.ceil((info["ymax"] - ymin) / res)) + 1)
+    if c1 <= c0 or r1 <= r0:
+        return None
+    try:
+        import rasterio
+        from rasterio.windows import Window
+        with rasterio.open(str(path)) as src:
+            flip = src.transform.e > 0
+            rr0 = src.height - r1 if flip else r0
+            a = src.read(1, window=Window(c0, rr0, c1 - c0, r1 - r0)).astype(np.float64)
+            if src.nodata is not None:
+                a[a == src.nodata] = np.nan
+    except ImportError:
+        from osgeo import gdal
+        ds = gdal.Open(str(path))
+        flip = ds.GetGeoTransform()[5] > 0
+        rr0 = ds.RasterYSize - r1 if flip else r0
+        band = ds.GetRasterBand(1)
+        a = band.ReadAsArray(c0, rr0, c1 - c0, r1 - r0).astype(np.float64)
+        nd = band.GetNoDataValue()
+        if nd is not None:
+            a[a == nd] = np.nan
+    if flip:
+        a = a[::-1]
+    a[~(np.abs(a) < 1e30)] = np.nan          # EA rasters use -3.4e38 (float32 min) as nodata
+    return a, info["xmin"] + c0 * res, info["ymax"] - r0 * res, res
+
+
+def sample_rasters(paths: list, xs: np.ndarray, ys: np.ndarray) -> np.ndarray:
+    """Values of a mosaic of rasters at points (cell centres of our grid:
+    xs [W] eastings, ys [H] northings) -> [H, W], NaN where no raster has
+    data. A raster's value is taken to sit at its own pixel centre and is
+    interpolated bilinearly; points that need a no-data neighbour are NaN
+    (so voids do not bleed). When grids coincide this returns the raster
+    values exactly. Earlier paths win where rasters overlap."""
+    from scipy.ndimage import map_coordinates
+
+    out = np.full((ys.size, xs.size), np.nan)
+    xmin, xmax, ymin, ymax = xs.min(), xs.max(), ys.min(), ys.max()
+    for p in paths:
+        got = _read_window(p, xmin, ymin, xmax, ymax)
+        if got is None:
+            continue
+        a, x0, y0, res = got
+        fc = (xs - x0) / res - 0.5
+        fr = (y0 - ys) / res - 0.5
+        inside_c = (fc >= -1e-6) & (fc <= a.shape[1] - 1 + 1e-6)
+        inside_r = (fr >= -1e-6) & (fr <= a.shape[0] - 1 + 1e-6)
+        if not inside_c.any() or not inside_r.any():
+            continue
+        R, C = np.meshgrid(np.clip(fr, 0, a.shape[0] - 1), np.clip(fc, 0, a.shape[1] - 1), indexing="ij")
+        ok = np.isfinite(a)
+        v = map_coordinates(np.where(ok, a, 0.0), [R, C], order=1, mode="nearest", prefilter=False)
+        w = map_coordinates(ok.astype(np.float64), [R, C], order=1, mode="nearest", prefilter=False)
+        good = (w > 1 - 1e-6) & inside_r[:, None] & inside_c[None, :] & ~np.isfinite(out)
+        out[good] = v[good] / w[good]
+    return out
 
 
 def build_vrt(vrt_path: str | Path, tiles: list, width: int, height: int, xmin: float, ymax: float,
@@ -127,3 +227,53 @@ def vrt_to_geotiff(vrt_path: str | Path, out_path: str | Path, rgba: bool = Fals
     from osgeo import gdal
     co = ["COMPRESS=LZW", "TILED=YES", "BIGTIFF=IF_SAFER"] + (["PHOTOMETRIC=RGB", "ALPHA=YES"] if rgba else [])
     gdal.Translate(str(out_path), str(vrt_path), creationOptions=co)
+
+
+def epsg_of(crs_wkt: str | None) -> int | None:
+    """EPSG code of a WKT CRS, if it can be identified."""
+    if not crs_wkt:
+        return None
+    try:
+        from rasterio.crs import CRS
+        return CRS.from_wkt(crs_wkt).to_epsg()
+    except ImportError:
+        pass
+    except Exception:
+        return None
+    try:
+        from osgeo import osr
+        srs = osr.SpatialReference()
+        if srs.ImportFromWkt(crs_wkt) != 0:
+            return None
+        srs.AutoIdentifyEPSG()
+        code = srs.GetAuthorityCode(None)
+        return int(code) if code else None
+    except Exception:
+        return None
+
+
+def build_overviews(path: str | Path, resampling: str = "average", min_size: int = 256):
+    """Internal overviews (x2, x4, ...) so large mosaics draw quickly in QGIS/LP360."""
+    try:
+        import rasterio
+        from rasterio.enums import Resampling
+        with rasterio.open(str(path), "r+") as ds:
+            factors, f = [], 2
+            while max(ds.width, ds.height) / f >= min_size:
+                factors.append(f)
+                f *= 2
+            if factors:
+                ds.build_overviews(factors, getattr(Resampling, resampling))
+                ds.update_tags(ns="rio_overview", resampling=resampling)
+        return
+    except ImportError:
+        pass
+    from osgeo import gdal
+    ds = gdal.Open(str(path), gdal.GA_Update)
+    factors, f = [], 2
+    while max(ds.RasterXSize, ds.RasterYSize) / f >= min_size:
+        factors.append(f)
+        f *= 2
+    if factors:
+        ds.BuildOverviews(resampling.upper(), factors)
+    ds = None

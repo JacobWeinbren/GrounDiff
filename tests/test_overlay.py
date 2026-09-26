@@ -17,7 +17,7 @@ def test_render_transparent_below_threshold_and_monotone():
 
 def test_presets_transform():
     assert render_rgba(np.array([[-0.8]]), "dz")[0, 0, 3] > 0             # |dz| used
-    assert render_rgba(np.array([[0.1]]), "low_confidence")[0, 0, 3] > 0  # 1 - 0.1 = 0.9
+    assert render_rgba(np.array([[0.1]]), "nonground")[0, 0, 3] > 0  # 1 - 0.1 = 0.9
 
 
 def test_write_overlays(tmp_path):

@@ -33,8 +33,9 @@ PRESETS = {
     "dz": {"stops": [0.15, 0.3, 0.5, 1.0, 2.0], "label": "Predicted edit |dz| (m)", "abs": True},
     # std: spread across samples / TTA views, metres
     "uncertainty": {"stops": [0.1, 0.2, 0.4, 0.7, 1.0], "label": "Uncertainty (m)"},
-    # p_ground: invert so LOW confidence is highlighted
-    "low_confidence": {"stops": [0.2, 0.4, 0.6, 0.8, 1.0], "label": "1 - confidence", "invert": True},
+    # DSM-gated (paper) model only: 1 - p_ground = probability that the DSM
+    # is NOT ground (buildings, trees). Not an uncertainty map; not written by default.
+    "nonground": {"stops": [0.2, 0.4, 0.6, 0.8, 1.0], "label": "Non-ground probability", "invert": True},
 }
 
 
@@ -124,22 +125,31 @@ def qml_style(preset: str) -> str:
     honours colour alpha in pseudocolour ramps)."""
     p = PRESETS[preset]
     stops = p["stops"]
-    items = []
-    # below the first stop: transparent
     first = _rgb(RAMP[0][0]).astype(int)
-    items.append(f'<item alpha="0" value="{stops[0] - 1e-6}" label="&lt; {stops[0]}" '
-                 f'color="#{first[0]:02x}{first[1]:02x}{first[2]:02x}"/>')
-    for s, (c, a) in zip(stops, RAMP):
-        items.append(f'<item alpha="{int(round(a * 255))}" value="{s}" label="{s}" color="{c.lower()}"/>')
-    if p.get("invert") or p.get("abs"):
-        note = "<!-- note: this preset transforms values (invert/abs); the style applies to raw values -->"
+    fc = f"#{first[0]:02x}{first[1]:02x}{first[2]:02x}"
+    ramp = [(s, c.lower(), int(round(a * 255))) for s, (c, a) in zip(stops, RAMP)]
+    items = []
+    if p.get("invert"):                           # values v -> 1 - v: high where v is low
+        for s, c, a in reversed(ramp):
+            items.append(f'<item alpha="{a}" value="{1 - s:.6g}" label="{1 - s:.6g}" color="{c}"/>')
+        items.append(f'<item alpha="0" value="{1 - stops[0] + 1e-6:.8g}" label="&gt; {1 - stops[0]:.6g}" '
+                     f'color="{fc}"/>')
     else:
-        note = ""
+        if p.get("abs"):                          # symmetric: -max .. -first, transparent gap, first .. max
+            for s, c, a in reversed(ramp):
+                items.append(f'<item alpha="{a}" value="{-s:.6g}" label="{-s:.6g}" color="{c}"/>')
+            items.append(f'<item alpha="0" value="{-stops[0] + 1e-6:.8g}" label="" color="{fc}"/>')
+        items.append(f'<item alpha="0" value="{stops[0] - 1e-6:.8g}" label="&lt; {stops[0]}" color="{fc}"/>')
+        for s, c, a in ramp:
+            items.append(f'<item alpha="{a}" value="{s:.6g}" label="{s:.6g}" color="{c}"/>')
+    lo = -stops[-1] if p.get("abs") else (1 - stops[-1] if p.get("invert") else stops[0])
+    hi = (1 - stops[0] if p.get("invert") else stops[-1])
+    note = ""
     return f"""<!DOCTYPE qgis PUBLIC 'http://mrcc.com/qgis.dtd' 'SYSTEM'>
 <qgis version="3.22" styleCategories="Symbology">{note}
  <pipe>
   <rasterrenderer type="singlebandpseudocolor" band="1" opacity="1" alphaBand="-1"
-                  classificationMin="{stops[0]}" classificationMax="{stops[-1]}">
+                  classificationMin="{lo:.6g}" classificationMax="{hi:.6g}">
    <rastershader>
     <colorrampshader colorRampType="INTERPOLATED" classificationMode="1" clip="0">
      {chr(10).join('     ' + i for i in items)}
@@ -160,12 +170,9 @@ def write_overlays(values: np.ndarray, out_stem: str | Path, preset: str, xmin: 
     b = stem.with_name(stem.name + "_overlay_rgb.tif")
     write_rgba_geotiff(a, rgba, xmin, ymax, gsd, crs_wkt, alpha=True)
     write_rgba_geotiff(b, rgba, xmin, ymax, gsd, crs_wkt, alpha=False)
-    paths = [a, b]
-    if not (PRESETS[preset].get("invert") or PRESETS[preset].get("abs")):
-        q = stem.with_suffix(".qml")
-        q.write_text(qml_style(preset))
-        paths.append(q)
-    return paths
+    q = stem.with_name(stem.name + ".qml")       # not with_suffix: names may contain dots
+    q.write_text(qml_style(preset))
+    return [a, b, q]
 
 
 def main(argv=None):

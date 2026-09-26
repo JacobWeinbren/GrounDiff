@@ -17,7 +17,7 @@ def scenes(tmp_path_factory):
     root = tmp_path_factory.mktemp("train")
     for i in range(3):
         after, before = write_scene(root / "laz", name=f"S{i}", seed=i, size=96.0)
-        process_scene(after, root / "scenes", before=before, gsd=1.0)
+        process_scene(before, root / "scenes", after=after, gsd=1.0)
     split = {"train": ["S0", "S1"], "val": ["S2"], "test": []}
     (root / "split.json").write_text(json.dumps(split))
     return root
@@ -64,7 +64,7 @@ def test_init_from_widens_input_exactly(scenes, tmp_path):
     new_cfg = base_cfg(scenes, tmp_path / "wide")
     new = build_model(new_cfg)
     notes = init_from_checkpoint(new, new_cfg, out / "last.pt")
-    assert any("stem widened" in n for n in notes)
+    assert any("stem mapped by channel name" in n for n in notes)
     new.eval()
     torch.manual_seed(0)
     g_t, cond_old = torch.randn(1, 1, 32, 32), torch.randn(1, 2, 32, 32)

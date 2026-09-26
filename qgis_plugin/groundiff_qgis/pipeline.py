@@ -1,11 +1,11 @@
 """QGIS-independent logic of the plugin (testable without QGIS).
 
 Inputs:
-  * point-cloud tiles (any number): the EA/LP360 LAS/LAZ/COPC tiles and, for
-    before -> after models, the same tiles re-classified by lasground_new
-    (paired by file name). Processed with neighbour buffers into one set of
-    mosaic GeoTIFFs in an output folder (core/batch.py);
-  * rasters: one GeoTIFF per channel name, all on one grid.
+  * point-cloud tiles (any number) as lasground_new wrote them (default
+    settings: classes 1/2), processed with neighbour buffers into one set of
+    mosaic GeoTIFFs plus a priority list in an output folder (core/batch.py);
+  * rasters: one GeoTIFF per channel name, all on one grid (e.g. written by
+    `python -m groundiff.data.preprocess --geotiff`).
 """
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ import numpy as np
 
 from .core.io_raster import read_geotiff, write_geotiff
 from .core.overlay import write_overlays
-from .core.runtime import RuntimeSpec, predict_scene
+from .core.runtime import RuntimeSpec, lattice_anchor, predict_scene
 
 OVERLAY_PRESET = {"p_edit": "edit", "dz_before": "dz", "std": "uncertainty"}
 
@@ -25,6 +25,11 @@ def load_spec(onnx_path: str) -> RuntimeSpec:
     if not js.exists():
         raise FileNotFoundError(f"{js} not found: export the model with `python -m groundiff.export`")
     return RuntimeSpec.from_json(js)
+
+
+def producible(spec: RuntimeSpec, n_samples: int = 1, tta: bool = False) -> list[str]:
+    from .core.batch import output_keys
+    return output_keys(spec, {"n_samples": n_samples, "tta": tta})
 
 
 def rasters_from_files(paths: dict) -> tuple[dict, dict]:
@@ -40,28 +45,27 @@ def rasters_from_files(paths: dict) -> tuple[dict, dict]:
     return arrs, info
 
 
-def rasters_from_points(after_laz: str, before_laz: str | None, gsd: float,
-                        before_ground_classes=(2,), read_opts: dict | None = None) -> tuple[dict, dict]:
+def rasters_from_points(tile: str, gsd: float, lasground: bool = True, before_ground_classes=(2,),
+                        read_opts: dict | None = None) -> tuple[dict, dict]:
     """One tile, no neighbour buffer (use run_tiles for several tiles)."""
-    from .core.data.laz import NOISE_CLASSES, read_points
-    from .core.data.rasterise import Grid, build_rasters
-
-    read_opts = read_opts or {}
-    pts = read_points(after_laz, drop_classes=NOISE_CLASSES, **read_opts)
-    bp = read_points(before_laz, drop_classes=NOISE_CLASSES, **read_opts) if before_laz else None
-    grid = Grid.from_bounds(pts.x.min(), pts.y.min(), pts.x.max(), pts.y.max(), gsd)
-    arrs = build_rasters(grid, pts, bp, before_ground_classes=before_ground_classes, with_target=False)
+    from .core.data.laz import read_points
+    from .core.data.rasterise import Grid, input_rasters
     from .core.io_raster import crs_wkt_from_epsg
+
+    pts = read_points(tile, **(read_opts or {}))
+    grid = Grid.from_bounds(pts.x.min(), pts.y.min(), pts.x.max(), pts.y.max(), gsd)
+    arrs = input_rasters(grid, pts, lasground, before_ground_classes)
     return ({k: v.astype(np.float64) for k, v in arrs.items()},
             {"xmin": grid.xmin, "ymax": grid.ymax, "gsd": grid.gsd,
              "crs_wkt": pts.crs_wkt or crs_wkt_from_epsg(27700)})
 
 
 def run(onnx_path: str, arrs: dict, info: dict, outputs: dict, providers: list | None = None,
-        stride: int | None = None, blend: str = "min", prior: str = "auto", n_samples: int = 1,
+        stride: int | None = None, blend: str = "linear", prior: str = "auto", n_samples: int = 1,
         tta: bool = False, batch_size: int = 8, seed: int = 0, progress=None, crs_wkt: str | None = None,
         overlays: bool = True) -> dict:
-    """outputs: {"dtm", "p_ground", "p_edit", "std", "dz_before"} -> path; empty or missing are skipped."""
+    """outputs: {"dtm", "p_ground", "p_edit", "std", "dz_before"} -> path; empty,
+    missing or not producible by this model are skipped."""
     from .core.backends import OnnxNet
 
     spec = load_spec(onnx_path)
@@ -69,21 +73,24 @@ def run(onnx_path: str, arrs: dict, info: dict, outputs: dict, providers: list |
     if missing:
         raise ValueError(f"the model needs these inputs, which were not provided: {missing}")
     net = OnnxNet(onnx_path, providers)
+    # same tile lattice and per-tile noise as the tile mode (batch), so both give the same values
     res = predict_scene(arrs, spec, net, stride=stride, blend=blend, prior=prior, n_samples=n_samples,
-                        tta=tta, batch_size=batch_size, seed=seed, progress=progress)
+                        tta=tta, batch_size=batch_size, seed=seed, progress=progress, gsd=info.get("gsd"),
+                        anchor=lattice_anchor(info["xmin"], info["ymax"], info["gsd"]))
     written = {}
     crs = crs_wkt or info.get("crs_wkt")
     for key, path in outputs.items():
         if path and key in res:
             write_geotiff(path, res[key], info["xmin"], info["ymax"], info["gsd"], crs)
             written[key] = path
-            preset = OVERLAY_PRESET.get(key) or ("low_confidence" if key == "p_ground" and "p_edit" not in res else None)
+            preset = OVERLAY_PRESET.get(key)
             if overlays and preset:
                 stem = Path(path).with_suffix("")
                 written[f"{key}_overlays"] = [str(p) for p in
                                               write_overlays(res[key], stem, preset, info["xmin"], info["ymax"],
                                                              info["gsd"], crs)]
     written["providers"] = net.providers
+    written["warning"] = net.warning
     return written
 
 
@@ -101,21 +108,25 @@ def inspect_report(path: str, compare_to: str | None = None) -> str:
     return "\n".join(lines)
 
 
-def run_tiles(onnx_path: str, after_files: list, out_dir: str, before_files: list | None = None,
-              providers: list | None = None, gsd: float = 0.5, buffer_m: float = 64.0, workers: int = 2,
-              read_opts: dict | None = None, overlays: bool = True, predict_kwargs: dict | None = None,
-              progress=None, log=print, cancelled=lambda: False) -> dict:
+def run_tiles(onnx_path: str, tiles: list, out_dir: str, providers: list | None = None, gsd: float | None = None,
+              buffer_m: float | None = None, workers: int = 2, read_opts: dict | None = None, overlays: bool = True,
+              predict_kwargs: dict | None = None, block_m: float = 100.0, progress=None, log=print,
+              cancelled=lambda: False) -> dict:
+    """tiles: LAS/LAZ/COPC files as lasground_new wrote them. gsd / buffer
+    None: as trained / one network tile + 32 m."""
     from .core.backends import OnnxNet
     from .core.batch import run_batch
 
-    exts = (".las", ".laz")
-    after_files = [f for f in after_files if str(f).lower().endswith(exts)]
-    before_files = [f for f in (before_files or []) if str(f).lower().endswith(exts)]
-    if not after_files:
+    tiles = [f for f in tiles if str(f).lower().endswith((".las", ".laz"))]
+    if not tiles:
         raise ValueError("no .las/.laz files selected")
     spec = load_spec(onnx_path)
     net = OnnxNet(onnx_path, providers)
     log(f"ONNX Runtime providers: {net.providers}")
-    return run_batch(after_files, out_dir, net, spec, before_files=before_files, gsd=gsd, buffer_m=buffer_m,
-                     workers=workers, read_opts=read_opts, overlays=overlays, predict_kwargs=predict_kwargs,
-                     progress=progress, log=log, cancelled=cancelled)
+    if net.warning:
+        log(f"[warn] {net.warning}")
+    s = run_batch(tiles, out_dir, net, spec, gsd=gsd, buffer_m=buffer_m, workers=workers, read_opts=read_opts,
+                  overlays=overlays, predict_kwargs=predict_kwargs, block_m=block_m, progress=progress, log=log,
+                  cancelled=cancelled)
+    s["providers"] = net.providers
+    return s

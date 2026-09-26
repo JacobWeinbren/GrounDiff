@@ -17,19 +17,23 @@ from __future__ import annotations
 import numpy as np
 
 
-def tile_range(stack: np.ndarray, valid: np.ndarray, min_range: float = 2.0) -> tuple[float, float]:
-    """stack: [C, H, W] reference rasters in metres; valid: [H, W] bool.
+def tile_range(stack: np.ndarray, valid: np.ndarray | None = None, min_range: float = 2.0,
+               quantile: float = 0.0) -> tuple[float, float]:
+    """stack: [C, H, W] reference rasters in metres. The range covers every
+    finite value of every channel (valid=None) or only pixels where `valid`
+    is True. quantile > 0 uses the [q, 1-q] quantiles instead of min/max, so a
+    single stray noise return cannot stretch the tile.
 
     Returns (lo, scale) such that x_n = 2 (x - lo) / scale - 1.
     """
-    if valid.any():
-        vals = stack[:, valid]
-        vals = vals[np.isfinite(vals)]
-    else:
-        vals = np.empty(0)
+    vals = stack if valid is None else stack[:, valid]
+    vals = vals[np.isfinite(vals)]
     if vals.size == 0:
         return 0.0, float(min_range)
-    lo, hi = float(vals.min()), float(vals.max())
+    if quantile > 0:
+        lo, hi = (float(v) for v in np.quantile(vals, [quantile, 1.0 - quantile]))
+    else:
+        lo, hi = float(vals.min()), float(vals.max())
     scale = hi - lo
     if scale < min_range:
         mid = 0.5 * (lo + hi)
@@ -46,7 +50,8 @@ def denormalise(xn, lo, scale):
 
 
 HEIGHT_CHANNELS = {"dsm_max", "dsm_min", "dsm_last", "dtm_before", "gt_dtm"}
-NEAREST_CHANNELS = {"has_return", "sem_ground", "sem_nonground", "gt_valid", "before_valid", "top_ground"}
+NEAREST_CHANNELS = {"has_return", "sem_ground", "sem_nonground", "gt_valid", "before_valid", "top_ground",
+                    "in_survey"}
 FILL_CHANNELS = {"dsm_max", "dsm_min", "dsm_last", "dtm_before"}
 
 
@@ -71,3 +76,18 @@ def channel_transform(name: str, x: np.ndarray, lo: float, scale: float) -> np.n
     if name == "echoes":
         return (x - 1.0) / 2.0
     return x
+
+
+def coverage_mask(has_data: np.ndarray, gsd: float, close_m: float = 30.0) -> np.ndarray:
+    """Cells inside LiDAR coverage: data cells, plus voids narrower than
+    2 * close_m (morphological closing) and any void fully enclosed by data
+    (lakes, shadows). Areas outside the survey stay outside."""
+    from scipy.ndimage import binary_fill_holes, distance_transform_edt
+    m = np.asarray(has_data, bool)
+    if not m.any():
+        return m
+    r = close_m / gsd
+    if r > 0:
+        dilated = distance_transform_edt(~m) <= r
+        m = m | (distance_transform_edt(dilated) > r)
+    return binary_fill_holes(m)

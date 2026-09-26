@@ -27,7 +27,27 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from collections import OrderedDict
+
 from ..normalise import FILL_CHANNELS, NEAREST_CHANNELS, channel_transform, fill_nearest, tile_range
+
+# Open memmaps are cached per process with a cap: every open .npy holds a file
+# descriptor, and macOS allows only 256 per process by default.
+MAX_OPEN_ARRAYS = 96
+_OPEN: "OrderedDict[str, np.ndarray]" = OrderedDict()
+
+
+def _open_array(path: Path) -> np.ndarray:
+    key = str(path)
+    a = _OPEN.get(key)
+    if a is not None:
+        _OPEN.move_to_end(key)
+        return a
+    a = np.load(path, mmap_mode="r")
+    _OPEN[key] = a
+    while len(_OPEN) > MAX_OPEN_ARRAYS:
+        _OPEN.popitem(last=False)          # dropping the last reference closes the file
+    return a
 
 
 
@@ -44,6 +64,8 @@ class DataConfig:
     min_range: float = 2.0                   # metres, see normalise.py
     norm_mode: str = "minmax"                # "minmax" (GrounDiff §7.2) or "mean_std" (ResDepth)
     norm_std: float | None = None            # metres, mean_std mode (estimated from training tiles if None)
+    norm_quantile: float = 0.0               # >0: robust range from [q, 1-q] quantiles (stray noise returns)
+    coverage_close_m: float = 30.0           # voids narrower than 2x this (and enclosed voids) count as covered
     loss_mask: str = "gt_and_dsm"            # or "gt": also learn to fill no-return cells
     m_alpha_mode: str = "residual"           # "residual": |s - g| < alpha (paper Eq. 14);
                                              # "top_class": highest return is ground (DSM gate only)
@@ -60,6 +82,7 @@ class DataConfig:
     samples_per_epoch: int = 20000
     min_valid_frac: float = 0.05
     val_stride: int | None = None
+    include_suspect: bool = False            # also use scenes the preprocess quality gate flagged
 
 
 class Scene:
@@ -68,22 +91,12 @@ class Scene:
         self.meta = json.loads((self.path / "meta.json").read_text())
         g = self.meta["grid"]
         self.height, self.width, self.gsd = g["height"], g["width"], g["gsd"]
-        self._arrays: dict[str, np.ndarray] = {}
-
-    def __getstate__(self):
-        # memmaps would be pickled as full copies when DataLoader workers are
-        # spawned (the default on macOS); reopen them lazily in each worker
-        state = self.__dict__.copy()
-        state["_arrays"] = {}
-        return state
 
     def array(self, name: str) -> np.ndarray:
-        if name not in self._arrays:
-            f = self.path / f"{name}.npy"
-            if not f.exists():
-                raise FileNotFoundError(f"{f} missing (re-run preprocess with --before-dir?)")
-            self._arrays[name] = np.load(f, mmap_mode="r")
-        return self._arrays[name]
+        f = self.path / f"{name}.npy"
+        if not f.exists():
+            raise FileNotFoundError(f"{f} missing (re-run preprocess with --before-dir?)")
+        return _open_array(f)
 
     def window(self, name: str, r0: int, c0: int, h: int, w: int) -> np.ndarray:
         """Read [r0:r0+h, c0:c0+w], NaN outside the scene."""
@@ -104,9 +117,32 @@ def load_scenes(cfg: DataConfig, split: str | None) -> list[Scene]:
             raise ValueError("split_file is required to select a split")
         names_split = set(json.loads(Path(cfg.split_file).read_text())[split])
         names = [n for n in names if n in names_split]
-    if not names:
+    scenes = [Scene(root / n) for n in names]
+    if not cfg.include_suspect:
+        bad = [s.path.name for s in scenes if s.meta.get("quality", {}).get("suspect")]
+        if bad:
+            print(f"[info] skipping {len(bad)} scenes flagged suspect by preprocess: {bad[:5]}"
+                  + ("..." if len(bad) > 5 else ""))
+            scenes = [s for s in scenes if s.path.name not in set(bad)]
+    if not scenes:
         raise FileNotFoundError(f"no scenes for split {split!r} under {root}")
-    return [Scene(root / n) for n in names]
+    return scenes
+
+
+def _starts(n: int, t: int, stride: int) -> list:
+    if n <= t:
+        return [0]
+    s = list(range(0, n - t + 1, stride))
+    if s[-1] != n - t:
+        s.append(n - t)
+    return s
+
+
+def _own(starts: list, i: int, t: int, stride: int) -> tuple:
+    """Part of tile i (in tile coordinates) not already covered by tile i-1,
+    so pooled metrics count every pixel once."""
+    lo = 0 if i == 0 else max(0, starts[i - 1] + min(stride, t) - starts[i])
+    return lo, t
 
 
 class TileDataset(Dataset):
@@ -114,23 +150,35 @@ class TileDataset(Dataset):
     mode="eval": every tile of a regular grid (stride `val_stride`), no augmentation."""
 
     def __init__(self, cfg: DataConfig, split: str | None, mode: str = "train",
-                 scenes: list[Scene] | None = None):
+                 scenes: list[Scene] | None = None, max_tiles: int | None = None):
+        if cfg.m_alpha_mode == "top_class" and cfg.gate_channel not in ("dsm_max", "dsm_min", "dsm_last"):
+            raise ValueError("m_alpha_mode='top_class' only makes sense with a DSM gate channel; "
+                             f"got gate_channel={cfg.gate_channel!r}")
         self.cfg = cfg
         self.mode = mode
         self.epoch = 0
         self.scenes = scenes if scenes is not None else load_scenes(cfg, split)
-        self.needed = sorted(set(cfg.cond_channels) | set(cfg.norm_channels) | {cfg.gate_channel, "gt_dtm", "gt_valid"}
+        self.needed = sorted(set(cfg.cond_channels) | set(cfg.norm_channels)
+                             | {cfg.gate_channel, "gt_dtm", "gt_valid", "dsm_max"}
                              | ({cfg.prior_channel} if cfg.prior_channel else set())
                              | ({"top_ground"} if cfg.m_alpha_mode == "top_class" else set()))
         if mode == "eval":
             t, stride = cfg.tile, cfg.val_stride or cfg.tile
             self.index = []
             for si, sc in enumerate(self.scenes):
-                rows = range(0, max(sc.height - t, 0) + 1, stride) if sc.height > t else [0]
-                cols = range(0, max(sc.width - t, 0) + 1, stride) if sc.width > t else [0]
-                rows = sorted(set(rows) | {max(sc.height - t, 0)})
-                cols = sorted(set(cols) | {max(sc.width - t, 0)})
-                self.index += [(si, r, c) for r in rows for c in cols]
+                rows = _starts(sc.height, t, stride)
+                cols = _starts(sc.width, t, stride)
+                gv = sc.array("gt_valid")
+                for i, r in enumerate(rows):
+                    for j, c in enumerate(cols):
+                        if not np.any(gv[r:r + t, c:c + t] > 0.5):
+                            continue                          # nothing to evaluate
+                        own = (_own(rows, i, t, stride), _own(cols, j, t, stride))
+                        self.index.append((si, r, c, own))
+            if max_tiles and len(self.index) > max_tiles:
+                # spread the subset over all scenes rather than taking the first ones
+                pick = np.unique(np.linspace(0, len(self.index) - 1, max_tiles).round().astype(int))
+                self.index = [self.index[k] for k in pick]
         else:
             areas = np.array([s.height * s.width for s in self.scenes], np.float64)
             self.scene_p = areas / areas.sum()
@@ -199,9 +247,12 @@ class TileDataset(Dataset):
 
     def __getitem__(self, i):
         if self.mode == "eval":
-            si, r0, c0 = self.index[i]
+            si, r0, c0, ((or0, _), (oc0, _)) = self.index[i]
             arrs = self._exact(self.scenes[si], r0, c0, 0)
             item = self._finish(arrs)
+            own = torch.zeros_like(item["valid"])
+            own[:, or0:, oc0:] = 1.0
+            item["own"] = own
             item["scene_index"] = torch.tensor(si)
             item["origin"] = torch.tensor([r0, c0])
             return item
@@ -233,7 +284,7 @@ class TileDataset(Dataset):
             lo, scale = mean - std, 2.0 * std
         else:
             ref = np.stack([arrs[n] for n in cfg.norm_channels])
-            lo, scale = tile_range(ref, np.isfinite(ref).all(0), cfg.min_range)
+            lo, scale = tile_range(ref, None, cfg.min_range, cfg.norm_quantile)
 
         def prep(name, fill=False):
             a = arrs[name].astype(np.float64)
@@ -242,15 +293,22 @@ class TileDataset(Dataset):
             x = channel_transform(name, a, lo, scale)
             return np.where(np.isfinite(x), x, 0.0).astype(np.float32)
 
-        cond = np.stack([prep(n, cfg.fill_empty == "nearest") for n in cfg.cond_channels])
+        fill = cfg.fill_empty == "nearest"
+        cond = np.stack([prep(n, fill) for n in cfg.cond_channels])
         target = np.where(gt_ok, prep("gt_dtm"), 0.0).astype(np.float32)
-        prior = prep(cfg.prior_channel) if cfg.prior_channel else np.zeros_like(target)
+        prior = prep(cfg.prior_channel, fill) if cfg.prior_channel else np.zeros_like(target)
+        prior_valid = (np.isfinite(arrs[cfg.prior_channel]) if cfg.prior_channel
+                       else np.zeros(target.shape, bool))
         return {
             "cond": torch.from_numpy(cond),
             "target": torch.from_numpy(target[None]),
             "m_alpha": torch.from_numpy(m_alpha[None].astype(np.float32)),
             "valid": torch.from_numpy(valid[None].astype(np.float32)),
             "prior": torch.from_numpy(prior[None]),
+            "prior_valid": torch.from_numpy(prior_valid[None].astype(np.float32)),
+            # highest-return DSM in network units, NaN where empty (metrics only)
+            "surface": torch.from_numpy(channel_transform("dsm_max", arrs["dsm_max"].astype(np.float64), lo, scale
+                                                          ).astype(np.float32)[None]),
             "lo": torch.tensor(lo, dtype=torch.float32),
             "scale": torch.tensor(scale, dtype=torch.float32),
         }

@@ -70,33 +70,46 @@ def load_model(path: str | Path, device: str | torch.device = "cpu", use_ema: bo
 def init_from_checkpoint(model: nn.Module, cfg: Config, path: str | Path) -> list[str]:
     """Fine-tune start: copy matching weights from another checkpoint.
 
-    If the new model has extra conditioning channels (e.g. dtm_before and
-    sem_* added to a DSM-only model), the first convolution's weights for
-    channels the old model had are copied by channel name and the new ones
-    are zero, so the fine-tuned model starts out computing exactly what the
-    old one did."""
+    The first convolution's input weights are always mapped by channel name
+    (g_t plus the conditioning channels), so reordered, added or dropped
+    channels line up; channels the old model lacked start at zero. The new
+    model reproduces the old one exactly only if the gate channel,
+    normalisation and no-data filling are also unchanged; the returned notes
+    say when they are not (e.g. paper_dsm2dtm -> before_after changes the
+    gate from dsm_max to dtm_before, so it starts from the old features, not
+    the old output)."""
     ck = torch.load(path, map_location="cpu", weights_only=False)
     old_cfg = config_from_dict(ck["config"])
     src = ck.get("ema") or ck["model"]
     dst = model.state_dict()
+    old_names = ["g_t"] + list(old_cfg.data.cond_channels)
+    new_names = ["g_t"] + list(cfg.data.cond_channels)
     notes = []
     for k, v in dst.items():
         if k not in src:
             notes.append(f"new: {k}")
             continue
         w = src[k]
-        if w.shape == v.shape:
-            dst[k] = w
-        elif k.endswith("input_blocks.0.0.weight") and w.shape[0] == v.shape[0]:
-            old_names = ["g_t"] + list(old_cfg.data.cond_channels)
-            new_names = ["g_t"] + list(cfg.data.cond_channels)
+        stem = k.endswith("input_blocks.0.0.weight") and cfg.model.kind == "groundiff"
+        if stem and w.shape[0] == v.shape[0] and (old_names != new_names or w.shape != v.shape):
             nw = torch.zeros_like(v)
             for j, name in enumerate(new_names):
                 if name in old_names:
                     nw[:, j] = w[:, old_names.index(name)]
             dst[k] = nw
-            notes.append(f"stem widened {tuple(w.shape)} -> {tuple(v.shape)}; new channels zero-initialised")
+            added = [n for n in new_names if n not in old_names]
+            dropped = [n for n in old_names if n not in new_names]
+            notes.append(f"stem mapped by channel name {tuple(w.shape)} -> {tuple(v.shape)}"
+                         + (f"; zero-initialised: {added}" if added else "")
+                         + (f"; dropped: {dropped}" if dropped else ""))
+        elif w.shape == v.shape:
+            dst[k] = w
         else:
             notes.append(f"shape mismatch, left at init: {k} {tuple(w.shape)} vs {tuple(v.shape)}")
+    od, nd = old_cfg.data, cfg.data
+    for attr in ("gate_channel", "norm_channels", "norm_mode", "fill_empty", "prior_channel"):
+        if getattr(od, attr) != getattr(nd, attr):
+            notes.append(f"{attr} changed ({getattr(od, attr)!r} -> {getattr(nd, attr)!r}): "
+                         "the fine-tune starts from the old features, not the old output")
     model.load_state_dict(dst)
     return notes

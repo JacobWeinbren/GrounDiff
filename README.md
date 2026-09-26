@@ -1,8 +1,9 @@
 # GrounDiff for EA LiDAR DTM production
 
 Learns what editors change after `lasground_new`, and turns that into a
-predicted DTM, a per-pixel **edit probability** and ready-to-view overlays for
-LP360 and QGIS.
+per-pixel **edit probability**, the **predicted change** to the
+`lasground_new` DTM, a ranked list of blocks to edit, and ready-to-view
+overlays for LP360 and QGIS.
 
 * **GrounDiff** — Dhaouadi, Meier, Kaiser & Cremers, *GrounDiff: Diffusion-Based
   Ground Surface Generation from Digital Surface Models*, WACV 2026
@@ -18,8 +19,8 @@ LP360 and QGIS.
   rasters (lowest return, density / height-spread / echo rasters, and the
   2-channel ground/non-ground raster, here built from `lasground_new` classes).
 
-Everything runs on CUDA, Apple Silicon (MPS) or CPU; inference also runs
-without PyTorch through ONNX Runtime (QGIS plugin).
+Training runs on Apple Silicon (MPS), CUDA or CPU; inference also runs without
+PyTorch through ONNX Runtime (QGIS plugin, Windows GPU via CUDA or DirectML).
 
 ![edit-probability overlay on a light-green DTM](docs/overlay_example.png)
 
@@ -30,14 +31,27 @@ rises.*
 
 ---
 
-## How the before → after model works
+## What is learned from what
 
-Inputs per cell: highest / lowest / lowest-last return, point density, height
-spread, echoes, the `lasground_new` DTM (TIN of its ground points) and its
-ground / non-ground raster. Target: the EA hand-edited DTM (TIN of the final
-ground + water classes of the same points).
+**Production chain.** Tiles are classified by `lasground_new` with default
+settings (every point becomes 1 = non-ground or 2 = ground), then edited by
+hand in LP360 using only unclassified, ground, bridge and low noise. The EA
+DTM is built from the edited ground class.
 
-GrounDiff's gate (Eq. 5) is anchored on the **`lasground_new` DTM**:
+**Inputs** (per 1 m cell), all from the `lasground_new` output, so training
+and production see the same thing: highest / lowest / lowest-last return,
+point density, height spread, echoes, the `lasground_new` DTM (TIN of its
+ground points) and its ground / non-ground raster. No point is dropped by
+class.
+
+**Target: the EA's published DTM raster.** The classes in the EA's published
+LAZ/COPC files come from a different, automated process (they contain 1–7
+including vegetation height bands and buildings) and do not match the DTM
+rasters, so they are never used. `groundiff.data.ea_dtm` downloads the DTM
+for each training tile; alternatively, your own LP360-edited tiles can be the
+target (`--after-dir`: TIN of class 2).
+
+**Model.** GrounDiff's gate (Eq. 5) is anchored on the `lasground_new` DTM:
 
     DTM = σ(ℓ) · DTM_lasground + (1 − σ(ℓ)) · (DTM_lasground − r̂)
 
@@ -45,215 +59,274 @@ so the model keeps the automated surface where it is right and corrects it
 where editors would. Its confidence head (Eq. 14, M_α = |DTM_lasground − DTM_EA| < α)
 therefore learns "no edit needed": **p_edit = 1 − σ(ℓ)** is the per-pixel
 probability that an editor changes the ground there, trained with the paper's
-own loss. `dz_before = DTM_pred − DTM_lasground` is the size of the predicted
-correction.
+own loss. `dz_before = DTM_pred − DTM_lasground` is the size and sign of the
+predicted correction (negative: `lasground_new` kept something as ground that
+editors remove; positive: it cut off real ground, e.g. an embankment crest).
 
-## Install
+**Quality gate.** A tile whose DTM raster disagrees with `lasground_new` on
+the cells `lasground_new` calls ground (a different survey, misregistration)
+is flagged *suspect* by `preprocess` and left out of training and evaluation.
 
-```bash
-# Mac (Apple Silicon) or Linux/Windows with CUDA
-python -m venv .venv && source .venv/bin/activate
-pip install torch                      # CUDA: pick the wheel for your CUDA version at pytorch.org
-pip install -e ".[onnx,dev]"
-pytest                                 # ~70 tests, ~1 min on CPU
-```
+---
 
-## Mac quickstart (M3 Max)
+## Mac quickstart (MacBook Pro M3 Max, 36 GB)
 
 ```bash
-# one-off setup
+# 0. one-off setup (Python 3.10-3.12)
 git clone -b claude/rewrite-before-after https://github.com/JacobWeinbren/GrounDiff.git && cd GrounDiff
-python3.11 -m venv .venv && source .venv/bin/activate          # any Python 3.10-3.12
+python3.11 -m venv .venv && source .venv/bin/activate
 pip install --upgrade pip && pip install torch && pip install -e ".[onnx,dev]"
 python -c "import torch; print('MPS available:', torch.backends.mps.is_available())"
-pytest -q                                                       # ~1 min, all should pass
+pytest -q                                   # ~2 min, all should pass
 
-# 1. download EA tiles (~300 tiles = a few GB; --dry-run first shows the size)
-python -m groundiff.data.download --out data/laz/after --target 300 --min-per-grid 8 --dry-run
-python -m groundiff.data.download --out data/laz/after --target 300 --min-per-grid 8
+# 1. EA 2022 point clouds (open data; --dry-run shows count and size first)
+python -m groundiff.data.download --out data/laz/ea --target 300 --min-per-grid 8 --dry-run
+python -m groundiff.data.download --out data/laz/ea --target 300 --min-per-grid 8
 
-# 2. "before" tiles: lasground_new with default settings, on the machine with licensed LAStools
-python -m groundiff.data.lasground --in data/laz/after --out data/laz/before --cores 8 --verbose   # writes run_lasground_new.sh (.bat with --windows)
-#    run it there, copy data/laz/before back, then check the pairs:
-python -m groundiff.data.lasground check --before data/laz/before --after data/laz/after
+# 2. the EA DTM rasters for those tiles (the target; ~50-150 MB per 5 km tile)
+python -m groundiff.data.ea_dtm --tiles data/laz/ea --out data/ea_dtm --dry-run
+python -m groundiff.data.ea_dtm --tiles data/laz/ea --out data/ea_dtm
 
-# 3. rasterise (≈ 56 MB per 500 m tile at 0.5 m) and split
-python -m groundiff.data.preprocess --after-dir data/laz/after --before-dir data/laz/before \
-    --out data/scenes_05m --gsd 0.5 --workers 8
-python -m groundiff.data.split --root data/scenes_05m --out data/split.json
+# 3. "before" tiles: lasground_new, default settings, on the PC with licensed LAStools
+python -m groundiff.data.lasground --in data/laz/ea --out data/laz/before --cores 8 --verbose --windows
+#    copy data/laz/ea and run_lasground_new.bat to the PC, run the .bat,
+#    copy data/laz/before back (paths inside the .bat can be edited), then:
+python -m groundiff.data.lasground check --before data/laz/before --after data/laz/ea
 
-# 4. five-minute smoke test on the GPU
+# 4. rasterise at 1 m (the EA DTM grid) and split by 10 km blocks
+python -m groundiff.data.preprocess --before-dir data/laz/before --dtm-dir data/ea_dtm \
+    --out data/scenes_1m --gsd 1.0 --workers 4
+python -m groundiff.data.split --root data/scenes_1m --out data/split.json
+
+# 5. five-minute smoke test
 python -m groundiff.train configs/before_after.json --set train.out_dir=runs/smoke \
-    optim.total_steps=50 train.val_every=50 train.val_max_tiles=16 train.batch_size=2
+    optim.total_steps=50 train.val_every=50 train.val_max_tiles=16
 
-# 5. full run in the background; caffeinate stops the Mac sleeping (keep it on power)
+# 6. full run in the background; caffeinate keeps the Mac awake (keep it on power)
 mkdir -p runs
 caffeinate -dimsu nohup python -m groundiff.train configs/before_after.json \
-    --set train.batch_size=4 train.grad_accum=4 train.num_workers=6 train.val_max_tiles=128 \
-    > runs/before_after.out 2>&1 &
+    --set train.num_workers=6 > runs/before_after.out 2>&1 &
 
-# 6. watch it
-python -m groundiff.monitor runs/before_after --follow     # progress, time left, losses, memory, validation
-tail -f runs/before_after.out                              # raw log
-# stop:  pkill -f groundiff.train      resume: run step 5 again (continues from last.pt)
+# 7. watch it
+python -m groundiff.monitor runs/before_after --follow   # step, time left, loss curve, memory, validation
+tail -f runs/before_after.out                            # raw log
+# stop: pkill -f groundiff.train      resume: run step 6 again (continues from last.pt)
 
-# 7. evaluate on the held-out tiles, then export for QGIS / the PC
-python -m groundiff.infer --checkpoint runs/before_after/best.pt --scenes data/scenes_05m \
+# 8. evaluate on the held-out tiles, export for the PC / QGIS
+python -m groundiff.infer --checkpoint runs/before_after/best.pt --scenes data/scenes_1m \
     --split-file data/split.json --split test --out results/test
-python -m groundiff.export runs/before_after/best.pt --out models/before_after
-python tools/build_qgis_plugin.py                          # -> dist/groundiff_qgis.zip
+python -m groundiff.export runs/before_after/best.pt --out models/before_after   # .onnx + .json
+python tools/build_qgis_plugin.py                                                # dist/groundiff_qgis.zip
 ```
 
-If MPS runs out of memory, use `train.batch_size=2 train.grad_accum=8`, or add
-`model.use_checkpoint=true`.
+`environment.data.gov.uk` (step 2) must be reachable; it is from a normal
+connection. Step 4 needs roughly 1-3 GB RAM per worker for 500 m tiles and
+more for the 2 km tiles the archive also contains; lower `--workers` if the
+Mac starts swapping. Tiles flagged *suspect* are listed at the end of step 4.
 
-## Workflow
+Configs default to batch 4 × 4 accumulation (≈ batch 16, as in the paper).
+If MPS runs out of memory: `--set train.batch_size=2 train.grad_accum=8`, or
+add `model.use_checkpoint=true` (≈ 25 % slower, far less activation memory).
 
-### 1. Get tiles
+---
+
+## Workflow details
+
+### Point clouds
 
 ```bash
-# EA/DEFRA 2022 COPC tiles (500 m, classified) from the open-data bucket, balanced across England
-python -m groundiff.data.download --out data/laz/after --target 1000 --min-per-grid 20 --blocks 3
+python -m groundiff.data.download --out data/laz/ea --target 1000 --min-per-grid 20
+python -m groundiff.data.download --out data/laz/ea --squares TL4378 --blocks 3      # an area + neighbours
 ```
 
-`--blocks 3` also fetches each tile's 8 neighbours (context for buffers and
-spatial splits). These files carry **no CRS**; outputs default to EPSG:27700.
+The DEFRA `LIDAR_2022` folder of the public `open-lidar-data` bucket holds
+500 m quadrants (`TL4378nw_P_12534_...`) and 2 km tiles (`NX9410_P_12706_...`)
+from ~86 surveys; it appears to be the EA's time-stamped survey archive rather
+than the National LIDAR Programme. The files carry **no CRS** (they are BNG,
+EPSG:27700, heights ODN); outputs default to EPSG:27700. `--blocks N` adds the
+N × N neighbours of each sampled tile (every survey at each position).
 
-### 2. Recreate the automated classification ("before")
-
-Production uses `lasground_new` with **default settings**. This writes the exact
-command (paired by file name) for a machine with licensed LAStools:
+### Target DTMs
 
 ```bash
-python -m groundiff.data.lasground --in data/laz/after --out data/laz/before --cores 8 --verbose --windows
-# run run_lasground_new.bat, then:
-python -m groundiff.data.lasground check --before data/laz/before --after data/laz/after
+python -m groundiff.data.ea_dtm --tiles data/laz/ea --out data/ea_dtm
 ```
 
-Keep the `-v` log: the lasground_new README gives two different default steps
-(25 m in the text, 5.0 in the argument list), and the log shows what your
-binary used. Unlicensed LAStools distorts files above ~1.5M points.
+For each 5 km tile the point clouds touch, and the survey year in their file
+names, this asks the Defra survey service what exists and downloads, by
+default, `lidar_tiles_dtm` (the time-stamped DTM of the same surveys) at the
+finest resolution up to 1 m, else the National LIDAR Programme DTM of that
+year (`--product` forces one). It resumes where it stopped. Zips hold float32
+GeoTIFFs (nodata −3.4e38) on whole-metre cell edges, plus a GeoPackage
+recording which survey fed each area. The service's public key (`dspui`, from
+its web page) is undocumented and may change.
 
-### 3. Check files from different producers
+`preprocess --dtm-dir` accepts any folder of GeoTIFF / ASCII grid / VRT DTMs
+in any tiling, so rasters downloaded by hand from
+<https://environment.data.gov.uk/survey> work too.
+
+### The "before" classification
+
+Production runs `lasground_new` with **default settings**, which reclassifies
+every point to 1 or 2 regardless of the classes it had. `groundiff.data.lasground`
+writes the command (outputs keep the input file names, so tiles pair up), and
+`check` confirms equal point counts and 1/2-only classes. Keep the `-v` log:
+the `lasground_new` README gives two default steps (25 m in the text, 5.0 in
+the argument list) and the log shows which your binary used. Unlicensed
+LAStools distorts files above ~1.5M points.
+
+### Files from different producers
 
 ```bash
 python -m groundiff.data.lasinspect ea_tile.laz --compare lp360_tile.las
 ```
 
-Reports version, point format, WKT bit, CRS storage, extra bytes, flags
-(overlap / synthetic / withheld / key-point), classes and return statistics,
-with warnings for things that make PDAL / QGIS reject files. The reader
-tolerates all of them; `--drop-overlap` / `--drop-synthetic` are available
-everywhere.
+Reports version, point format, WKT bit, CRS storage (VLRs and EVLRs; parsed
+without pyproj too), extra bytes, flags (overlap / synthetic / withheld /
+key-point), classes and return statistics, with warnings for things that make
+PDAL / QGIS reject files. The reader tolerates all of them; `--drop-overlap` /
+`--drop-synthetic` exist everywhere.
 
-### 4. Rasterise and split
+### Rasterise and split
 
 ```bash
-python -m groundiff.data.preprocess --after-dir data/laz/after --before-dir data/laz/before \
-    --out data/scenes_05m --gsd 0.5 --workers 6
-python -m groundiff.data.split --root data/scenes_05m --out data/split.json --block-km 10
+python -m groundiff.data.preprocess --before-dir data/laz/before --dtm-dir data/ea_dtm \
+    --out data/scenes_1m --gsd 1.0 --workers 4
+# or, with your own hand-edited tiles as the target (same file names, ground = class 2):
+python -m groundiff.data.preprocess --before-dir data/laz/before --after-dir data/laz/edited \
+    --out data/scenes_1m --gsd 1.0
+python -m groundiff.data.split --root data/scenes_1m --out data/split.json --block-km 10
 ```
 
-Noise classes 7 and 18 are removed. Splits are by 10 km blocks so neighbouring
-tiles never straddle train and test.
+`preprocess` refuses "before" files with classes other than 1/2 (plus 7/18) —
+usually a sign that the published EA file was given instead of the
+`lasground_new` output. The TIN of `lasground_new` ground and the target are
+cut to the LiDAR coverage (returns plus voids narrower than 60 m and enclosed
+voids such as lakes). Re-running only redoes tiles whose inputs or settings
+changed. `--geotiff` also writes every channel as GeoTIFF (for the raster tool
+in QGIS). Splits assign whole 10 km blocks, balancing the three sets by size.
 
-### 5. Train
+### Train
 
 | Config | What |
 |---|---|
 | `configs/before_after.json` | GrounDiff, before → after (recommended) |
 | `configs/paper_dsm2dtm.json` | GrounDiff as published (DSM → DTM) |
-| `configs/resdepth_before_after.json` | ResDepth baseline |
+| `configs/resdepth_before_after.json` | ResDepth baseline, as published (fp32) |
 
 ```bash
-# MacBook Pro M3 Max, 36 GB: effective batch 16 as in the paper
-python -m groundiff.train configs/before_after.json --set train.batch_size=4 train.grad_accum=4 train.num_workers=6
-# 16 GB CUDA GPU: bf16 is automatic
-python -m groundiff.train configs/before_after.json --set train.batch_size=8 train.grad_accum=2
-# tight memory: add model.use_checkpoint=true (≈25 % slower, several-fold less activation memory)
-# fine-tune an existing checkpoint (new input channels start at zero, so it starts exactly where it was)
+# M3 Max, 36 GB (fp32; batch 4 x 4 is the default)
+python -m groundiff.train configs/before_after.json --set train.num_workers=6
+# 16 GB CUDA GPU (bf16 automatic on RTX 30xx and newer)
+python -m groundiff.train configs/before_after.json --set train.num_workers=8
+#   batch 8 needs model.use_checkpoint=true on 16 GB
+# fine-tune from another checkpoint (input channels are matched by name; new ones start at zero)
 python -m groundiff.train configs/before_after.json --init-from runs/paper_dsm2dtm/best.pt
 ```
 
-Runs resume from `last.pt`. Validation reports the paper's metrics for both the
-model and `lasground_new` against the EA DTM. Because the U-Net uses GroupNorm,
-batch 4 × 4 accumulation gives the same gradient as batch 16.
+Runs resume from `last.pt` (weights, EMA, optimiser, schedule, grad scaler,
+random state, data position). Validation uses tiles spread over all validation
+scenes, counts each pixel once, and reports for the model and for
+`lasground_new` against the EA DTM: RMSE, MAE, bias, MedAE, NMAD, ground /
+non-ground RMSE, Type I/II/total (against the highest-return DSM), and edit
+detection precision / recall / F1 (|DTM − DTM_lasground| > α). The monitor's
+time estimate excludes validation.
 
-Rough cost (estimates, not measurements): ≈1 TFLOP per 256² tile per training
-step, so the paper's 10–20k iterations at batch 16 is roughly half a day to a
-day on an M3 Max (30-core GPU) and a few hours on a recent 16 GB NVIDIA card.
-Memory at 256² tiles: batch 4 fp32 ≈ 10–13 GB, batch 8 bf16 ≈ 10 GB, batch 16
-fp32 ≈ 35–46 GB. Inference needs ≈0.5 GB.
+Cost (estimates): ≈ 1 TFLOP per 256² tile per training step, so the paper's
+10–20k iterations at batch 16 is roughly half a day to a day on an M3 Max and a
+few hours on a recent 16 GB NVIDIA card. Memory at 256² tiles: batch 4 fp32
+≈ 10–13 GB; batch 8 bf16 ≈ 15.5–17 GB (too much for 16 GB without
+checkpointing); batch 16 fp32 ≈ 35–46 GB. Accumulation 4 × 4 is close to, not
+exactly, batch 16 (loss means are per micro-batch). Inference needs ≈ 0.5 GB.
 
-### 6. Evaluate on held-out scenes
+### Evaluate on held-out scenes
 
 ```bash
-python -m groundiff.infer --checkpoint runs/before_after/best.pt --scenes data/scenes_05m \
+python -m groundiff.infer --checkpoint runs/before_after/best.pt --scenes data/scenes_1m \
     --split-file data/split.json --split test --out results/test --samples 4
 ```
 
-Per scene: GeoTIFFs, overlays, `metrics.json` (model and `lasground_new` vs the
-EA DTM: RMSE, MAE, Type I/II/total, MedAE, NMAD, roughness) and `priority.csv`
-(100 m blocks ranked by predicted edit). With a reference, `capture_topK`
-reports how much of the true edit volume the top 5/10/20 % of blocks contain;
-this ranking measure is ours, neither paper defines one.
+Per scene: GeoTIFFs, overlays, `metrics.json` (as above, plus roughness) and
+`priority.csv` (100 m blocks with coordinates, ranked by predicted edit
+volume). With a reference, `capture_topK` reports how much of the true edit
+volume the top 5/10/20 % of blocks contain; this ranking measure is ours,
+neither paper defines one.
 
-### 7. Export and run anywhere
+### Run on new tiles (command line, no QGIS)
 
 ```bash
-python -m groundiff.export runs/before_after/best.pt --out models/before_after   # .onnx + .json, checked vs PyTorch
-python -m groundiff.batch --onnx models/before_after.onnx \
-    --after tiles/*.laz --before tiles_lasground/*.laz --out results/area1 --workers 3
+python -m groundiff.export runs/before_after/best.pt --out models/before_after   # checked vs PyTorch
+python -m groundiff.batch --onnx models/before_after.onnx --tiles "lasground/*.laz" --out results/area1 --workers 3
 ```
 
-`batch` takes any number of tiles, reads each with a 64 m buffer of neighbour
-points (so there are no seams), prepares tiles in parallel while the network
-runs, and writes mosaics: `dtm.tif`, `p_edit.tif`, `dz_before.tif`
-(`std.tif` with `--samples > 1` or `--tta`), their overlays, and per-tile pieces
-in `tiles/`. Tested on real EA tiles: the mosaic matches a single
-rasterisation of the merged points to 5e-7 m.
+Inputs are tiles as `lasground_new` wrote them (quote wildcards; folders work
+too, and Windows is handled). Each tile is read with a buffer of neighbour
+points (one network tile + 32 m), network tiles lie on one lattice anchored to
+the National Grid, and each tile's sampling noise is seeded by its position,
+so neighbouring tiles agree exactly where they meet and re-running part of an
+area reproduces the same values. Tiles are prepared in parallel while the
+network runs; a bad file is reported in `batch_summary.json` and the rest
+carry on. Header extents are checked against point counts and tile names and
+replaced by the points' own extent when they cannot be right (stale LP360
+headers). Cell size and read options default to what the model was trained
+with.
+
+Outputs: `p_edit.tif`, `dz_before.tif`, `dtm.tif` (`std.tif` with
+`--samples > 1` or `--tta`), their LP360 overlays and QGIS styles, overviews,
+`.tfw`/`.prj`, and `priority.csv` / `priority.geojson` (+ `priority.shp` where
+GDAL's Python bindings exist, e.g. inside QGIS): blocks ranked by predicted
+edit volume, with coordinates, edit area and mean p_edit.
 
 ## Using the outputs in LP360
 
 For each map there are two pre-coloured GeoTIFFs:
 
 * `*_overlay.tif` — RGBA with an alpha channel: transparent where nothing
-  needs attention. Add it as a raster layer above the DTM.
+  needs attention. Add it as a raster layer above the DTM; try this first.
 * `*_overlay_rgb.tif` — RGB with no-data = 0, for viewers that ignore alpha;
   transparent pixels are no-data, set the layer's transparency in the viewer.
 
-Both have `.tfw` and `.prj` side-cars. The colour ramp (one hue, the complement
-of the light-green DTM shading) was checked numerically after blending over
-pale, mid and hill-shade greens, white and grey: lightness decreases
-monotonically, steps stay distinguishable, and even the palest visible step has
-≥ 2.3 : 1 contrast with the background. The float rasters (`p_edit.tif`, …)
-get a QGIS `.qml` style next to them, applied automatically when opened in QGIS.
+Both have `.tfw` and `.prj` side-cars and internal overviews. The colour ramp
+(one hue, the complement of the light-green DTM shading) was checked
+numerically after blending over pale, mid and hill-shade greens, white and
+grey: lightness decreases monotonically, steps stay distinguishable, and even
+the palest visible step has ≥ 2.3 : 1 contrast with the background.
+`priority.shp` / `.geojson` give the same information as a work list of
+squares.
 
 | Overlay | Shows | Transparent below |
 |---|---|---|
 | `p_edit` | probability that editors change the ground | 0.2 |
-| `dz_before` | size of the predicted correction | 0.15 m |
+| `dz_before` | size of the predicted correction (either sign) | 0.15 m |
 | `std` | spread across samples / flips | 0.1 m |
 
-## QGIS plugin
+## QGIS plugin (QGIS 3.22 – 4.x)
 
 ```bash
 python tools/build_qgis_plugin.py        # -> dist/groundiff_qgis.zip
 ```
 
-Install with *Plugins → Manage and Install Plugins → Install from ZIP*. Add
-the runtime to QGIS's Python (OSGeo4W Shell on Windows):
-`python -m pip install onnxruntime-directml laspy[lazrs]` (any Windows GPU),
-or `onnxruntime-gpu` (NVIDIA), or `onnxruntime` (CPU; on macOS CoreML is used
-automatically).
+Install with *Plugins → Manage and Install Plugins → Install from ZIP*, then
+add the runtime to QGIS's Python:
 
+* Windows (OSGeo4W Shell): `python -m pip install numpy scipy "laspy[lazrs]" onnxruntime-directml`
+  (any GPU), or replace `onnxruntime-directml` with `"onnxruntime-gpu[cuda,cudnn]"`
+  (NVIDIA, CUDA libraries included) or `onnxruntime` (CPU). Install only one
+  onnxruntime package.
+* macOS: `/Applications/QGIS.app/Contents/MacOS/bin/python3 -m pip install scipy "laspy[lazrs]" onnxruntime`
+* pyproj is optional.
+
+Copy `models/before_after.onnx` and `models/before_after.json` together.
 Processing Toolbox → GrounDiff:
 
-* **Predict DTM from point-cloud tiles**: select any number of LAS/LAZ files
-  (… → Add File(s)), optionally the `lasground_new` versions, an output folder,
-  and how many tiles to prepare in parallel. Adds the DTM and edit overlay to
-  the map when done.
-* **Predict DTM from rasters**: rasters already on one grid.
+* **Predict DTM and edit priorities from point-cloud tiles**: select any
+  number of `lasground_new` tiles (… → Add File(s) / Add Directory), an output
+  folder and how many tiles to prepare in parallel. Loads the edit probability
+  and predicted edit (styled), the DTM and the priority blocks when done. The
+  log says which device ONNX Runtime used and warns if a requested GPU was not
+  available.
+* **Predict DTM from rasters**: channel rasters already on one grid (e.g. from
+  `preprocess --geotiff`); outputs the model cannot produce are skipped.
 * **Inspect LAS/LAZ file**: the inspector above, optionally comparing two files.
 
 The plugin reads point clouds itself (laspy), so files that QGIS's own
@@ -265,46 +338,50 @@ point-cloud layers (PDAL) refuse can still be processed.
 |---|---|---|
 | Denoiser | Palette U-Net, 62.64M | U-Net "inspired by DDPM", 62.6M |
 | Gating, loss (Eq. 5, 11–14), λ | as published | |
-| T, schedule | T = 10, Palette cosine | "cosine … from 0.0001 to 0.02" (ambiguous; `cosine_range` implements the other reading) |
-| Sampler init | N(s, I) default; noise, DSM, prior as options | §3.2, Table 6 |
-| PrioStitch | global coarse prior, 50 % overlap, min/linear/mean blending | §3.3, Table 7 |
+| T, schedule | T = 10, Palette cosine; noise levels sampled as Palette does | "cosine … from 0.0001 to 0.02" (ambiguous; `cosine_range` implements the other reading) |
+| Sampler init | N(s, I) in DSM → DTM mode; before → after starts from the `lasground_new` DTM (Table 6 "DSM" init) | §3.2, Table 6 |
+| PrioStitch | global coarse prior (aspect kept), 50 % overlap, linear blending by default; min / mean available | §3.3, Table 7 (min = best RMSE, linear = best balance) |
 | Augmentation | rotations + ±5° jitter, zoom {256, 512, 1024} + crop, flips, p = 0.5 each | §7.1 |
-| Normalisation | per-tile min–max to [−1, 1] from inputs only, 2 m minimum range | min–max over DSM **and GT** (GT unknown at inference) |
+| Normalisation | per-tile min–max to [−1, 1] from inputs only, 2 m minimum range (before → after: 0.1 / 99.9 % quantiles) | min–max over DSM **and GT** (GT unknown at inference) |
 | Optimiser | AdamW 1e-4, wd 0.01, 500 warm-up, cosine, batch 16 | §7.3 |
-| α for M_α | 0.2 m (option: class of highest return) | not given |
+| α for M_α | 0.2 m (option: class of highest return, DSM → DTM only) | not given |
 | EMA | 0.999 with warm-up | not stated (Palette uses one) |
 | Before → after | gate on `lasground_new` DTM, extra inputs from ALS2DTM | extension |
 
 Known gap: with Palette's cosine schedule the last step is almost pure noise
 (√ᾱ_T = 0.005), so a prior injected at t = T barely reaches the network. The
 paper reports a large PrioStitch gain (Table 7), which suggests their setup
-kept more of it. Worth ablating: `diffusion.schedule=cosine_range`, or
+kept more of it. Worth ablating: `diffusion.schedule=cosine_range` (then also
+try `--init dsm_q`, which matches the forward process at t = T), or
 `--t-start 5` at inference. In before → after mode the `lasground_new` DTM is
-also an input channel, so the model sees it at every step regardless.
+an input channel, so the model sees it at every step regardless.
 
 ## Suggested ablations
 
-* schedule `cosine` vs `cosine_range`; `--t-start` for the prior
-* `data.m_alpha_mode=top_class` (avoids labelling steep ground as non-ground)
+* schedule `cosine` vs `cosine_range` (with `--init dsm_q`); `--t-start`
 * `loss.units=metres` (stops flat tiles dominating)
 * gate on `dsm_min` in DSM → DTM mode (on a real EA tile, 94 % of cells have
-  the lowest return within 0.2 m of the final DTM vs 81 % for the highest)
+  the lowest return within 0.2 m of the ground surface vs 81 % for the highest)
 * ResDepth vs GrounDiff on the same split
 
 ## Not done yet
 
-* Breaklines: the pipeline has no breakline output yet. Raster breakline
-  targets need a sample of how they are stored in production.
+* Breaklines: no breakline output yet. Raster breakline targets need a sample
+  of how they are stored in production.
 * Point reclassification from the predicted DTM (a height-above-DTM rule, or
-  a dense classification head as the GrounDiff author suggested) is not
-  included.
+  a dense classification head as the GrounDiff author suggested).
+* Checkpoints from the earlier version of this repository are not compatible.
 
 ## Tests
 
-`pytest` covers: the U-Net matching Palette, schedules and posterior maths,
-every sampler init, loss and metric definitions, rasterisation, TIN, dataset
-and augmentation consistency, spatial splits, training / resume / fine-tune
-widening, numpy vs PyTorch sampler equivalence, ONNX export, scene inference
-in every mode, seamless batch mosaics, overlays, LAS variants (LAS 1.2/1.4,
-missing WKT bit, extra bytes, broken return numbers, flags) and the QGIS
-plugin's logic.
+`pytest` covers: the U-Net matching Palette, checkpointed dropout gradients,
+schedules and posterior maths, every sampler init, loss and metric
+definitions, rasterisation, TIN, DTM-raster targets (exact copy and
+resampling), the quality gate, rejection of published-class files, dataset and
+augmentation consistency, spatial splits, training / resume / fine-tune,
+numpy vs PyTorch sampler equivalence, ONNX export, scene inference, seamless
+batch mosaics (also with a noise-dependent network and different job splits),
+stale headers, cancelling, overlays, LAS variants (LAS 1.2/1.4, missing WKT
+bit, extra bytes, broken return numbers, flags, CRS without pyproj), the DTM
+downloader (offline), and the QGIS algorithms run against a stand-in
+`qgis.core` in QGIS 3 and 4 styles.

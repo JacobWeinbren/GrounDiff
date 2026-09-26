@@ -1,7 +1,7 @@
 {
- "notes": "GrounDiff conditioned on the lasground_new result, predicting the EA hand-edited DTM. The gate surface s is the lasground_new DTM, so Eq. 5 keeps it where no edit is needed and the confidence head (Eq. 14, M_alpha = |dtm_before - gt| < alpha) learns 'no edit needed': 1 - sigmoid(l) is the per-pixel edit probability. Extra inputs follow ALS2DTM/DeepTerRa (Le et al. 2022): lowest-return rasters, statistic rasters (density, z_std, echoes) and the 2-channel ground/non-ground raster (their 'sem2'), here from lasground_new classes. Empty cells are nearest-filled and the loss covers them (the EA DTM is complete).",
+ "notes": "GrounDiff conditioned on the lasground_new result, predicting the EA hand-edited DTM. The gate surface s is the lasground_new DTM, so Eq. 5 keeps it where no edit is needed and the confidence head (Eq. 14, M_alpha = |dtm_before - gt| < alpha) learns 'no edit needed': 1 - sigmoid(l) is the per-pixel edit probability. Extra inputs follow ALS2DTM/DeepTerRa (Le et al. 2022): lowest-return rasters, statistic rasters (density, z_std, echoes) and the 2-channel ground/non-ground raster (their 'sem2'), here from lasground_new classes. Empty cells are nearest-filled and the loss covers them (the EA DTM is complete). Tile normalisation uses the 0.1/99.9 % height quantiles (norm_quantile) so a stray noise return cannot stretch a tile; validation starts the sampler from the lasground_new DTM, as inference does.",
  "data": {
-  "root": "data/scenes_05m",
+  "root": "data/scenes_1m",
   "split_file": "data/split.json",
   "cond_channels": [
    "dsm_max",
@@ -24,7 +24,8 @@
   "tile": 256,
   "alpha": 0.2,
   "loss_mask": "gt",
-  "fill_empty": "nearest"
+  "fill_empty": "nearest",
+  "norm_quantile": 0.001
  },
  "model": {
   "kind": "groundiff"
@@ -48,8 +49,8 @@
  },
  "train": {
   "out_dir": "runs/before_after",
-  "batch_size": 16,
-  "grad_accum": 1,
-  "val_init": "dsm_noise"
+  "batch_size": 4,
+  "grad_accum": 4,
+  "val_init": "prior"
  }
 }

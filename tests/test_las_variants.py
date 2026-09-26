@@ -75,8 +75,9 @@ def test_flags_and_overlap(tmp_path):
         wh = np.zeros(200, bool); wh[20:22] = True
         las.overlap, las.synthetic, las.withheld = ov, syn, wh
     p = _write(tmp_path / "flags.las", "1.4", 6, wkt_bit=True, setup=setup)
-    assert len(read_points(p)) == 200 - 5 - 2                       # noise + withheld dropped by default
-    assert len(read_points(p, drop_overlap=True, drop_synthetic=True)) == 200 - 5 - 2 - 10 - 5
+    assert len(read_points(p)) == 200 - 2                           # withheld dropped; classes kept by default
+    assert len(read_points(p, drop_classes=(7, 18))) == 200 - 5 - 2
+    assert len(read_points(p, drop_overlap=True, drop_synthetic=True)) == 200 - 2 - 10 - 5
     rep = inspect(p)
     assert rep["flags"]["overlap"] == 10 and rep["flags"]["synthetic"] == 5
     assert any("overlap" in w for w in rep["warnings"]) and any("synthetic" in w for w in rep["warnings"])
@@ -111,3 +112,36 @@ def test_compare_reports_differences(tmp_path):
     b = inspect(_write(tmp_path / "b.las", "1.4", 7, extra=True, wkt_bit=False))
     d = compare(a, b)
     assert "version" in d and "point_format" in d and "extra_dimensions" in d
+
+
+def test_crs_without_pyproj(tmp_path):
+    """QGIS's Python often lacks pyproj: the WKT VLR text or the GeoTIFF EPSG
+    key must still give a CRS."""
+    import laspy
+    from laspy.vlrs.known import GeoKeyDirectoryVlr, GeoKeyEntryStruct, WktCoordinateSystemVlr
+
+    from groundiff.data.laz import read_points, read_points_bbox
+    from groundiff.io_raster import crs_wkt_from_epsg, epsg_of
+
+    wkt = crs_wkt_from_epsg(27700)
+    for kind in ("wkt", "geokeys"):
+        hdr = laspy.LasHeader(point_format=6 if kind == "wkt" else 1, version="1.4" if kind == "wkt" else "1.2")
+        hdr.offsets, hdr.scales = [400000, 200000, 0], [0.01, 0.01, 0.01]
+        if kind == "wkt":
+            v = WktCoordinateSystemVlr(wkt)
+        else:
+            v = GeoKeyDirectoryVlr()
+            v.geo_keys_header.number_of_keys = 1
+            e = GeoKeyEntryStruct()
+            e.id, e.tiff_tag_location, e.count, e.value_offset = 3072, 0, 1, 27700
+            v.geo_keys = [e]
+        hdr.vlrs.append(v)
+        las = laspy.LasData(hdr)
+        las.x = np.array([400001.0, 400002.0])
+        las.y = np.array([200001.0, 200002.0])
+        las.z = np.array([1.0, 2.0])
+        p = tmp_path / f"{kind}.las"
+        las.write(str(p))
+        got = read_points(p).crs_wkt
+        assert got and epsg_of(got) == 27700, kind
+        assert epsg_of(read_points_bbox(p, (400000, 200000, 400010, 200010)).crs_wkt) == 27700

@@ -3,7 +3,7 @@ import json
 import numpy as np
 import pytest
 
-from groundiff.batch import plan, run_batch
+from groundiff.batch import Cancelled, plan, run_batch
 from groundiff.data.laz import concat, read_points
 from groundiff.data.rasterise import Grid, tin_dtm
 from groundiff.runtime import RuntimeSpec
@@ -12,11 +12,12 @@ from tests.synthetic import make_points, write_las
 
 @pytest.fixture(scope="module")
 def tiles(tmp_path_factory):
-    """One 160 m synthetic scene cut into 2x2 adjacent 80 m tiles (after + before)."""
+    """One 160 m synthetic scene cut into 2x2 adjacent 80 m tiles, classified
+    like lasground_new output (1/2 only, with a planted roof error), plus the
+    same tiles with EA-style final classes (2, 5, 6, 7, 18)."""
     root = tmp_path_factory.mktemp("batch")
     x, y, z, cls, rn, nr = make_points(size=160.0, seed=5)
     before = np.where(cls == 2, 2, 1).astype(np.uint8)
-    before[np.isin(cls, (7, 18))] = cls[np.isin(cls, (7, 18))]
     before[cls == 6] = 2                                  # planted lasground_new roof error
     x0, y0 = 400000.0, 200000.0
     after_files, before_files = [], []
@@ -40,7 +41,8 @@ def spec_before_after(tile=32):
                        gate_channel="dtm_before", norm_channels=["dsm_max", "dsm_min", "dtm_before"],
                        prior_channel="dtm_before", norm_mode="minmax", norm_std=None, min_range=2.0, tile=tile,
                        alpha=0.2, T=10, alphas_bar=s.alphas_bar.tolist(), coef_x0=s.coef_x0.tolist(),
-                       coef_xt=s.coef_xt.tolist(), posterior_var=s.posterior_var.tolist(), fill_empty="nearest")
+                       coef_xt=s.coef_xt.tolist(), posterior_var=s.posterior_var.tolist(), fill_empty="nearest",
+                       gsd=1.0)
 
 
 def keep_gate_net(x, gamma):
@@ -50,24 +52,56 @@ def keep_gate_net(x, gamma):
     return np.concatenate([np.zeros((b, 1, h, w), np.float32), np.full((b, 1, h, w), 30.0, np.float32)], 1)
 
 
+def noisy_net(x, gamma):
+    """Output depends on the noisy state g_t (channel 0), so any difference in
+    sampling noise between jobs would show up as a seam."""
+    b, _, h, w = x.shape
+    return np.concatenate([0.3 * x[:, :1] + 0.1 * x[:, 1:2], np.zeros((b, 1, h, w), np.float32)], 1).astype(np.float32)
+
+
+def read(path):
+    import rasterio
+    with rasterio.open(path) as src:
+        return src.read(1, masked=True).filled(np.nan), src.transform
+
+
 def test_plan_neighbours(tiles):
-    _, after, before = tiles
-    jobs, union = plan(after, before, gsd=1.0, buffer_m=16.0)
-    assert len(jobs) == 4 and all(len(j.after_files) == 4 for j in jobs)   # 2x2: every tile touches all others
+    _, _, before = tiles
+    jobs, union, problems = plan(before, gsd=1.0, buffer_m=16.0)
+    assert not problems
+    assert len(jobs) == 4 and all(len(j.files) == 4 for j in jobs)        # 2x2: every tile touches all others
     assert union[2] - union[0] == pytest.approx(160.0, abs=1.0)
-    jobs2, _ = plan(after, before, gsd=1.0, buffer_m=16.0, max_block_m=40.0)
+    jobs2, _, _ = plan(before, gsd=1.0, buffer_m=16.0, max_block_m=40.0)
     assert len(jobs2) == 16                                                 # each 80 m tile split in 2x2 blocks
 
 
+def test_plan_rejects_duplicate_names(tiles, tmp_path):
+    _, after, before = tiles
+    with pytest.raises(ValueError, match="more than once"):
+        plan([before[0], after[0]], gsd=1.0, buffer_m=16.0)
+
+
+def test_plan_repairs_stale_header(tiles, tmp_path):
+    import laspy
+    _, _, before = tiles
+    las = laspy.read(str(before[0]))
+    bad = tmp_path / "T00.las"
+    las.write(str(bad))
+    with open(bad, "r+b") as f:             # LAS 1.4 header: max X at byte 179, min X at 187 (float64)
+        f.seek(179)
+        f.write(np.float64(400000.5).tobytes())
+    msgs = []
+    jobs, _, _ = plan([bad], gsd=1.0, buffer_m=16.0, log=msgs.append)
+    assert any("look wrong" in m for m in msgs)
+    assert jobs[0].core[2] - jobs[0].core[0] == pytest.approx(80.0, abs=1.0)
+
+
 def test_batch_mosaic_is_seamless(tiles, tmp_path):
-    import rasterio
-    root, after, before = tiles
+    root, _, before = tiles
     spec = spec_before_after()
-    s = run_batch(after, tmp_path / "out", keep_gate_net, spec, before_files=before, gsd=1.0, buffer_m=16.0,
-                  workers=2, predict_kwargs={"batch_size": 4})
-    with rasterio.open(tmp_path / "out" / "dtm.tif") as src:
-        mosaic = src.read(1, masked=True).filled(np.nan)
-        tr = src.transform
+    s = run_batch(before, tmp_path / "out", keep_gate_net, spec, buffer_m=40.0, workers=2,
+                  predict_kwargs={"batch_size": 4})
+    mosaic, tr = read(tmp_path / "out" / "dtm.tif")
     # reference: TIN of ALL lasground_new ground points on the same global grid
     pts = concat([read_points(p) for p in before])
     g = pts.cls == 2
@@ -79,15 +113,56 @@ def test_batch_mosaic_is_seamless(tiles, tmp_path):
     assert diff.size > 0.9 * inner.sum()
     assert diff.max() < 1e-3                                                # identical across tile seams
     summary = json.loads((tmp_path / "out" / "batch_summary.json").read_text())
-    assert len(summary["tiles"]) == 4
-    for f in ("p_edit.tif", "dz_before.tif", "p_edit_overlay.tif", "p_edit_overlay_rgb.tif", "p_edit.qml", "dtm.vrt",
-              "p_edit_overlay.tfw"):
+    assert len(summary["tiles"]) == 4 and not summary["failed"]
+    for f in ("p_edit.tif", "dz_before.tif", "p_edit_overlay.tif", "p_edit_overlay_rgb.tif", "p_edit.qml",
+              "dz_before.qml", "dtm.vrt", "p_edit_overlay.tfw", "dtm.prj", "priority.csv", "priority.geojson"):
         assert (tmp_path / "out" / f).exists(), f
+    import rasterio
     with rasterio.open(tmp_path / "out" / "p_edit_overlay.tif") as src:
         assert src.count == 4 and src.read(4).max() == 0                     # p_edit ~ 0: fully transparent
+    gj = json.loads((tmp_path / "out" / "priority.geojson").read_text())
+    assert gj["features"] and gj["features"][0]["properties"]["rank"] == 1
+    assert gj["crs"]["properties"]["name"].endswith("27700")
 
 
-def test_batch_requires_before_for_before_after_models(tiles, tmp_path):
+def test_stochastic_outputs_do_not_depend_on_job_split(tiles, tmp_path):
+    """Global tile lattice + per-tile seeds: splitting the area into more
+    jobs must not change any value."""
+    _, _, before = tiles
+    spec = spec_before_after()
+    kw = {"batch_size": 3, "init": "prior_noise", "seed": 7}
+    run_batch(before, tmp_path / "a", noisy_net, spec, buffer_m=72.0, workers=1, predict_kwargs=dict(kw),
+              overlays=False)
+    run_batch(before, tmp_path / "b", noisy_net, spec, buffer_m=72.0, workers=1, predict_kwargs=dict(kw),
+              overlays=False, max_block_m=40.0)
+    a, _ = read(tmp_path / "a" / "dtm.tif")
+    b, _ = read(tmp_path / "b" / "dtm.tif")
+    both = np.isfinite(a) & np.isfinite(b)
+    assert both.sum() > 0.9 * a.size
+    assert np.abs(a - b)[both].max() < 1e-4
+    c, _ = read(tmp_path / "a" / "dz_before.tif")
+    assert np.nanstd(c) > 0.01                                              # the net really is noisy
+
+
+def test_batch_rejects_tiles_not_from_lasground(tiles, tmp_path):
     _, after, _ = tiles
-    with pytest.raises(ValueError):
-        run_batch(after, tmp_path / "x", keep_gate_net, spec_before_after())
+    with pytest.raises(ValueError, match="lasground_new"):
+        run_batch(after, tmp_path / "x", keep_gate_net, spec_before_after(), buffer_m=16.0)
+    summary = json.loads((tmp_path / "x" / "batch_summary.json").read_text()) if \
+        (tmp_path / "x" / "batch_summary.json").exists() else None
+    assert summary is None or summary["failed"]
+
+
+def test_batch_cancel(tiles, tmp_path):
+    _, _, before = tiles
+    calls = {"n": 0}
+
+    def cancelled():
+        calls["n"] += 1
+        return calls["n"] > 2
+
+    with pytest.raises(Cancelled):
+        run_batch(before, tmp_path / "c", keep_gate_net, spec_before_after(), buffer_m=16.0,
+                  cancelled=cancelled)
+    s = json.loads((tmp_path / "c" / "batch_summary.json").read_text())
+    assert s["cancelled"] and not (tmp_path / "c" / "dtm.tif").exists()

@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import contextlib
-import os
 
 import torch
 
@@ -24,8 +23,11 @@ def resolve_amp(amp: str, device: torch.device) -> torch.dtype | None:
     if amp == "none":
         return None
     if amp == "auto":
-        if device.type == "cuda" and torch.cuda.is_bf16_supported():
-            return torch.bfloat16
+        if device.type == "cuda":
+            # native bf16 needs Ampere or newer (is_bf16_supported() also counts
+            # emulation); older GPUs train in fp32 unless fp16 is chosen explicitly
+            major, _ = torch.cuda.get_device_capability(device)
+            return torch.bfloat16 if major >= 8 else None
         return None
     return {"bf16": torch.bfloat16, "fp16": torch.float16}[amp]
 
@@ -41,9 +43,6 @@ def setup_backend(device: torch.device):
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         torch.backends.cudnn.benchmark = True
-    if device.type == "mps":
-        # fall back to CPU for any op MPS lacks instead of crashing
-        os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
 
 def memory_gb(device: torch.device) -> dict:

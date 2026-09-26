@@ -26,7 +26,10 @@ from typing import Callable
 
 import numpy as np
 
-from .normalise import FILL_CHANNELS, NEAREST_CHANNELS, channel_transform, fill_nearest, tile_range
+from .normalise import (FILL_CHANNELS, HEIGHT_CHANNELS, NEAREST_CHANNELS, channel_transform, coverage_mask,
+                        fill_nearest, tile_range)
+
+INITS = ("dsm_noise", "noise", "dsm", "prior", "prior_noise", "dsm_q", "prior_q")   # = diffusion.INITS
 
 
 @dataclass
@@ -48,25 +51,47 @@ class RuntimeSpec:
     posterior_var: list = field(default_factory=list)
     clip_x0: float | None = None
     fill_empty: str = "zero"
+    norm_quantile: float = 0.0
+    coverage_close_m: float = 30.0
+    init: str | None = None               # sampler init used in validation (None: prior if any, else dsm_noise)
+    # how the training rasters were made (from the scenes' meta.json); batch and
+    # the QGIS plugin use these as defaults so inference matches training
+    gsd: float | None = None
+    ground_classes: list | None = None
+    before_ground_classes: list | None = None
+    read_opts: dict | None = None
 
     def to_json(self, path: str | Path):
         Path(path).write_text(json.dumps(asdict(self), indent=1))
 
     @classmethod
     def from_json(cls, path: str | Path) -> "RuntimeSpec":
-        return cls(**json.loads(Path(path).read_text()))
+        d = json.loads(Path(path).read_text())
+        known = set(cls.__dataclass_fields__)
+        return cls(**{k: v for k, v in d.items() if k in known})
 
     @classmethod
-    def from_config(cls, cfg) -> "RuntimeSpec":
+    def from_config(cls, cfg, data_meta: dict | None = None) -> "RuntimeSpec":
         from .schedule import build_schedule
         d, dc = cfg.data, cfg.diffusion
         sch = build_schedule(dc.schedule, dc.T, dc.beta_start, dc.beta_end, dc.cosine_s)
+        m = data_meta or {}
         return cls(kind=cfg.model.kind, cond_channels=list(d.cond_channels), gate_channel=d.gate_channel,
                    norm_channels=list(d.norm_channels), prior_channel=d.prior_channel,
                    norm_mode=d.norm_mode, norm_std=d.norm_std, min_range=d.min_range, tile=d.tile,
                    alpha=d.alpha, T=dc.T, alphas_bar=sch.alphas_bar.tolist(), coef_x0=sch.coef_x0.tolist(),
                    coef_xt=sch.coef_xt.tolist(), posterior_var=sch.posterior_var.tolist(),
-                   clip_x0=dc.clip_x0, fill_empty=d.fill_empty)
+                   clip_x0=dc.clip_x0, fill_empty=d.fill_empty, norm_quantile=d.norm_quantile,
+                   coverage_close_m=d.coverage_close_m,
+                   init=getattr(cfg.train, "val_init", None) if cfg.model.kind == "groundiff" else None,
+                   gsd=m.get("gsd"), ground_classes=m.get("ground_classes"),
+                   before_ground_classes=m.get("before_ground_classes"), read_opts=m.get("read_opts"))
+
+    @property
+    def needs_before(self) -> bool:
+        """Needs the lasground_new classification (dtm_before / sem_* channels)."""
+        return bool(self.prior_channel) or any(c.startswith("sem_") or c in ("dtm_before", "before_valid")
+                                               for c in self.cond_channels)
 
     @property
     def needed_channels(self) -> list:
@@ -84,34 +109,49 @@ def tile_norm(arrs: dict, spec: RuntimeSpec) -> tuple[float, float]:
         std = float(spec.norm_std or 1.0)
         return mean - std, 2.0 * std
     ref = np.stack([arrs[n] for n in spec.norm_channels])
-    return tile_range(ref, np.isfinite(ref).all(0), spec.min_range)
+    return tile_range(ref, None, spec.min_range, spec.norm_quantile)
+
+
+def _prep(arrs: dict, spec: RuntimeSpec, name: str, lo: float, scale: float) -> np.ndarray:
+    """Same rule as TileDataset._finish."""
+    a = arrs[name].astype(np.float64)
+    if spec.fill_empty == "nearest" and name in FILL_CHANNELS:
+        a = fill_nearest(a)
+    x = channel_transform(name, a, lo, scale)
+    return np.where(np.isfinite(x), x, 0.0).astype(np.float32)
 
 
 def prepare(arrs: dict, spec: RuntimeSpec, lo: float, scale: float) -> np.ndarray:
-    def prep(name):
-        a = arrs[name].astype(np.float64)
-        if spec.fill_empty == "nearest" and name in FILL_CHANNELS:
-            a = fill_nearest(a)
-        x = channel_transform(name, a, lo, scale)
-        return np.where(np.isfinite(x), x, 0.0).astype(np.float32)
-    return np.stack([prep(n) for n in spec.cond_channels])
+    return np.stack([_prep(arrs, spec, n, lo, scale) for n in spec.cond_channels])
 
 
 def _sigmoid(x):
     return 1.0 / (1.0 + np.exp(-np.clip(x, -60, 60)))
 
 
+def _normal(rng, shape) -> np.ndarray:
+    """rng: one Generator, or one per batch element (so a tile's noise does not
+    depend on which batch or job it is processed in)."""
+    if isinstance(rng, (list, tuple)):
+        return np.stack([r.standard_normal(shape[1:]) for r in rng])
+    return rng.standard_normal(shape)
+
+
 def sample(denoise: Callable, cond: np.ndarray, spec: RuntimeSpec, init: str = "dsm_noise",
            prior: np.ndarray | None = None, t_start: int | None = None,
-           rng: np.random.Generator | None = None, add_noise: bool = True):
+           rng=None, add_noise: bool = True):
     """numpy mirror of GrounDiff.sample (diffusion.py). cond [B, C, T, T]."""
-    rng = rng or np.random.default_rng()
+    rng = rng if rng is not None else np.random.default_rng()
+    if init not in INITS:
+        raise ValueError(f"init must be one of {INITS}, got {init!r}")
     ab = np.asarray(spec.alphas_bar, np.float64)
     T = spec.T
     t_start = T if t_start is None else int(t_start)
+    if not 1 <= t_start <= T:
+        raise ValueError(f"t_start must be in [1, {T}], got {t_start}")
     gi = spec.cond_channels.index(spec.gate_channel)
     s = cond[:, gi:gi + 1].astype(np.float64)
-    noise = rng.standard_normal(s.shape) if add_noise else np.zeros(s.shape)
+    noise = _normal(rng, s.shape) if add_noise else np.zeros(s.shape)
     if init.startswith("prior"):
         if prior is None:
             raise ValueError(f"init={init!r} needs a prior")
@@ -120,7 +160,7 @@ def sample(denoise: Callable, cond: np.ndarray, spec: RuntimeSpec, init: str = "
         base = np.zeros_like(s)
     else:
         base = s
-    if t_start < T:
+    if t_start < T or init.endswith("_q"):
         g = math.sqrt(ab[t_start - 1]) * base + math.sqrt(1 - ab[t_start - 1]) * noise
     elif init in ("dsm", "prior"):
         g = base
@@ -138,7 +178,7 @@ def sample(denoise: Callable, cond: np.ndarray, spec: RuntimeSpec, init: str = "
             g0 = np.clip(g0, -spec.clip_x0, spec.clip_x0)
         if t > 1:
             mean = spec.coef_x0[t - 1] * g0 + spec.coef_xt[t - 1] * g
-            eps = rng.standard_normal(g.shape) if add_noise else np.zeros(g.shape)
+            eps = _normal(rng, g.shape) if add_noise else np.zeros(g.shape)
             g = mean + math.sqrt(spec.posterior_var[t - 1]) * eps
     return g0.astype(np.float32), logit.astype(np.float32)
 
@@ -201,54 +241,123 @@ def _ramp_weights(tile: int, stride: int) -> np.ndarray:
     return np.outer(w1, w1)
 
 
+LATTICE_TOP = 1_300_000.0      # northing of the tile-lattice origin (top of the British National Grid)
+
+
+def lattice_anchor(xmin: float, ymax: float, gsd: float) -> tuple[int, int]:
+    """Global (row, col) of a grid's top-left cell on the lattice anchored at
+    (0, LATTICE_TOP): pass as predict_scene(anchor=...) so rasters processed
+    separately (batch jobs, raster mode) use the same network tiles and noise."""
+    return int(round((LATTICE_TOP - ymax) / gsd)), int(round(xmin / gsd))
+
+
+def _tile_starts(n: int, t: int, stride: int, anchor: int | None, lo: int, hi: int) -> list:
+    """Tile starts along one axis. anchor=None: cover [0, n) with the last tile
+    flush with the edge. Otherwise tiles sit on a global lattice (multiples of
+    stride in global pixel coordinates; `anchor` is the global index of local
+    pixel 0) and only those touching [lo, hi) are returned, so neighbouring
+    batch jobs place identical tiles on the cells they share."""
+    if anchor is None:
+        return _starts(n, t, stride)
+    k0 = -((-(anchor + lo - t + 1)) // stride)          # ceil
+    k1 = (anchor + hi - 1) // stride
+    return [k * stride - anchor for k in range(k0, k1 + 1)]
+
+
+def _window(a: np.ndarray, r: int, c: int, t: int) -> np.ndarray:
+    """t x t window at (r, c), NaN outside the array (r, c may be negative)."""
+    H, W = a.shape
+    out = np.full((t, t), np.nan)
+    r0, c0, r1, c1 = max(r, 0), max(c, 0), min(r + t, H), min(c + t, W)
+    if r1 > r0 and c1 > c0:
+        out[r0 - r:r1 - r, c0 - c:c1 - c] = a[r0:r1, c0:c1]
+    return out
+
+
+def survey_mask(arrs: dict, spec: RuntimeSpec, gsd: float | None = None) -> np.ndarray:
+    """Cells inside the LiDAR coverage, where outputs are written."""
+    if "in_survey" in arrs:
+        return np.nan_to_num(arrs["in_survey"]) > 0.5
+    if "has_return" in arrs:
+        base = np.nan_to_num(arrs["has_return"]) > 0
+    else:                                  # raster inputs: any finite LiDAR surface
+        names = [n for n in spec.needed_channels if n in HEIGHT_CHANNELS and n != "dtm_before"] or \
+                [n for n in spec.needed_channels if n in HEIGHT_CHANNELS]
+        base = np.zeros(arrs[spec.gate_channel].shape, bool)
+        for n in names:
+            base |= np.isfinite(arrs[n])
+    return coverage_mask(base, gsd or spec.gsd or 1.0, spec.coverage_close_m)
+
+
 def predict_scene(arrs: dict, spec: RuntimeSpec, net: Callable, *, stride: int | None = None,
-                  blend: str = "min", prior: str = "auto", init: str | None = None,
+                  blend: str = "linear", prior: str = "auto", init: str | None = None,
                   t_start: int | None = None, n_samples: int = 1, tta: bool = False,
                   batch_size: int = 8, seed: int = 0, progress: Callable | None = None,
-                  add_noise: bool = True) -> dict:
+                  add_noise: bool = True, anchor: tuple | None = None, region: tuple | None = None,
+                  gsd: float | None = None) -> dict:
     """arrs: full-scene rasters in metres (NaN = no data), at least
     spec.needed_channels. Returns metre-space rasters:
         dtm, p_ground (GrounDiff: sigmoid(l), probability that the gate
         surface is already right), p_edit (1 - p_ground, when the gate is the
         lasground_new DTM), std (if n_samples > 1 or tta), dz_before
-        (dtm - prior channel, if present), coverage."""
+        (dtm - prior channel, if present), coverage.
+    anchor=(row, col): global pixel index of arrs[0, 0]; tiles then lie on a
+    global lattice and each tile's noise is seeded by its global position, so
+    separately processed neighbouring blocks agree where they overlap.
+    region=(r0, c0, h, w): only tiles touching this local window are run
+    (with anchor; the rest of the output is NaN).
+    progress(fraction) may raise to cancel."""
     missing = [c for c in spec.needed_channels if c not in arrs]
     if missing:
         raise KeyError(f"missing input rasters: {missing}")
-    rng = np.random.default_rng(seed)
     H, W = arrs[spec.gate_channel].shape
     t = spec.tile
     stride = stride or t // 2
+    if not 1 <= stride <= t:
+        raise ValueError(f"stride must be in [1, tile={t}], got {stride}")
+    if blend not in ("min", "linear", "mean"):
+        raise ValueError(f"blend must be min, linear or mean, got {blend!r}")
+    if prior not in ("auto", "global", "channel", "none"):
+        raise ValueError(f"prior must be auto, global, channel or none, got {prior!r}")
+    rng = np.random.default_rng(seed)
     if prior == "auto":
         prior = "channel" if spec.prior_channel else "global"
     is_diff = spec.kind == "groundiff"
 
     prior_full = None
     if is_diff and prior == "global":
-        small = {n: _resize(arrs[n], t, t, nearest=n in NEAREST_CHANNELS) for n in spec.needed_channels}
+        # keep the aspect ratio: the scene's long side becomes one tile
+        f = t / max(H, W)
+        sh, sw = max(1, round(H * f)), max(1, round(W * f))
+        small = {n: _window(_resize(arrs[n], sh, sw, nearest=n in NEAREST_CHANNELS), 0, 0, t)
+                 for n in spec.needed_channels}
         lo, sc = tile_norm(small, spec)
         g0, _ = sample(net, prepare(small, spec, lo, sc)[None], spec, init="dsm_noise", rng=rng,
                        add_noise=add_noise)
-        coarse = (g0[0, 0].astype(np.float64) + 1) * 0.5 * sc + lo
+        coarse = (g0[0, 0, :sh, :sw].astype(np.float64) + 1) * 0.5 * sc + lo
         prior_full = _resize(coarse, H, W)
     elif prior == "channel" or not is_diff:
         if not spec.prior_channel:
             raise ValueError("prior='channel' needs a prior channel in the spec")
         prior_full = arrs[spec.prior_channel].astype(np.float64)
+        if spec.fill_empty == "nearest":
+            prior_full = fill_nearest(prior_full)          # as in training (dataset._finish)
     if init is None:
         init = "prior" if (is_diff and prior_full is not None) else "dsm_noise"
+    if is_diff and init not in INITS:
+        raise ValueError(f"init must be one of {INITS}, got {init!r}")
 
-    rows, cols = _starts(H, t, stride), _starts(W, t, stride)
+    ar, ac = anchor if anchor is not None else (None, None)
+    r0g, c0g, hg, wg = region if region is not None else (0, 0, H, W)
+    rows = _tile_starts(H, t, stride, ar, r0g, r0g + hg)
+    cols = _tile_starts(W, t, stride, ac, c0g, c0g + wg)
     acc = np.full((H, W), np.inf) if blend == "min" else np.zeros((H, W))
     wsum = np.zeros((H, W))
     pg_acc, sd_acc, cnt = np.zeros((H, W)), np.zeros((H, W)), np.zeros((H, W))
     wt = _ramp_weights(t, stride) if blend == "linear" else np.ones((t, t))
     views = [(k, f) for k in range(4) for f in (False, True)] if tta else [(0, False)]
 
-    def window(a, r, c):
-        out = np.full((t, t), np.nan)
-        out[: min(t, H - r), : min(t, W - c)] = a[r:r + t, c:c + t]
-        return out
+    window = lambda a, r, c: _window(a, r, c, t)
 
     jobs = [(r, c) for r in rows for c in cols]
     for j0 in range(0, len(jobs), batch_size):
@@ -265,13 +374,17 @@ def predict_scene(arrs: dict, spec: RuntimeSpec, net: Callable, *, stride: int |
                 priors.append(np.where(np.isfinite(pn), pn, 0.0).astype(np.float32)[None])
         cond = np.stack(tiles)
         pri = np.stack(priors) if priors else None
+        if anchor is not None:      # noise depends only on the tile's global position
+            tile_rngs = [np.random.default_rng([seed, r + ar + 2 ** 30, c + ac + 2 ** 30]) for r, c in chunk]
+        else:
+            tile_rngs = rng
         preds, probs = [], []
         for k, f in views:
             c_v = np.ascontiguousarray(_d4(cond, k, f))
             p_v = np.ascontiguousarray(_d4(pri, k, f)) if pri is not None else None
             for _ in range(n_samples if is_diff else 1):
                 if is_diff:
-                    g0, logit = sample(net, c_v, spec, init=init, prior=p_v, t_start=t_start, rng=rng,
+                    g0, logit = sample(net, c_v, spec, init=init, prior=p_v, t_start=t_start, rng=tile_rngs,
                                        add_noise=add_noise)
                     probs.append(_d4(_sigmoid(logit), k, f, inverse=True))
                 else:
@@ -282,26 +395,28 @@ def predict_scene(arrs: dict, spec: RuntimeSpec, net: Callable, *, stride: int |
         mean, std = P.mean(0), (P.std(0) if P.shape[0] > 1 else np.zeros_like(P[0]))
         pg = np.stack(probs).mean(0) if probs else None
         for i, (r, c) in enumerate(chunk):
-            hh, ww = min(t, H - r), min(t, W - c)
-            m = (mean[i, 0].astype(np.float64) + 1) * 0.5 * scs[i] + los[i]
-            sd = std[i, 0].astype(np.float64) * 0.5 * scs[i]
-            sl = (slice(r, r + hh), slice(c, c + ww))
+            # part of the tile inside the array
+            ra, ca, rb, cb = max(r, 0), max(c, 0), min(r + t, H), min(c + t, W)
+            if rb <= ra or cb <= ca:
+                continue
+            tl = (slice(ra - r, rb - r), slice(ca - c, cb - c))
+            m = ((mean[i, 0].astype(np.float64) + 1) * 0.5 * scs[i] + los[i])[tl]
+            sd = (std[i, 0].astype(np.float64) * 0.5 * scs[i])[tl]
+            sl = (slice(ra, rb), slice(ca, cb))
             if blend == "min":
-                acc[sl] = np.minimum(acc[sl], m[:hh, :ww])
+                acc[sl] = np.minimum(acc[sl], m)
             else:
-                acc[sl] += m[:hh, :ww] * wt[:hh, :ww]
-                wsum[sl] += wt[:hh, :ww]
-            sd_acc[sl] += sd[:hh, :ww]
+                acc[sl] += m * wt[tl]
+                wsum[sl] += wt[tl]
+            sd_acc[sl] += sd
             cnt[sl] += 1
             if pg is not None:
-                pg_acc[sl] += pg[i, 0][:hh, :ww]
+                pg_acc[sl] += pg[i, 0][tl]
         if progress:
             progress(min(j0 + batch_size, len(jobs)) / len(jobs))
 
     dtm = acc if blend == "min" else acc / np.maximum(wsum, 1e-12)
-    has_data = np.zeros((H, W), bool)
-    for n in spec.cond_channels:
-        has_data |= np.isfinite(arrs[n]) if n not in NEAREST_CHANNELS else arrs[n] > 0
+    has_data = survey_mask(arrs, spec, gsd) & (cnt > 0)
     out = {"dtm": np.where(has_data, dtm, np.nan).astype(np.float32),
            "coverage": cnt.astype(np.float32)}
     if is_diff:
@@ -312,7 +427,11 @@ def predict_scene(arrs: dict, spec: RuntimeSpec, net: Callable, *, stride: int |
     if n_samples > 1 or tta:
         out["std"] = np.where(has_data, sd_acc / np.maximum(cnt, 1), np.nan).astype(np.float32)
     if spec.prior_channel and spec.prior_channel in arrs:
+        # only where lasground_new has a DTM of its own (not the filled prior)
         out["dz_before"] = (out["dtm"] - arrs[spec.prior_channel]).astype(np.float32)
+        if "p_edit" in out:
+            out["p_edit"] = np.where(np.isfinite(arrs[spec.prior_channel]), out["p_edit"], np.nan
+                                     ).astype(np.float32)
     if prior_full is not None and prior == "global":
         out["prior"] = prior_full.astype(np.float32)
     return out

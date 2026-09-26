@@ -22,7 +22,7 @@ def trained(tmp_path_factory):
     root = tmp_path_factory.mktemp("rt")
     for i in range(3):
         after, before = write_scene(root / "laz", name=f"S{i}", seed=10 + i, size=80.0)
-        process_scene(after, root / "scenes", before=before, gsd=1.0)
+        process_scene(before, root / "scenes", after=after, gsd=1.0)
     (root / "split.json").write_text(json.dumps({"train": ["S0", "S1"], "val": ["S2"], "test": ["S2"]}))
     out = root / "run"
     train(base_cfg(root, out, optim={"total_steps": 3, "warmup_steps": 1, "lr": 1e-3}))

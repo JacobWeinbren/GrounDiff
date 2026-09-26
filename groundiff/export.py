@@ -30,10 +30,22 @@ class _Denoiser(torch.nn.Module):
         return self.unet(x, gamma)
 
 
+def _inline_weights(onnx_path: Path):
+    """torch.export writes weights to <name>.onnx.data; fold them into the
+    .onnx so the model is one file (plus its .json) to copy to the PC."""
+    data = onnx_path.with_name(onnx_path.name + ".data")
+    if not data.exists():
+        return
+    import onnx
+    m = onnx.load(str(onnx_path), load_external_data=True)
+    onnx.save_model(m, str(onnx_path), save_as_external_data=False)
+    data.unlink()
+
+
 def export(ckpt: str | Path, out: str | Path, use_ema: bool = True, opset: int = 18,
            check: bool = True) -> tuple[Path, Path]:
-    model, cfg, _ = load_model(ckpt, "cpu", use_ema=use_ema)
-    spec = RuntimeSpec.from_config(cfg)
+    model, cfg, ck = load_model(ckpt, "cpu", use_ema=use_ema)
+    spec = RuntimeSpec.from_config(cfg, ck.get("data_meta"))
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
     onnx_path, json_path = out.with_suffix(".onnx"), out.with_suffix(".json")
@@ -57,6 +69,7 @@ def export(ckpt: str | Path, out: str | Path, use_ema: bool = True, opset: int =
         shapes = {"x": {0: batch}, "gamma": {0: batch}} if len(args) == 2 else {"x": {0: batch}}
         torch.onnx.export(net, args, str(onnx_path), input_names=names, output_names=["out"],
                           dynamic_shapes=shapes, opset_version=opset, dynamo=True)
+        _inline_weights(onnx_path)
     spec.to_json(json_path)
     if check:
         ref = TorchNet(model, "cpu")

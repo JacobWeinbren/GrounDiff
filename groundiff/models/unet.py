@@ -114,9 +114,14 @@ class ResBlock(nn.Module):
         self.emb_layers = nn.Sequential(
             nn.SiLU(),
             nn.Linear(emb_channels, 2 * self.out_channel if use_scale_shift_norm else self.out_channel))
+        # out_layers[2] is the dropout. Under activation checkpointing the mask
+        # is drawn outside the checkpointed function and passed in, so the
+        # recomputation uses the same mask on every device (torch does not save
+        # and restore the MPS RNG around checkpoints).
         self.out_layers = nn.Sequential(
             normalization(self.out_channel), nn.SiLU(), nn.Dropout(p=dropout),
             zero_module(nn.Conv2d(self.out_channel, self.out_channel, 3, padding=1)))
+        self.dropout = float(dropout)
         if self.out_channel == channels:
             self.skip_connection = nn.Identity()
         elif use_conv:
@@ -126,10 +131,17 @@ class ResBlock(nn.Module):
 
     def forward(self, x, emb):
         if self.use_checkpoint and self.training and torch.is_grad_enabled():
-            return checkpoint(self._forward, x, emb, use_reentrant=False)
+            mask = None
+            if self.dropout > 0:
+                b, _, hh, ww = x.shape
+                if self.updown:
+                    hh, ww = (hh * 2, ww * 2) if isinstance(self.h_upd, Upsample) else (hh // 2, ww // 2)
+                keep = 1.0 - self.dropout
+                mask = torch.empty(b, self.out_channel, hh, ww, device=x.device).bernoulli_(keep) / keep
+            return checkpoint(self._forward, x, emb, mask, use_reentrant=False, preserve_rng_state=False)
         return self._forward(x, emb)
 
-    def _forward(self, x, emb):
+    def _forward(self, x, emb, mask=None):
         if self.updown:
             in_rest, in_conv = self.in_layers[:-1], self.in_layers[-1]
             h = in_conv(self.h_upd(in_rest(x)))
@@ -137,13 +149,14 @@ class ResBlock(nn.Module):
         else:
             h = self.in_layers(x)
         emb_out = self.emb_layers(emb).type(h.dtype)[..., None, None]
+        norm, act, drop, conv = self.out_layers
         if self.use_scale_shift_norm:
-            out_norm, out_rest = self.out_layers[0], self.out_layers[1:]
             scale, shift = torch.chunk(emb_out, 2, dim=1)
-            h = out_rest(out_norm(h) * (1 + scale) + shift)
+            h = act(norm(h) * (1 + scale) + shift)
         else:
-            h = self.out_layers(h + emb_out)
-        return self.skip_connection(x) + h
+            h = act(norm(h + emb_out))
+        h = h * mask.to(h.dtype) if mask is not None else drop(h)
+        return self.skip_connection(x) + conv(h)
 
 
 class AttentionBlock(nn.Module):
@@ -258,7 +271,8 @@ def _fp32(x: torch.Tensor):
     try:
         if torch.is_autocast_enabled(x.device.type):
             return torch.autocast(device_type=x.device.type, enabled=False)
-    except TypeError:                     # older torch: is_autocast_enabled() takes no args
-        if torch.is_autocast_enabled():
+    except TypeError:                     # torch < 2.4: no device argument
+        on = torch.is_autocast_cpu_enabled() if x.device.type == "cpu" else torch.is_autocast_enabled()
+        if on:
             return torch.autocast(device_type=x.device.type, enabled=False)
     return contextlib.nullcontext()

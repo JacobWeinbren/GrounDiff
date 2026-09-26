@@ -14,7 +14,12 @@ Channels produced (all float32, metres unless stated):
   z_std      std of return heights in the cell      (ALS2DTM statistic raster)
   echoes     mean number_of_returns in the cell     (ALS2DTM statistic raster)
   has_return 1 where the cell holds at least one return
-A TIN DTM is built from the points of chosen classes (see `tin_dtm`).
+  in_survey  1 inside the LiDAR coverage (returns plus narrow/enclosed voids
+             such as water; see normalise.coverage_mask)
+A TIN DTM is built from the points of chosen classes (see `tin_dtm`) and is
+cut to in_survey, so no triangle spanning open sea or the survey edge
+counts as a target or input. Targets can instead come from published DTM
+rasters (`target_from_rasters`).
 """
 from __future__ import annotations
 
@@ -132,28 +137,17 @@ def top_return_is(grid: Grid, x, y, z, flag) -> np.ndarray:
     return out.reshape(grid.height, grid.width).astype(np.float32)
 
 
-def tin_dtm(grid: Grid, x, y, z, max_points: int = 4_000_000, seed: int = 0):
-    """Linear interpolation on a Delaunay triangulation (TIN) of the given
+def tin_dtm(grid: Grid, x, y, z):
+    """Linear interpolation on a Delaunay triangulation (TIN) of all given
     points, evaluated at cell centres. Returns (dtm, valid) where valid is
-    False outside the convex hull. Very dense inputs are thinned by a
-    per-cell minimum first (keeps the lowest point in each cell), then
-    randomly if still above `max_points`."""
+    False outside the convex hull. No thinning, so training scenes and
+    inference blocks of any size give the same surface (memory is roughly
+    300 bytes per point: keep inference blocks to ~1 km)."""
     from scipy.interpolate import LinearNDInterpolator
 
     if x.size < 3:
         return (np.full((grid.height, grid.width), np.nan, np.float32),
                 np.zeros((grid.height, grid.width), bool))
-    if x.size > max_points:
-        # keep the lowest point per cell, which preserves the terrain surface
-        idx, ok = _flat_index(grid, x, y)
-        order = np.lexsort((z[ok], idx[ok]))
-        first = np.ones(order.size, bool)
-        first[1:] = idx[ok][order][1:] != idx[ok][order][:-1]
-        keep = np.flatnonzero(ok)[order[first]]
-        x, y, z = x[keep], y[keep], z[keep]
-        if x.size > max_points:
-            sel = np.random.default_rng(seed).choice(x.size, max_points, replace=False)
-            x, y, z = x[sel], y[sel], z[sel]
     xs, ys = grid.cell_centres()
     # interpolate in local coordinates: Delaunay on 6-7 digit BNG values loses precision
     ox, oy = grid.xmin, grid.ymax
@@ -164,20 +158,62 @@ def tin_dtm(grid: Grid, x, y, z, max_points: int = 4_000_000, seed: int = 0):
     return dtm, np.isfinite(dtm)
 
 
-def build_rasters(grid: Grid, pts, before=None, ground_classes=(2, 9), before_ground_classes=(2,),
-                  with_target: bool = True) -> dict:
-    """Every channel used in training/inference for one grid. `pts` is the
-    final ("after") point set, `before` the lasground_new-classified one."""
+def input_rasters(grid: Grid, pts, lasground: bool = True, before_ground_classes=(2,),
+                  coverage_close_m: float = 30.0) -> dict:
+    """The network's input rasters from one point set: the DSM / statistic
+    rasters and in_survey, plus (lasground=True) dtm_before, before_valid and
+    sem_* from its classification, which must be lasground_new's (default
+    settings write only 1 = non-ground, 2 = ground). The same function serves
+    training (preprocess) and inference (batch / QGIS), so both see the same
+    points: nothing is dropped by class, because published EA classes are
+    not the ones the DTM was made from and production tiles have none yet."""
+    from ..normalise import coverage_mask
+
     out = rasterise_points(grid, pts.x, pts.y, pts.z, pts.return_number, pts.number_of_returns)
-    if with_target:
-        g = np.isin(pts.cls, np.asarray(ground_classes, np.uint8))
-        gt, gt_valid = tin_dtm(grid, pts.x[g], pts.y[g], pts.z[g])
-        out["gt_dtm"], out["gt_valid"] = gt, gt_valid.astype(np.float32)
-        out["top_ground"] = top_return_is(grid, pts.x, pts.y, pts.z, g)
-    if before is not None:
-        bg = np.isin(before.cls, np.asarray(before_ground_classes, np.uint8))
-        dtm_b, b_valid = tin_dtm(grid, before.x[bg], before.y[bg], before.z[bg])
-        out["dtm_before"], out["before_valid"] = dtm_b, b_valid.astype(np.float32)
-        sem = class_mode_onehot(grid, before.x, before.y, bg)
+    survey = coverage_mask(out["has_return"] > 0, grid.gsd, coverage_close_m)
+    out["in_survey"] = survey.astype(np.float32)
+    if lasground:
+        bg = np.isin(pts.cls, np.asarray(before_ground_classes, np.uint8))
+        dtm_b, b_valid = tin_dtm(grid, pts.x[bg], pts.y[bg], pts.z[bg])
+        b_valid &= survey
+        out["dtm_before"] = np.where(b_valid, dtm_b, np.nan).astype(np.float32)
+        out["before_valid"] = b_valid.astype(np.float32)
+        sem = class_mode_onehot(grid, pts.x, pts.y, bg)
         out["sem_ground"], out["sem_nonground"] = sem[0], sem[1]
+    return out
+
+
+def target_from_points(grid: Grid, after, survey: np.ndarray, ground_classes=(2,)) -> dict:
+    """Target DTM from a hand-edited point cloud (e.g. your own LP360 tiles):
+    TIN of the ground class. EA production uses 1 unclassified, 2 ground,
+    bridge and low noise, and builds the DTM from ground only."""
+    g = np.isin(after.cls, np.asarray(ground_classes, np.uint8))
+    gt, gt_valid = tin_dtm(grid, after.x[g], after.y[g], after.z[g])
+    gt_valid &= survey
+    return {"gt_dtm": np.where(gt_valid, gt, np.nan).astype(np.float32),
+            "gt_valid": gt_valid.astype(np.float32),
+            "top_ground": top_return_is(grid, after.x, after.y, after.z, g)}
+
+
+def target_from_rasters(grid: Grid, paths: list, survey: np.ndarray) -> dict:
+    """Target DTM from published DTM rasters (the EA product), sampled at
+    our cell centres (exact copy when the grids coincide, e.g. gsd 1 m on
+    the whole-metre OS grid)."""
+    from ..io_raster import sample_rasters
+
+    xs, ys = grid.cell_centres()
+    gt = sample_rasters(paths, xs, ys)
+    ok = np.isfinite(gt) & survey
+    return {"gt_dtm": np.where(ok, gt, np.nan).astype(np.float32), "gt_valid": ok.astype(np.float32)}
+
+
+def build_rasters(grid: Grid, pts, before=None, ground_classes=(2,), before_ground_classes=(2,),
+                  with_target: bool = True, coverage_close_m: float = 30.0) -> dict:
+    """Inputs from `before` (lasground_new-classified) when given, else from
+    `pts` without lasground channels; target (with_target) from the ground
+    class of `pts` (a hand-edited point cloud)."""
+    src = before if before is not None else pts
+    out = input_rasters(grid, src, before is not None, before_ground_classes, coverage_close_m)
+    if with_target:
+        out.update(target_from_points(grid, pts, out["in_survey"] > 0.5, ground_classes))
     return out
