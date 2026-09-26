@@ -43,6 +43,12 @@ def scene_name(path: Path) -> str:
     return path.stem
 
 
+def _default_crs():
+    """EA open-data COPC tiles carry no CRS VLR; they are British National Grid."""
+    from ..io_raster import crs_wkt_from_epsg
+    return crs_wkt_from_epsg(27700)
+
+
 def _save(out: Path, name: str, arr: np.ndarray):
     np.save(out / f"{name}.npy", np.ascontiguousarray(arr, dtype=np.float32))
 
@@ -72,7 +78,7 @@ def process_scene(after: Path, out_root: Path, before: Path | None = None, gsd: 
         _save(out, k, v)
     meta = {
         "schema": SCHEMA, "scene": name, "gsd": gsd, "grid": grid.to_dict(),
-        "crs_wkt": pts.crs_wkt, "after_file": str(after), "n_points": len(pts),
+        "crs_wkt": pts.crs_wkt or _default_crs(), "after_file": str(after), "n_points": len(pts),
         "ground_classes": list(ground_classes), "class_hist_after": class_histogram(pts.cls),
         "has_before": before is not None, "read_opts": read_opts,
     }

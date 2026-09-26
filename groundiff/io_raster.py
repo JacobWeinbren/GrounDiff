@@ -6,6 +6,22 @@ from pathlib import Path
 import numpy as np
 
 
+def crs_wkt_from_epsg(epsg: int = 27700) -> str | None:
+    """WKT for an EPSG code via rasterio or GDAL (None if neither is available)."""
+    try:
+        from rasterio.crs import CRS
+        return CRS.from_epsg(epsg).to_wkt()
+    except ImportError:
+        pass
+    try:
+        from osgeo import osr
+        srs = osr.SpatialReference()
+        srs.ImportFromEPSG(epsg)
+        return srs.ExportToWkt()
+    except ImportError:
+        return None
+
+
 def write_geotiff(path: str | Path, arr: np.ndarray, xmin: float, ymax: float, gsd: float,
                   crs_wkt: str | None = None, nodata: float = -9999.0):
     a = np.where(np.isfinite(arr), arr, nodata).astype(np.float32)

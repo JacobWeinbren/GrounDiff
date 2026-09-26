@@ -30,7 +30,7 @@ import numpy as np
 from .data.laz import NOISE_CLASSES, concat, header_bounds, read_points_bbox
 from .data.preprocess import scene_name
 from .data.rasterise import Grid, build_rasters
-from .io_raster import build_vrt, vrt_to_geotiff, write_geotiff
+from .io_raster import build_vrt, crs_wkt_from_epsg, vrt_to_geotiff, write_geotiff
 from .overlay import PRESETS, _write_sidecars, qml_style, render_rgba, write_rgba_geotiff
 from .runtime import RuntimeSpec, predict_scene
 
@@ -111,7 +111,11 @@ OUTPUT_PRESETS = {"p_edit": "edit", "dz_before": "dz", "std": "uncertainty", "p_
 def run_batch(after_files: list, out_dir: str | Path, net, spec: RuntimeSpec, *, before_files: list | None = None,
               gsd: float = 0.5, buffer_m: float = 64.0, workers: int = 2, read_opts: dict | None = None,
               overlays: bool = True, predict_kwargs: dict | None = None, max_block_m: float = 2000.0,
-              progress: Callable | None = None, log: Callable = print, cancelled: Callable = lambda: False) -> dict:
+              progress: Callable | None = None, log: Callable = print, cancelled: Callable = lambda: False,
+              default_epsg: int | None = 27700) -> dict:
+    """default_epsg: CRS for outputs when the input files carry none (EA COPC
+    tiles from the open-data bucket have no CRS VLR; they are British National
+    Grid, EPSG:27700)."""
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     needs_before = bool(spec.prior_channel) or any(c.startswith("sem_") or c == "dtm_before"
@@ -166,7 +170,11 @@ def run_batch(after_files: list, out_dir: str | Path, net, spec: RuntimeSpec, *,
                 rec["skipped"] = "no points"
                 summary["tiles"].append(rec)
                 continue
-            crs = crs or info["crs_wkt"]
+            if crs is None:
+                crs = info["crs_wkt"]
+                if crs is None and default_epsg:
+                    crs = crs_wkt_from_epsg(default_epsg)
+                    log(f"[info] inputs have no CRS; writing outputs as EPSG:{default_epsg}")
             t1 = time.time()
             res = predict_scene(arrs, spec, net, seed=base_seed + idx, **predict_kwargs)
             rec["predict_s"] = round(time.time() - t1, 1)
@@ -177,7 +185,7 @@ def run_batch(after_files: list, out_dir: str | Path, net, spec: RuntimeSpec, *,
             h = int(round((job.core[3] - job.core[1]) / gsd))
             gc = int(round((job.core[0] - G.xmin) / gsd))
             gr = int(round((G.ymax - job.core[3]) / gsd))
-            geo = (job.core[0], job.core[3], gsd, info["crs_wkt"])
+            geo = (job.core[0], job.core[3], gsd, crs)
             for k in keys:
                 if k in res:
                     p = tiles_dir / f"{job.name}_{k}.tif"
@@ -244,12 +252,14 @@ def main(argv=None):
     ap.add_argument("--drop-overlap", action="store_true")
     ap.add_argument("--drop-synthetic", action="store_true")
     ap.add_argument("--no-overlays", action="store_true")
+    ap.add_argument("--epsg", type=int, default=27700, help="CRS for outputs when inputs have none")
     a = ap.parse_args(argv)
     from .infer import load_net
     net, spec = load_net(a.checkpoint, a.onnx, a.device)
     s = run_batch(a.after, a.out, net, spec, before_files=a.before, gsd=a.gsd, buffer_m=a.buffer,
                   workers=a.workers, overlays=not a.no_overlays,
                   read_opts={"drop_overlap": a.drop_overlap, "drop_synthetic": a.drop_synthetic},
+                  default_epsg=a.epsg,
                   predict_kwargs={"blend": a.blend, "prior": a.prior, "n_samples": a.samples, "tta": a.tta,
                                   "batch_size": a.batch_size})
     print(json.dumps({k: v for k, v in s.items() if k != "tiles"}, indent=1))

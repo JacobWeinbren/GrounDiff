@@ -51,8 +51,10 @@ def rasters_from_points(after_laz: str, before_laz: str | None, gsd: float,
     bp = read_points(before_laz, drop_classes=NOISE_CLASSES, **read_opts) if before_laz else None
     grid = Grid.from_bounds(pts.x.min(), pts.y.min(), pts.x.max(), pts.y.max(), gsd)
     arrs = build_rasters(grid, pts, bp, before_ground_classes=before_ground_classes, with_target=False)
+    from .core.io_raster import crs_wkt_from_epsg
     return ({k: v.astype(np.float64) for k, v in arrs.items()},
-            {"xmin": grid.xmin, "ymax": grid.ymax, "gsd": grid.gsd, "crs_wkt": pts.crs_wkt})
+            {"xmin": grid.xmin, "ymax": grid.ymax, "gsd": grid.gsd,
+             "crs_wkt": pts.crs_wkt or crs_wkt_from_epsg(27700)})
 
 
 def run(onnx_path: str, arrs: dict, info: dict, outputs: dict, providers: list | None = None,
