@@ -58,6 +58,55 @@ pip install -e ".[onnx,dev]"
 pytest                                 # ~70 tests, ~1 min on CPU
 ```
 
+## Mac quickstart (M3 Max)
+
+```bash
+# one-off setup
+git clone -b claude/rewrite-before-after https://github.com/JacobWeinbren/GrounDiff.git && cd GrounDiff
+python3.11 -m venv .venv && source .venv/bin/activate          # any Python 3.10-3.12
+pip install --upgrade pip && pip install torch && pip install -e ".[onnx,dev]"
+python -c "import torch; print('MPS available:', torch.backends.mps.is_available())"
+pytest -q                                                       # ~1 min, all should pass
+
+# 1. download EA tiles (~300 tiles = a few GB; --dry-run first shows the size)
+python -m groundiff.data.download --out data/laz/after --target 300 --min-per-grid 8 --dry-run
+python -m groundiff.data.download --out data/laz/after --target 300 --min-per-grid 8
+
+# 2. "before" tiles: lasground_new with default settings, on the machine with licensed LAStools
+python -m groundiff.data.lasground --in data/laz/after --out data/laz/before --cores 8 --verbose   # writes run_lasground_new.sh (.bat with --windows)
+#    run it there, copy data/laz/before back, then check the pairs:
+python -m groundiff.data.lasground check --before data/laz/before --after data/laz/after
+
+# 3. rasterise (≈ 56 MB per 500 m tile at 0.5 m) and split
+python -m groundiff.data.preprocess --after-dir data/laz/after --before-dir data/laz/before \
+    --out data/scenes_05m --gsd 0.5 --workers 8
+python -m groundiff.data.split --root data/scenes_05m --out data/split.json
+
+# 4. five-minute smoke test on the GPU
+python -m groundiff.train configs/before_after.json --set train.out_dir=runs/smoke \
+    optim.total_steps=50 train.val_every=50 train.val_max_tiles=16 train.batch_size=2
+
+# 5. full run in the background; caffeinate stops the Mac sleeping (keep it on power)
+mkdir -p runs
+caffeinate -dimsu nohup python -m groundiff.train configs/before_after.json \
+    --set train.batch_size=4 train.grad_accum=4 train.num_workers=6 train.val_max_tiles=128 \
+    > runs/before_after.out 2>&1 &
+
+# 6. watch it
+python -m groundiff.monitor runs/before_after --follow     # progress, time left, losses, memory, validation
+tail -f runs/before_after.out                              # raw log
+# stop:  pkill -f groundiff.train      resume: run step 5 again (continues from last.pt)
+
+# 7. evaluate on the held-out tiles, then export for QGIS / the PC
+python -m groundiff.infer --checkpoint runs/before_after/best.pt --scenes data/scenes_05m \
+    --split-file data/split.json --split test --out results/test
+python -m groundiff.export runs/before_after/best.pt --out models/before_after
+python tools/build_qgis_plugin.py                          # -> dist/groundiff_qgis.zip
+```
+
+If MPS runs out of memory, use `train.batch_size=2 train.grad_accum=8`, or add
+`model.use_checkpoint=true`.
+
 ## Workflow
 
 ### 1. Get tiles

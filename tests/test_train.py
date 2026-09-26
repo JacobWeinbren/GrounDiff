@@ -122,3 +122,13 @@ def test_before_after_gate_on_lasground(scenes, tmp_path):
     arrs = {n: np.load(sd / f"{n}.npy") for n in spec.needed_channels}
     res = predict_scene(arrs, spec, TorchNet(model, "cpu"), batch_size=4)
     assert "p_edit" in res and np.allclose(res["p_edit"] + res["p_ground"], 1.0, equal_nan=True)
+
+
+def test_monitor_reads_a_run(scenes, tmp_path):
+    from groundiff.monitor import summary, to_csv
+    out = tmp_path / "mon"
+    train(base_cfg(scenes, out, optim={"total_steps": 3, "warmup_steps": 1, "lr": 1e-3}))
+    s = summary(out)
+    assert "step 3/3" in s and "validation @ step 3" in s and "lasground_new RMSE" in s and "DONE" in s
+    to_csv(out, tmp_path / "c.csv")
+    assert (tmp_path / "c.csv").read_text().startswith("conf") or "loss" in (tmp_path / "c.csv").read_text()

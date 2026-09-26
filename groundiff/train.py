@@ -241,7 +241,7 @@ def train(cfg: Config, init_from: str | None = None) -> dict:
         if ema:
             ema.update(model, step)
 
-        if step % cfg.train.log_every == 0 or step == 1:
+        if step % cfg.train.log_every == 0 or step == 1 or step == cfg.optim.total_steps:
             dt = time.time() - t0
             log_event(log_path, {"event": "train", "step": step, "lr": sched.get_last_lr()[0],
                                  **{k: v / n_acc for k, v in acc.items()},
