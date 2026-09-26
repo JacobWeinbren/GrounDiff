@@ -125,7 +125,9 @@ def load_scenes(cfg: DataConfig, split: str | None) -> list[Scene]:
                   + ("..." if len(bad) > 5 else ""))
             scenes = [s for s in scenes if s.path.name not in set(bad)]
     if not scenes:
-        raise FileNotFoundError(f"no scenes for split {split!r} under {root}")
+        hint = (" (all were flagged suspect by preprocess: see its summary; to keep them set "
+                "data.include_suspect=true, or rerun preprocess with a looser gate)") if names else ""
+        raise FileNotFoundError(f"no scenes for split {split!r} under {root}{hint}")
     return scenes
 
 

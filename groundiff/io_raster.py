@@ -23,6 +23,13 @@ def crs_wkt_from_epsg(epsg: int = 27700) -> str | None:
         return None
 
 
+def _gdal_check(path):
+    """GDAL (without exceptions enabled, as in QGIS) only records write errors: raise them."""
+    from osgeo import gdal
+    if gdal.GetLastErrorType() >= gdal.CE_Failure:
+        raise OSError(f"writing {path} failed: {gdal.GetLastErrorMsg()} (disk full?)")
+
+
 def write_geotiff(path: str | Path, arr: np.ndarray, xmin: float, ymax: float, gsd: float,
                   crs_wkt: str | None = None, nodata: float = -9999.0):
     a = np.where(np.isfinite(arr), arr, nodata).astype(np.float32)
@@ -46,8 +53,11 @@ def write_geotiff(path: str | Path, arr: np.ndarray, xmin: float, ymax: float, g
         ds.SetProjection(srs.ExportToWkt())
     band = ds.GetRasterBand(1)
     band.SetNoDataValue(nodata)
+    gdal.ErrorReset()
     band.WriteArray(a)
     ds.FlushCache()
+    ds = None
+    _gdal_check(path)
 
 
 def _north_up(a: np.ndarray, gt: tuple, path) -> tuple[np.ndarray, tuple]:
@@ -142,7 +152,7 @@ def _read_window(path, xmin, ymin, xmax, ymax):
             a[a == nd] = np.nan
     if flip:
         a = a[::-1]
-    a[~(np.abs(a) < 1e30)] = np.nan          # EA rasters use -3.4e38 (float32 min) as nodata
+    a[~(np.abs(a) < 1e30) | (a < -1000)] = np.nan   # EA: -3.4e38 (float32 min); older ASC grids: -9999
     return a, info["xmin"] + c0 * res, info["ymax"] - r0 * res, res
 
 

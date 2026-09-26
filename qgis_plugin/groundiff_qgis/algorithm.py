@@ -34,8 +34,8 @@ CHANNELS = [
 ]
 PROVIDERS = [
     ("Auto (best available)", None),
-    ("NVIDIA CUDA", ["CUDAExecutionProvider", "CPUExecutionProvider"]),
     ("DirectML (any Windows GPU)", ["DmlExecutionProvider", "CPUExecutionProvider"]),
+    ("NVIDIA CUDA (needs onnxruntime-gpu with matching CUDA/cuDNN)", ["CUDAExecutionProvider", "CPUExecutionProvider"]),
     ("CoreML (Mac)", ["CoreMLExecutionProvider", "CPUExecutionProvider"]),
     ("CPU", ["CPUExecutionProvider"]),
 ]
@@ -47,10 +47,10 @@ OUTPUTS = [("dtm", "Predicted DTM"), ("p_edit", "Edit probability"),
 
 INSTALL_HINT = (
     "Install the missing packages into QGIS's Python. Windows: open the OSGeo4W Shell and run "
-    "`python -m pip install numpy scipy \"laspy[lazrs]\" onnxruntime-directml` (any GPU), or replace "
-    "onnxruntime-directml with `\"onnxruntime-gpu[cuda,cudnn]\"` (NVIDIA) or `onnxruntime` (CPU); install only "
-    "one onnxruntime package. macOS: `/Applications/QGIS.app/Contents/MacOS/bin/python3 -m pip install "
-    "scipy \"laspy[lazrs]\" onnxruntime`. pyproj is optional (CRS parsing).")
+    "`python -m pip install numpy scipy \"laspy[lazrs]\" onnxruntime-directml` (uses any GPU, NVIDIA included, "
+    "with no CUDA install); `onnxruntime` for CPU only. Install only one onnxruntime package. macOS: "
+    "`/Applications/QGIS.app/Contents/MacOS/bin/python3 -m pip install scipy \"laspy[lazrs]\" onnxruntime`. "
+    "pyproj is optional (CRS parsing).")
 
 _KEEP = []          # post-processors must outlive processAlgorithm
 
@@ -193,7 +193,7 @@ class PredictTilesAlgorithm(QgsProcessingAlgorithm):
                     _load(context, outputs[key], name, os.path.splitext(outputs[key])[0] + ".qml")
             pr = os.path.join(out, "priority.geojson")
             if os.path.exists(pr):
-                _load(context, pr, "Edit priority blocks")
+                _load(context, pr, "Edit priority blocks", os.path.join(out, "priority.qml"))
         for k, v in outputs.items():
             feedback.pushInfo(f"{k}: {v}")
         return {"OUTPUT_FOLDER": out}

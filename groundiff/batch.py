@@ -88,7 +88,7 @@ def expand_inputs(paths: list) -> list[Path]:
         for h in hits:
             hp = Path(h)
             files = (sorted(q for q in hp.rglob("*") if q.suffix.lower() in (".las", ".laz"))
-                     if hp.is_dir() else [hp])
+                     if hp.is_dir() else ([hp] if hp.suffix.lower() in (".las", ".laz") else []))
             for f in files:
                 key = str(f.resolve())
                 key = key.lower() if sys.platform.startswith("win") else key
@@ -135,9 +135,16 @@ def plan(tiles: list, gsd: float, buffer_m: float, max_block_m: float = 1000.0,
     if dup:
         lines = "; ".join(f"{k}: {', '.join(str(q) for q in v)}" for k, v in sorted(dup.items()))
         raise ValueError(f"the same tile name appears more than once (select each tile once): {lines}")
-    extents, problems = {}, {}
+    extents, problems, seen = {}, {}, {}
     for p in tiles:
         try:
+            h = header_info(p)
+            sig = (tuple(round(v, 2) for v in h["bounds"]), h["point_count"])
+            if sig in seen:                     # e.g. a renamed copy picked up by 'Add Directory'
+                log(f"[warn] {p.name} has the same extent and point count as {seen[sig].name}; "
+                    "treated as a copy and skipped")
+                continue
+            seen[sig] = p
             extents[p] = tile_extent(p, log=log)
         except Exception as e:
             problems[p.name] = f"cannot read: {e}"
@@ -207,6 +214,38 @@ def output_keys(spec: RuntimeSpec, predict_kwargs: dict | None = None) -> list[s
 
 
 OUTPUT_PRESETS = {"p_edit": "edit", "dz_before": "dz", "std": "uncertainty"}
+
+# outline-only squares (so the edit rasters stay visible), labelled with their rank for the top 50
+PRIORITY_QML = """<!DOCTYPE qgis PUBLIC 'http://mrcc.com/qgis.dtd' 'SYSTEM'>
+<qgis version="3.22" styleCategories="Symbology|Labeling">
+ <renderer-v2 type="singleSymbol">
+  <symbols>
+   <symbol type="fill" name="0" alpha="1">
+    <layer class="SimpleFill">
+     <Option type="Map">
+      <Option name="style" value="no" type="QString"/>
+      <Option name="outline_color" value="58,6,80,255" type="QString"/>
+      <Option name="outline_width" value="0.5" type="QString"/>
+      <Option name="outline_width_unit" value="MM" type="QString"/>
+     </Option>
+     <prop k="style" v="no"/>
+     <prop k="outline_color" v="58,6,80,255"/>
+     <prop k="outline_width" v="0.5"/>
+     <prop k="outline_width_unit" v="MM"/>
+    </layer>
+   </symbol>
+  </symbols>
+ </renderer-v2>
+ <labeling type="simple">
+  <settings calloutType="simple">
+   <text-style fieldName="CASE WHEN &quot;rank&quot; &lt;= 50 THEN &quot;rank&quot; END" isExpression="1"
+               fontSize="9" textColor="58,6,80,255"/>
+   <text-buffer bufferDraw="1" bufferSize="0.8" bufferColor="255,255,255,255"/>
+   <placement placement="1"/>
+  </settings>
+ </labeling>
+</qgis>
+"""
 
 
 class Priorities:
@@ -306,6 +345,7 @@ class Priorities:
             gj["crs"] = {"type": "name", "properties": {"name": f"urn:ogc:def:crs:EPSG::{epsg}"}}
         gj_path = out_dir / "priority.geojson"
         gj_path.write_text(json.dumps(gj))
+        (out_dir / "priority.qml").write_text(PRIORITY_QML)
         written = [str(csv_path), str(gj_path)]
         try:                            # shapefile for LP360 when GDAL's Python bindings exist (QGIS)
             from osgeo import gdal
@@ -348,6 +388,8 @@ def run_batch(tiles: list, out_dir: str | Path, net, spec: RuntimeSpec, *, gsd: 
     files = expand_inputs(tiles)
     if not files:
         raise ValueError("no input tiles")
+    for f in out.glob("priority.*"):           # never leave (and load) an earlier run's priority list
+        f.unlink()
     jobs, union, problems = plan(files, gsd, buffer_m, max_block_m, log)
     for name, err in problems.items():
         log(f"[error] {name}: {err}")
@@ -387,8 +429,13 @@ def run_batch(tiles: list, out_dir: str | Path, net, spec: RuntimeSpec, *, gsd: 
             rec = {"name": job.name, "tile": job.tile}
             try:
                 arrs, grid, info = pending.pop(idx).result()
+            except ImportError:
+                raise                            # missing package: stop, the caller shows how to install it
             except Exception as e:
-                arrs, rec["error"] = None, str(e)
+                msg = str(e)
+                if "LazBackend" in msg or "lazrs" in msg or "laszip" in msg:
+                    raise ImportError(f"LAZ support missing ({msg}); install laspy[lazrs]") from e
+                arrs, rec["error"] = None, msg
             submit_upto(max(1, workers) + 1)
             if arrs is None:
                 log(f"[error] {job.name}: {rec['error']}")

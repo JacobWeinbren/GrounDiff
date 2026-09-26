@@ -51,7 +51,7 @@ def denormalise(xn, lo, scale):
 
 HEIGHT_CHANNELS = {"dsm_max", "dsm_min", "dsm_last", "dtm_before", "gt_dtm"}
 NEAREST_CHANNELS = {"has_return", "sem_ground", "sem_nonground", "gt_valid", "before_valid", "top_ground",
-                    "in_survey"}
+                    "in_survey", "flat_water"}
 FILL_CHANNELS = {"dsm_max", "dsm_min", "dsm_last", "dtm_before"}
 
 

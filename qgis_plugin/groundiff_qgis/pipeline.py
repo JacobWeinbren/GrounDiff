@@ -122,9 +122,8 @@ def run_tiles(onnx_path: str, tiles: list, out_dir: str, providers: list | None 
     from .core.backends import OnnxNet
     from .core.batch import run_batch
 
-    tiles = [f for f in tiles if str(f).lower().endswith((".las", ".laz"))]
     if not tiles:
-        raise ValueError("no .las/.laz files selected")
+        raise ValueError("no .las/.laz files selected")           # folders and wildcards are expanded by run_batch
     spec = load_spec(onnx_path)
     net = OnnxNet(onnx_path, providers)
     log(f"ONNX Runtime providers: {net.providers}")

@@ -186,9 +186,13 @@ def extract(zpath: Path, out: Path) -> list[Path]:
     got = []
     with zipfile.ZipFile(zpath) as z:
         for info in z.infolist():
-            name = Path(info.filename).name
+            rel = Path(info.filename)
+            if rel.is_absolute() or ".." in rel.parts:
+                continue                                   # never write outside out/
+            name = rel.name
             if name.lower().endswith((".tif", ".tiff", ".tfw", ".gpkg", ".xml")):
-                target = out / name
+                target = out / Path(zpath).stem / rel           # zip-relative: survey subfolders stay apart
+                target.parent.mkdir(parents=True, exist_ok=True)
                 with z.open(info) as src, open(target, "wb") as dst:
                     while chunk := src.read(1 << 20):
                         dst.write(chunk)

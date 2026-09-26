@@ -278,7 +278,8 @@ Cost (estimates): ≈ 1 TFLOP per 256² tile per training step, so the paper's
 few hours on a recent 16 GB NVIDIA card. Memory at 256² tiles: batch 4 fp32
 ≈ 10–13 GB; batch 8 bf16 ≈ 15.5–17 GB (too much for 16 GB without
 checkpointing); batch 16 fp32 ≈ 35–46 GB. Accumulation 4 × 4 is close to, not
-exactly, batch 16 (loss means are per micro-batch). Inference needs ≈ 0.5 GB.
+exactly, batch 16 (loss means are per micro-batch). Inference needs ≈ 2–3 GB of GPU memory at the default 8 network tiles per batch
+(lower "Network tiles per batch" on small GPUs).
 
 ### Evaluate on held-out scenes
 
@@ -351,9 +352,11 @@ Install with *Plugins → Manage and Install Plugins → Install from ZIP*, then
 add the runtime to QGIS's Python:
 
 * Windows (OSGeo4W Shell): `python -m pip install numpy scipy "laspy[lazrs]" onnxruntime-directml`
-  (any GPU), or replace `onnxruntime-directml` with `"onnxruntime-gpu[cuda,cudnn]"`
-  (NVIDIA, CUDA libraries included) or `onnxruntime` (CPU). Install only one
-  onnxruntime package.
+  — DirectML uses any GPU (NVIDIA included) with no CUDA install; choose
+  "DirectML" as the device. `onnxruntime` instead gives CPU only. The CUDA
+  build (`onnxruntime-gpu`) needs CUDA/cuDNN versions matching QGIS's Python
+  and often fails inside QGIS; the log warns if a requested GPU is not used.
+  Install only one onnxruntime package.
 * macOS: `/Applications/QGIS.app/Contents/MacOS/bin/python3 -m pip install scipy "laspy[lazrs]" onnxruntime`
 * pyproj is optional.
 

@@ -57,11 +57,24 @@ def laz(tmp_path_factory):
     return root, after, before
 
 
-def _dtm(root, offset=0.0, name="dtm"):
+def _dtm(root, offset=0.0, name="dtm", noise=0.0, analytic=False):
+    """A stand-in EA DTM built as the EA does: TIN of the survey's (edited)
+    ground points at 1 m cell centres. noise > 0 imitates a DTM from another
+    survey (independent measurement noise); analytic=True uses the terrain
+    function instead of the points."""
+    from groundiff.data.laz import read_points
+    from groundiff.data.rasterise import tin_dtm
     d = root / name
     d.mkdir(exist_ok=True)
-    fn = lambda X, Y: terrain(X - X0, Y - Y0) + offset
-    write_geotiff(d / "SX00sw.tif", raster_of(fn, X0, Y0 + 100, 100, 100, 1.0), X0, Y0 + 100, 1.0)
+    g = Grid(X0, Y0 + 100, 1.0, 100, 100)
+    if analytic:
+        z = raster_of(lambda X, Y: terrain(X - X0, Y - Y0), X0, Y0 + 100, 100, 100, 1.0)
+    else:
+        pts = read_points(root / "laz" / "after" / "SX0000_dtm.las")
+        k = pts.cls == 2
+        z, _ = tin_dtm(g, pts.x[k], pts.y[k], pts.z[k])
+    z = z + offset + (np.random.default_rng(1).normal(0, noise, z.shape) if noise else 0.0)
+    write_geotiff(d / "SX00sw.tif", np.round(z, 3), X0, Y0 + 100, 1.0)          # EA values are on whole mm
     return d
 
 
@@ -73,14 +86,38 @@ def test_process_scene_with_dtm_target(laz):
     meta = process_scene(before, root / "scenes", dtm_paths=hits, gsd=1.0)
     assert meta["target"] == "dtm_raster" and not meta["quality"]["suspect"]
     assert meta["quality"]["agree_frac"] > 0.8
+    assert meta["quality"]["exact_frac"] > 0.8                           # same survey: matches the ground TIN
     sd = root / "scenes" / "SX0000_dtm"
     gt, ok = np.load(sd / "gt_dtm.npy"), np.load(sd / "gt_valid.npy") > 0.5
     g = meta["grid"]
-    truth = raster_of(lambda X, Y: terrain(X - X0, Y - Y0), g["xmin"], g["ymax"], g["width"], g["height"], 1.0)
-    assert ok.mean() > 0.9 and np.abs(gt - truth)[ok].max() < 1e-4       # raster values copied exactly
+    from groundiff.io_raster import read_geotiff
+    src, info = read_geotiff(d / "SX00sw.tif")
+    c0, r0 = int(round(g["xmin"] - info["xmin"])), int(round(info["ymax"] - g["ymax"]))
+    ref = src[r0:r0 + g["height"], c0:c0 + g["width"]]
+    assert ok.mean() > 0.9 and np.abs(gt - ref)[ok].max() < 1e-4        # raster values copied exactly
     assert not (sd / "top_ground.npy").exists()
     # cached on the second call; re-made when the target changes
     assert process_scene(before, root / "scenes", dtm_paths=hits, gsd=1.0) is None
+
+
+def test_quality_gate_flags_other_survey(laz):
+    """A DTM from another survey agrees within 0.2 m almost everywhere, but
+    not within 5 mm on open ground."""
+    root, _, before = laz
+    d = _dtm(root, noise=0.03, name="dtm_other")
+    meta = process_scene(before, root / "scenes_other", dtm_paths=rasters_for((X0, Y0, X0 + 96, Y0 + 96),
+                                                                                index_rasters(d)), gsd=1.0)
+    q = meta["quality"]
+    assert q["agree_frac"] > 0.9 and q["exact_frac"] < 0.15 and q["suspect"]
+
+
+def test_flat_water_is_not_a_target():
+    from groundiff.data.rasterise import flat_areas
+    rng = np.random.default_rng(0)
+    z = np.round(50 + np.cumsum(rng.normal(0, 0.01, (60, 60)), 1), 3)   # mm-rounded natural surface
+    z[10:30, 20:45] = 2.48                                              # flattened river
+    m = flat_areas(z)
+    assert m[10:30, 20:45].all() and m.sum() == 20 * 25
 
 
 def test_quality_gate_flags_mismatched_target(laz):

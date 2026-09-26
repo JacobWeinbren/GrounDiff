@@ -111,12 +111,16 @@ def write_rgba_geotiff(path: str | Path, rgba: np.ndarray, xmin: float, ymax: fl
             srs = osr.SpatialReference()
             srs.ImportFromWkt(crs_wkt)
             ds.SetProjection(srs.ExportToWkt())
+        gdal.ErrorReset()
         for i in range(n):
             b = ds.GetRasterBand(i + 1)
             b.WriteArray(bands[..., i])
             if not alpha:
                 b.SetNoDataValue(0)
         ds.FlushCache()
+        ds = None
+        if gdal.GetLastErrorType() >= gdal.CE_Failure:
+            raise OSError(f"writing {path} failed: {gdal.GetLastErrorMsg()} (disk full?)")
     _write_sidecars(path, xmin, ymax, gsd, crs_wkt)
 
 

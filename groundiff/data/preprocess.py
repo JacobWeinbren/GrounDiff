@@ -94,10 +94,18 @@ def check_lasground_classes(hist: dict, max_other: float = 0.005) -> str | None:
     return None
 
 
-def quality(arrs: dict, alpha: float = 0.2) -> dict:
-    """Agreement of the target with lasground_new where lasground_new says
-    ground: most such cells need no edit, so a low share means the target
-    does not belong to this point cloud."""
+def quality(arrs: dict, alpha: float = 0.2, ground_tin: np.ndarray | None = None) -> dict:
+    """Does the target belong to this point cloud?
+
+    agree_frac / median_dz: agreement within alpha where lasground_new says
+    ground (or, points only, on open ground against the lowest return).
+    exact_frac: share of open-ground cells (single returns, < 5 cm spread)
+    where the target equals a TIN of the tile's own ground points within
+    5 mm. The EA DTM is a TIN of the same survey's edited ground at cell
+    centres, so a same-survey DTM matches almost exactly on open ground
+    (0.4-1.0 in tests), a DTM from another survey does not (0.002-0.05),
+    although both pass agree_frac. ground_tin: the reference for points-only
+    scenes (TIN of the published ground class, used for this check only)."""
     q = {}
     ok = np.isfinite(arrs["gt_dtm"]) & (np.nan_to_num(arrs["gt_valid"]) > 0.5)
     survey = np.nan_to_num(arrs["in_survey"]) > 0.5
@@ -119,11 +127,25 @@ def quality(arrs: dict, alpha: float = 0.2) -> dict:
         d = (arrs["gt_dtm"] - ref)[g].astype(np.float64)
         q["median_dz"] = float(np.median(d))
         q["agree_frac"] = float((np.abs(d) < alpha).mean())
+    tin = arrs.get("dtm_before", ground_tin)
+    if tin is not None:
+        open_ = (ok & np.isfinite(tin) & (np.nan_to_num(arrs["z_std"], nan=9.0) < 0.05)
+                 & (np.nan_to_num(arrs.get("echoes", np.ones_like(tin)), nan=9.0) <= 1.05))
+        if "sem_ground" in arrs:
+            open_ &= np.nan_to_num(arrs["sem_ground"]) > 0.5
+        q["n_open_cells"] = int(open_.sum())
+        if open_.sum() >= 200:
+            q["exact_frac"] = float((np.abs(arrs["gt_dtm"] - tin)[open_] <= 0.005).mean())
     return q
 
 
-def is_suspect(q: dict, min_agree: float = 0.6, max_offset: float = 0.15, min_coverage: float = 0.5) -> list:
+def is_suspect(q: dict, min_agree: float = 0.6, max_offset: float = 0.15, min_coverage: float = 0.8,
+               min_exact: float = 0.15) -> list:
     why = []
+    if min_exact and q.get("exact_frac") is not None and q["exact_frac"] < min_exact:
+        why.append(f"only {q['exact_frac']:.0%} of open-ground cells match the tile's ground within 5 mm: "
+                   "the DTM probably comes from another survey (if every tile says this, the DTMs are built "
+                   "differently than assumed: rerun with --min-exact 0 and send the summary)")
     if q.get("canopy_gap_m") is not None and q["canopy_gap_m"] < 1.0:
         why.append(f"target follows the tree/building tops (median {q['canopy_gap_m']:.2f} m below the highest "
                    "return where there are several echoes): a DSM, not a DTM?")
@@ -179,6 +201,13 @@ def process_scene(before: Path, out_root: Path, *, dtm_paths: list | None = None
     grid = Grid.from_bounds(pts.x.min(), pts.y.min(), pts.x.max(), pts.y.max(), gsd)
     arrs = input_rasters(grid, pts, lasground, before_ground_classes, coverage_close_m)
     survey = arrs["in_survey"] > 0.5
+    ground_tin = None
+    if not lasground and dtm_paths:            # published ground class: for the quality check only, never an input
+        from .rasterise import tin_dtm
+        g2 = pts.cls == 2
+        if g2.sum() >= 3:
+            ground_tin, ok_tin = tin_dtm(grid, pts.x[g2], pts.y[g2], pts.z[g2])
+            ground_tin = np.where(ok_tin & survey, ground_tin, np.nan)
     meta = {"schema": SCHEMA, "scene": name, "gsd": gsd, "grid": grid.to_dict(),
             "crs_wkt": pts.crs_wkt or _default_crs(), "before_file": str(before), "n_points": len(pts),
             "class_hist_before": hist, "has_before": lasground, "lasground": lasground,
@@ -193,7 +222,7 @@ def process_scene(before: Path, out_root: Path, *, dtm_paths: list | None = None
                      "class_hist_after": class_histogram(ap.cls)})
         if len(ap) != len(pts):
             meta["warning"] = f"before/after point counts differ ({len(pts)} vs {len(ap)})"
-    q = quality(arrs)
+    q = quality(arrs, ground_tin=ground_tin)
     why = is_suspect(q, **(gate or {}))
     meta["quality"] = {**q, "suspect": bool(why), "reasons": why}
     meta["coverage_close_m"] = coverage_close_m
@@ -286,6 +315,9 @@ def main(argv=None):
     ap.add_argument("--keep-withheld", action="store_true")
     ap.add_argument("--min-agree", type=float, default=0.6, help="quality gate, see module doc")
     ap.add_argument("--max-offset", type=float, default=0.15, help="quality gate, metres")
+    ap.add_argument("--min-exact", type=float, default=0.15,
+                    help="quality gate: min share of open-ground cells matching the ground TIN within 5 mm "
+                         "(catches DTMs from another survey); 0 disables")
     ap.add_argument("--geotiff", action="store_true", help="also write every channel as GeoTIFF")
     ap.add_argument("--overwrite", action="store_true")
     a = ap.parse_args(argv)
@@ -294,7 +326,7 @@ def main(argv=None):
     lasground = a.before_dir is not None
     a.out.mkdir(parents=True, exist_ok=True)
     ro = {"drop_overlap": a.drop_overlap, "drop_synthetic": a.drop_synthetic, "drop_withheld": not a.keep_withheld}
-    gate = {"min_agree": a.min_agree, "max_offset": a.max_offset}
+    gate = {"min_agree": a.min_agree, "max_offset": a.max_offset, "min_exact": a.min_exact}
     jobs = []
     if a.dtm_dir:
         from .laz import header_info
@@ -319,7 +351,7 @@ def main(argv=None):
             print(f"[warn] {len(missing)} tiles have no after file and are skipped: {missing[:5]}...")
         jobs = [(p, {"after": after[k]}) for k, p in before.items() if k in after]
     print(f"{len(jobs)} scenes -> {a.out}")
-    failures, suspect = 0, 0
+    failures, suspect, exact = 0, 0, []
     with ProcessPoolExecutor(max_workers=max(1, a.workers)) as ex:
         futures = {ex.submit(process_scene, p, a.out, gsd=a.gsd, ground_classes=tuple(a.ground_classes),
                              lasground=lasground, overwrite=a.overwrite, read_opts=ro, gate=gate,
@@ -337,9 +369,15 @@ def main(argv=None):
                 continue
             q = meta["quality"]
             suspect += q["suspect"]
+            if q.get("exact_frac") is not None:
+                exact.append(q["exact_frac"])
             print(f"  {name}: {meta['seconds']} s, agree {q.get('agree_frac', float('nan')):.0%}"
                   + (f"  SUSPECT: {'; '.join(q['reasons'])}" if q["suspect"] else ""))
     print(f"done: {len(jobs) - failures} scenes ({suspect} suspect, skipped by training), {failures} failed")
+    if exact:
+        qs = np.quantile(exact, [0.1, 0.25, 0.5, 0.75, 0.9])
+        print("open-ground cells matching the ground TIN within 5 mm (same survey expected >= 0.4, other survey "
+              "<= 0.05): 10/25/50/75/90 % = " + " / ".join(f"{v:.2f}" for v in qs))
     return 1 if failures else 0
 
 

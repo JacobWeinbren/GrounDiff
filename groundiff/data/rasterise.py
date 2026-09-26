@@ -195,16 +195,43 @@ def target_from_points(grid: Grid, after, survey: np.ndarray, ground_classes=(2,
             "top_ground": top_return_is(grid, after.x, after.y, after.z, g)}
 
 
-def target_from_rasters(grid: Grid, paths: list, survey: np.ndarray) -> dict:
+def flat_areas(z: np.ndarray, min_cells: int = 50) -> np.ndarray:
+    """Connected areas of exactly equal value (4-neighbours) of at least
+    min_cells: hydro-flattened water in EA DTMs (e.g. a river set to 2.48 m
+    over 100,000+ cells). Natural terrain gives equal runs of a few cells at
+    most, even with values rounded to the millimetre."""
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+
+    H, W = z.shape
+    idx = np.arange(H * W).reshape(H, W)
+    fin = np.isfinite(z)
+    eh = fin[:, :-1] & fin[:, 1:] & (z[:, :-1] == z[:, 1:])
+    ev = fin[:-1, :] & fin[1:, :] & (z[:-1, :] == z[1:, :])
+    a = np.concatenate([idx[:, :-1][eh], idx[:-1, :][ev]])
+    b = np.concatenate([idx[:, 1:][eh], idx[1:, :][ev]])
+    if a.size == 0:
+        return np.zeros((H, W), bool)
+    g = coo_matrix((np.ones(a.size, np.int8), (a, b)), shape=(H * W, H * W))
+    _, lab = connected_components(g, directed=False)
+    sizes = np.bincount(lab)
+    return (sizes[lab] >= min_cells).reshape(H, W)
+
+
+def target_from_rasters(grid: Grid, paths: list, survey: np.ndarray, flat_min_cells: int = 50) -> dict:
     """Target DTM from published DTM rasters (the EA product), sampled at
     our cell centres (exact copy when the grids coincide, e.g. gsd 1 m on
-    the whole-metre OS grid)."""
+    the whole-metre OS grid). Hydro-flattened water (flat_areas) is excluded
+    from the target: its level is a production choice the points cannot show."""
     from ..io_raster import sample_rasters
 
     xs, ys = grid.cell_centres()
     gt = sample_rasters(paths, xs, ys)
     ok = np.isfinite(gt) & survey
-    return {"gt_dtm": np.where(ok, gt, np.nan).astype(np.float32), "gt_valid": ok.astype(np.float32)}
+    flat = flat_areas(gt, flat_min_cells) if flat_min_cells else np.zeros_like(ok)
+    ok &= ~flat
+    return {"gt_dtm": np.where(ok, gt, np.nan).astype(np.float32), "gt_valid": ok.astype(np.float32),
+            "flat_water": flat.astype(np.float32)}
 
 
 def build_rasters(grid: Grid, pts, before=None, ground_classes=(2,), before_ground_classes=(2,),
