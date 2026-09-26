@@ -11,8 +11,8 @@ import zipfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
-CORE_FILES = ["runtime.py", "normalise.py", "io_raster.py", "backends.py", "schedule.py",
-              "data/rasterise.py", "data/laz.py"]
+CORE_FILES = ["runtime.py", "normalise.py", "io_raster.py", "backends.py", "schedule.py", "overlay.py",
+              "batch.py", "data/rasterise.py", "data/laz.py", "data/lasinspect.py", "data/preprocess.py"]
 
 
 def build(dest: Path) -> Path:

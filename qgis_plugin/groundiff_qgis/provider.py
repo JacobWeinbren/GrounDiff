@@ -1,11 +1,13 @@
 from qgis.core import QgsProcessingProvider
 
-from .algorithm import PredictDtmAlgorithm
+from .algorithm import InspectLasAlgorithm, PredictRastersAlgorithm, PredictTilesAlgorithm
 
 
 class GrounDiffProvider(QgsProcessingProvider):
     def loadAlgorithms(self):
-        self.addAlgorithm(PredictDtmAlgorithm())
+        self.addAlgorithm(PredictTilesAlgorithm())
+        self.addAlgorithm(PredictRastersAlgorithm())
+        self.addAlgorithm(InspectLasAlgorithm())
 
     def id(self):
         return "groundiff"

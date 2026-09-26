@@ -1,11 +1,11 @@
 """QGIS-independent logic of the plugin (testable without QGIS).
 
-Two ways to supply inputs:
-  * rasters: one GeoTIFF per channel name (as written by `groundiff.infer`
-    or produced in QGIS), all on the same grid;
-  * point clouds: the EA LAZ/COPC tile and, for before -> after models, the
-    same tile re-classified by lasground_new; rasters are built exactly as
-    in training (core/data/rasterise.py).
+Inputs:
+  * point-cloud tiles (any number): the EA/LP360 LAS/LAZ/COPC tiles and, for
+    before -> after models, the same tiles re-classified by lasground_new
+    (paired by file name). Processed with neighbour buffers into one set of
+    mosaic GeoTIFFs in an output folder (core/batch.py);
+  * rasters: one GeoTIFF per channel name, all on one grid.
 """
 from __future__ import annotations
 
@@ -14,7 +14,10 @@ from pathlib import Path
 import numpy as np
 
 from .core.io_raster import read_geotiff, write_geotiff
+from .core.overlay import write_overlays
 from .core.runtime import RuntimeSpec, predict_scene
+
+OVERLAY_PRESET = {"p_edit": "edit", "dz_before": "dz", "std": "uncertainty"}
 
 
 def load_spec(onnx_path: str) -> RuntimeSpec:
@@ -38,27 +41,24 @@ def rasters_from_files(paths: dict) -> tuple[dict, dict]:
 
 
 def rasters_from_points(after_laz: str, before_laz: str | None, gsd: float,
-                        before_ground_classes=(2,)) -> tuple[dict, dict]:
+                        before_ground_classes=(2,), read_opts: dict | None = None) -> tuple[dict, dict]:
+    """One tile, no neighbour buffer (use run_tiles for several tiles)."""
     from .core.data.laz import NOISE_CLASSES, read_points
-    from .core.data.rasterise import Grid, class_mode_onehot, rasterise_points, tin_dtm
+    from .core.data.rasterise import Grid, build_rasters
 
-    pts = read_points(after_laz, drop_classes=NOISE_CLASSES)
+    read_opts = read_opts or {}
+    pts = read_points(after_laz, drop_classes=NOISE_CLASSES, **read_opts)
+    bp = read_points(before_laz, drop_classes=NOISE_CLASSES, **read_opts) if before_laz else None
     grid = Grid.from_bounds(pts.x.min(), pts.y.min(), pts.x.max(), pts.y.max(), gsd)
-    arrs = {k: v.astype(np.float64) for k, v in
-            rasterise_points(grid, pts.x, pts.y, pts.z, pts.return_number, pts.number_of_returns).items()}
-    if before_laz:
-        bp = read_points(before_laz, drop_classes=NOISE_CLASSES)
-        bg = np.isin(bp.cls, np.asarray(before_ground_classes, np.uint8))
-        dtm_b, _ = tin_dtm(grid, bp.x[bg], bp.y[bg], bp.z[bg])
-        arrs["dtm_before"] = dtm_b.astype(np.float64)
-        sem = class_mode_onehot(grid, bp.x, bp.y, bg)
-        arrs["sem_ground"], arrs["sem_nonground"] = sem[0], sem[1]
-    return arrs, {"xmin": grid.xmin, "ymax": grid.ymax, "gsd": grid.gsd, "crs_wkt": pts.crs_wkt}
+    arrs = build_rasters(grid, pts, bp, before_ground_classes=before_ground_classes, with_target=False)
+    return ({k: v.astype(np.float64) for k, v in arrs.items()},
+            {"xmin": grid.xmin, "ymax": grid.ymax, "gsd": grid.gsd, "crs_wkt": pts.crs_wkt})
 
 
 def run(onnx_path: str, arrs: dict, info: dict, outputs: dict, providers: list | None = None,
         stride: int | None = None, blend: str = "min", prior: str = "auto", n_samples: int = 1,
-        tta: bool = False, batch_size: int = 8, seed: int = 0, progress=None, crs_wkt: str | None = None) -> dict:
+        tta: bool = False, batch_size: int = 8, seed: int = 0, progress=None, crs_wkt: str | None = None,
+        overlays: bool = True) -> dict:
     """outputs: {"dtm", "p_ground", "p_edit", "std", "dz_before"} -> path; empty or missing are skipped."""
     from .core.backends import OnnxNet
 
@@ -75,5 +75,45 @@ def run(onnx_path: str, arrs: dict, info: dict, outputs: dict, providers: list |
         if path and key in res:
             write_geotiff(path, res[key], info["xmin"], info["ymax"], info["gsd"], crs)
             written[key] = path
+            preset = OVERLAY_PRESET.get(key) or ("low_confidence" if key == "p_ground" and "p_edit" not in res else None)
+            if overlays and preset:
+                stem = Path(path).with_suffix("")
+                written[f"{key}_overlays"] = [str(p) for p in
+                                              write_overlays(res[key], stem, preset, info["xmin"], info["ymax"],
+                                                             info["gsd"], crs)]
     written["providers"] = net.providers
     return written
+
+
+def inspect_report(path: str, compare_to: str | None = None) -> str:
+    from .core.data.lasinspect import compare, inspect
+    lines = []
+    reps = [inspect(path)] + ([inspect(compare_to)] if compare_to else [])
+    for r in reps:
+        lines.append(f"== {r['file']}")
+        lines += [f"  {k}: {v}" for k, v in r.items() if k not in ("file", "warnings")]
+        lines += [f"  WARNING: {w}" for w in r["warnings"]]
+    if compare_to:
+        lines.append("== differences (first | second)")
+        lines += [f"  {k}: {v}" for k, v in compare(reps[0], reps[1]).items()]
+    return "\n".join(lines)
+
+
+def run_tiles(onnx_path: str, after_files: list, out_dir: str, before_files: list | None = None,
+              providers: list | None = None, gsd: float = 0.5, buffer_m: float = 64.0, workers: int = 2,
+              read_opts: dict | None = None, overlays: bool = True, predict_kwargs: dict | None = None,
+              progress=None, log=print, cancelled=lambda: False) -> dict:
+    from .core.backends import OnnxNet
+    from .core.batch import run_batch
+
+    exts = (".las", ".laz")
+    after_files = [f for f in after_files if str(f).lower().endswith(exts)]
+    before_files = [f for f in (before_files or []) if str(f).lower().endswith(exts)]
+    if not after_files:
+        raise ValueError("no .las/.laz files selected")
+    spec = load_spec(onnx_path)
+    net = OnnxNet(onnx_path, providers)
+    log(f"ONNX Runtime providers: {net.providers}")
+    return run_batch(after_files, out_dir, net, spec, before_files=before_files, gsd=gsd, buffer_m=buffer_m,
+                     workers=workers, read_opts=read_opts, overlays=overlays, predict_kwargs=predict_kwargs,
+                     progress=progress, log=log, cancelled=cancelled)

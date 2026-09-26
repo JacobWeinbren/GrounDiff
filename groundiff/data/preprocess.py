@@ -29,7 +29,7 @@ from pathlib import Path
 import numpy as np
 
 from .laz import NOISE_CLASSES, class_histogram, read_points
-from .rasterise import Grid, class_mode_onehot, rasterise_points, tin_dtm, top_return_is
+from .rasterise import Grid, build_rasters
 
 SCHEMA = 2
 LAZ_SUFFIXES = (".laz", ".las")
@@ -49,7 +49,9 @@ def _save(out: Path, name: str, arr: np.ndarray):
 
 def process_scene(after: Path, out_root: Path, before: Path | None = None, gsd: float = 0.5,
                   ground_classes=(2, 9), before_ground_classes=(2,),
-                  overwrite: bool = False) -> dict | None:
+                  overwrite: bool = False, read_opts: dict | None = None) -> dict | None:
+    """read_opts: drop_overlap / drop_synthetic / drop_withheld for read_points."""
+    read_opts = read_opts or {}
     name = scene_name(after)
     out = out_root / name
     meta_path = out / "meta.json"
@@ -61,33 +63,20 @@ def process_scene(after: Path, out_root: Path, before: Path | None = None, gsd: 
     out.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
 
-    pts = read_points(after, drop_classes=NOISE_CLASSES)
+    pts = read_points(after, drop_classes=NOISE_CLASSES, **read_opts)
     grid = Grid.from_bounds(pts.x.min(), pts.y.min(), pts.x.max(), pts.y.max(), gsd)
-    rasters = rasterise_points(grid, pts.x, pts.y, pts.z, pts.return_number, pts.number_of_returns)
-    for k, v in rasters.items():
+    # The before file is used as lasground_new wrote it (only its own noise
+    # classes are dropped) so no EA editing leaks into the inputs.
+    bp = read_points(before, drop_classes=NOISE_CLASSES, **read_opts) if before is not None else None
+    for k, v in build_rasters(grid, pts, bp, ground_classes, before_ground_classes).items():
         _save(out, k, v)
-    g = np.isin(pts.cls, np.asarray(ground_classes, np.uint8))
-    gt, gt_valid = tin_dtm(grid, pts.x[g], pts.y[g], pts.z[g])
-    _save(out, "gt_dtm", gt)
-    _save(out, "gt_valid", gt_valid.astype(np.float32))
-    _save(out, "top_ground", top_return_is(grid, pts.x, pts.y, pts.z, g))
     meta = {
         "schema": SCHEMA, "scene": name, "gsd": gsd, "grid": grid.to_dict(),
         "crs_wkt": pts.crs_wkt, "after_file": str(after), "n_points": len(pts),
         "ground_classes": list(ground_classes), "class_hist_after": class_histogram(pts.cls),
-        "has_before": before is not None,
+        "has_before": before is not None, "read_opts": read_opts,
     }
-    if before is not None:
-        # The before file is used as lasground_new wrote it (only its own noise
-        # classes are dropped) so no EA editing leaks into the inputs.
-        bp = read_points(before, drop_classes=NOISE_CLASSES)
-        bg = np.isin(bp.cls, np.asarray(before_ground_classes, np.uint8))
-        dtm_b, b_valid = tin_dtm(grid, bp.x[bg], bp.y[bg], bp.z[bg])
-        _save(out, "dtm_before", dtm_b)
-        _save(out, "before_valid", b_valid.astype(np.float32))
-        sem = class_mode_onehot(grid, bp.x, bp.y, bg)
-        _save(out, "sem_ground", sem[0])
-        _save(out, "sem_nonground", sem[1])
+    if bp is not None:
         meta.update({"before_file": str(before), "n_points_before": len(bp),
                      "before_ground_classes": list(before_ground_classes),
                      "class_hist_before": class_histogram(bp.cls)})
@@ -114,6 +103,9 @@ def main(argv=None):
                     help="classes forming the target DTM (default: ground + water)")
     ap.add_argument("--before-ground-classes", type=int, nargs="+", default=[2])
     ap.add_argument("--workers", type=int, default=1)
+    ap.add_argument("--drop-overlap", action="store_true", help="drop overlap-flagged / class 12 points")
+    ap.add_argument("--drop-synthetic", action="store_true", help="drop synthetic-flagged points")
+    ap.add_argument("--keep-withheld", action="store_true")
     ap.add_argument("--overwrite", action="store_true")
     a = ap.parse_args(argv)
 
@@ -125,8 +117,10 @@ def main(argv=None):
             print(f"[warn] {len(missing)} scenes have no before file and are skipped: {missing[:5]}...")
         after = {k: v for k, v in after.items() if k in before}
     a.out.mkdir(parents=True, exist_ok=True)
+    ro = {"drop_overlap": a.drop_overlap, "drop_synthetic": a.drop_synthetic,
+          "drop_withheld": not a.keep_withheld}
     jobs = [(p, a.out, before.get(k), a.gsd, tuple(a.ground_classes),
-             tuple(a.before_ground_classes), a.overwrite) for k, p in after.items()]
+             tuple(a.before_ground_classes), a.overwrite, ro) for k, p in after.items()]
     print(f"{len(jobs)} scenes -> {a.out}")
     failures = 0
     with ProcessPoolExecutor(max_workers=max(1, a.workers)) as ex:

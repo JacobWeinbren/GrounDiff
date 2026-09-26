@@ -11,7 +11,9 @@ Outputs per scene (GeoTIFF, same grid as the inputs):
     std.tif          spread across samples / TTA views (m), with --samples > 1 or --tta
     dz_before.tif    predicted DTM - lasground_new DTM (m): the predicted edit
     error.tif        predicted DTM - reference DTM (m), when a reference exists
-and, when a reference DTM exists, metrics.json (model and lasground_new vs
+plus coloured overlays for LP360 (see overlay.py): p_edit_overlay.tif (RGBA),
+p_edit_overlay_rgb.tif (RGB + nodata), likewise for dz_before and std, and
+QGIS .qml styles. And, when a reference DTM exists, metrics.json (model and lasground_new vs
 reference; GrounDiff's RMSE/MAE/Type I/II/total plus ResDepth's MedAE/NMAD).
 
 priority.csv ranks square blocks (default 100 m) by predicted edit size,
@@ -32,6 +34,7 @@ import numpy as np
 
 from .io_raster import write_geotiff
 from .metrics import dtm_metrics
+from .overlay import write_overlays
 from .runtime import RuntimeSpec, predict_scene
 
 
@@ -46,6 +49,20 @@ def load_net(checkpoint: str | None, onnx: str | None, device: str = "auto"):
     dev = pick_device(device)
     model, cfg, _ = load_model(checkpoint, dev)
     return TorchNet(model, dev), RuntimeSpec.from_config(cfg)
+
+
+def overlay_presets(res: dict) -> list[tuple[str, str]]:
+    """Which rasters get LP360-ready colour overlays."""
+    out = []
+    if "p_edit" in res:
+        out.append(("p_edit", "edit"))
+    elif "p_ground" in res:
+        out.append(("p_ground", "low_confidence"))
+    if "dz_before" in res:
+        out.append(("dz_before", "dz"))
+    if "std" in res:
+        out.append(("std", "uncertainty"))
+    return out
 
 
 def block_priorities(dz: np.ndarray, gsd: float, block_m: float, std: np.ndarray | None = None,
@@ -100,6 +117,9 @@ def run_scene(scene_dir: Path, net, spec: RuntimeSpec, out_dir: Path, args) -> d
     for k in ("dtm", "p_ground", "p_edit", "std", "dz_before", "prior"):
         if k in res:
             write_geotiff(out_dir / f"{k}.tif", res[k], *geo)
+    if not getattr(args, "no_overlays", False):
+        for k, preset in overlay_presets(res):
+            write_overlays(res[k], out_dir / k, preset, *geo)
     summary = {"scene": meta["scene"]}
     true_dz = None
     if "gt_dtm" in arrs:
@@ -148,6 +168,7 @@ def main(argv=None):
     ap.add_argument("--batch-size", type=int, default=8)
     ap.add_argument("--block-m", type=float, default=100.0)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--no-overlays", action="store_true", help="skip the coloured RGBA overlays")
     a = ap.parse_args(argv)
 
     net, spec = load_net(a.checkpoint, a.onnx, a.device)

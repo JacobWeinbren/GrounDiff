@@ -59,3 +59,55 @@ def read_geotiff(path: str | Path) -> tuple[np.ndarray, dict]:
     if gt[2] or gt[4] or abs(gt[1]) != abs(gt[5]):
         raise ValueError(f"{path}: only north-up rasters with square pixels are supported")
     return a, {"xmin": gt[0], "ymax": gt[3], "gsd": gt[1], "crs_wkt": ds.GetProjection() or None}
+
+
+def build_vrt(vrt_path: str | Path, tiles: list, width: int, height: int, xmin: float, ymax: float,
+              gsd: float, crs_wkt: str | None, bands: int = 1, dtype: str = "Float32",
+              nodata: float | None = -9999.0, colorinterp: list | None = None) -> Path:
+    """Write a GDAL VRT mosaic. tiles: [(path, row0, col0, h, w)] on the mosaic grid.
+    Float tiles use ComplexSource with NODATA so a tile's no-data never hides a
+    neighbour's data."""
+    from xml.sax.saxutils import escape
+    vrt_path = Path(vrt_path)
+    out = [f'<VRTDataset rasterXSize="{width}" rasterYSize="{height}">']
+    if crs_wkt:
+        out.append(f"  <SRS>{escape(crs_wkt)}</SRS>")
+    out.append(f"  <GeoTransform>{xmin!r}, {gsd!r}, 0.0, {ymax!r}, 0.0, {-gsd!r}</GeoTransform>")
+    for b in range(1, bands + 1):
+        out.append(f'  <VRTRasterBand dataType="{dtype}" band="{b}">')
+        if nodata is not None:
+            out.append(f"    <NoDataValue>{nodata}</NoDataValue>")
+        if colorinterp:
+            out.append(f"    <ColorInterp>{colorinterp[b - 1]}</ColorInterp>")
+        for path, r0, c0, h, w in tiles:
+            rel = Path(path).resolve().relative_to(vrt_path.parent.resolve())
+            tag = "ComplexSource" if nodata is not None else "SimpleSource"
+            out.append(f"    <{tag}>")
+            out.append(f'      <SourceFilename relativeToVRT="1">{escape(rel.as_posix())}</SourceFilename>')
+            out.append(f"      <SourceBand>{b}</SourceBand>")
+            out.append(f'      <SrcRect xOff="0" yOff="0" xSize="{w}" ySize="{h}"/>')
+            out.append(f'      <DstRect xOff="{c0}" yOff="{r0}" xSize="{w}" ySize="{h}"/>')
+            if nodata is not None:
+                out.append(f"      <NODATA>{nodata}</NODATA>")
+            out.append(f"    </{tag}>")
+        out.append("  </VRTRasterBand>")
+    out.append("</VRTDataset>")
+    vrt_path.write_text("\n".join(out))
+    return vrt_path
+
+
+def vrt_to_geotiff(vrt_path: str | Path, out_path: str | Path, rgba: bool = False):
+    """Materialise a VRT as one tiled, LZW-compressed GeoTIFF (streams; the
+    mosaic is never held in memory)."""
+    opts = {"compress": "lzw", "tiled": True, "BIGTIFF": "IF_SAFER"}
+    if rgba:
+        opts.update({"photometric": "RGB", "alpha": "YES"})
+    try:
+        import rasterio.shutil
+        rasterio.shutil.copy(str(vrt_path), str(out_path), driver="GTiff", **opts)
+        return
+    except ImportError:
+        pass
+    from osgeo import gdal
+    co = ["COMPRESS=LZW", "TILED=YES", "BIGTIFF=IF_SAFER"] + (["PHOTOMETRIC=RGB", "ALPHA=YES"] if rgba else [])
+    gdal.Translate(str(out_path), str(vrt_path), creationOptions=co)

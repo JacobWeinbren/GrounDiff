@@ -204,7 +204,8 @@ def _ramp_weights(tile: int, stride: int) -> np.ndarray:
 def predict_scene(arrs: dict, spec: RuntimeSpec, net: Callable, *, stride: int | None = None,
                   blend: str = "min", prior: str = "auto", init: str | None = None,
                   t_start: int | None = None, n_samples: int = 1, tta: bool = False,
-                  batch_size: int = 8, seed: int = 0, progress: Callable | None = None) -> dict:
+                  batch_size: int = 8, seed: int = 0, progress: Callable | None = None,
+                  add_noise: bool = True) -> dict:
     """arrs: full-scene rasters in metres (NaN = no data), at least
     spec.needed_channels. Returns metre-space rasters:
         dtm, p_ground (GrounDiff: sigmoid(l), probability that the gate
@@ -226,7 +227,8 @@ def predict_scene(arrs: dict, spec: RuntimeSpec, net: Callable, *, stride: int |
     if is_diff and prior == "global":
         small = {n: _resize(arrs[n], t, t, nearest=n in NEAREST_CHANNELS) for n in spec.needed_channels}
         lo, sc = tile_norm(small, spec)
-        g0, _ = sample(net, prepare(small, spec, lo, sc)[None], spec, init="dsm_noise", rng=rng)
+        g0, _ = sample(net, prepare(small, spec, lo, sc)[None], spec, init="dsm_noise", rng=rng,
+                       add_noise=add_noise)
         coarse = (g0[0, 0].astype(np.float64) + 1) * 0.5 * sc + lo
         prior_full = _resize(coarse, H, W)
     elif prior == "channel" or not is_diff:
@@ -269,7 +271,8 @@ def predict_scene(arrs: dict, spec: RuntimeSpec, net: Callable, *, stride: int |
             p_v = np.ascontiguousarray(_d4(pri, k, f)) if pri is not None else None
             for _ in range(n_samples if is_diff else 1):
                 if is_diff:
-                    g0, logit = sample(net, c_v, spec, init=init, prior=p_v, t_start=t_start, rng=rng)
+                    g0, logit = sample(net, c_v, spec, init=init, prior=p_v, t_start=t_start, rng=rng,
+                                       add_noise=add_noise)
                     probs.append(_d4(_sigmoid(logit), k, f, inverse=True))
                 else:
                     keep = [i for i, n in enumerate(spec.cond_channels) if n != spec.prior_channel]

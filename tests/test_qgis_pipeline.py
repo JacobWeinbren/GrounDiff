@@ -53,12 +53,27 @@ def test_plugin_runs_from_rasters_and_points(trained, plugin, tmp_path):  # noqa
     dtm, dinfo = read_geotiff(written["dtm"])
     assert dtm.shape == (g["height"], g["width"]) and dinfo["xmin"] == g["xmin"]
     assert "std" not in written
-    # point-cloud input gives the same rasters as preprocessing, so the same DTM
-    arrs2, info2 = pipe.rasters_from_points(meta["after_file"], meta["before_file"], g["gsd"])
-    out2 = {"dtm": str(tmp_path / "dtm2.tif")}
-    pipe.run(str(onnx_path), arrs2, info2, out2, providers=["CPUExecutionProvider"], batch_size=4)
-    dtm2, _ = read_geotiff(out2["dtm"])
-    ok = np.isfinite(dtm) & np.isfinite(dtm2)
-    assert ok.mean() > 0.9 and np.abs(dtm[ok] - dtm2[ok]).max() < 1e-3
+    # tile mode on the same point cloud (single tile, no neighbours) gives the same DTM
+    s = pipe.run_tiles(str(onnx_path), [meta["after_file"]], str(tmp_path / "tiles_out"),
+                       before_files=[meta["before_file"]], providers=["CPUExecutionProvider"], gsd=g["gsd"],
+                       buffer_m=0.0, workers=1, predict_kwargs={"batch_size": 4})
+    dtm2, info2 = read_geotiff(s["outputs"]["dtm"])
+    # same grid origin => compare the overlapping window
+    dc = int(round((info2["xmin"] - dinfo["xmin"]) / g["gsd"]))
+    dr = int(round((dinfo["ymax"] - info2["ymax"]) / g["gsd"]))
+    sub = dtm[dr:dr + dtm2.shape[0], dc:dc + dtm2.shape[1]]
+    ok = np.isfinite(sub) & np.isfinite(dtm2[:sub.shape[0], :sub.shape[1]])
+    assert ok.mean() > 0.9
+    assert np.abs(sub[ok] - dtm2[:sub.shape[0], :sub.shape[1]][ok]).max() < 1e-3
+    assert "p_edit_overlay" not in s["outputs"] or s["outputs"]["p_edit_overlay"].endswith(".tif")
     with pytest.raises(ValueError):
         pipe.run(str(onnx_path), {"dsm_max": arrs["dsm_max"]}, info, outs)
+
+
+def test_plugin_inspect(trained, plugin):  # noqa: F811
+    root, _, _ = trained
+    _, pipe = plugin
+    import json as _json
+    meta = _json.loads((root / "scenes" / "S2" / "meta.json").read_text())
+    rep = pipe.inspect_report(meta["after_file"], meta["before_file"])
+    assert "point_format" in rep and "differences" in rep

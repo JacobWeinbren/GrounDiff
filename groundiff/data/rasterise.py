@@ -162,3 +162,22 @@ def tin_dtm(grid: Grid, x, y, z, max_points: int = 4_000_000, seed: int = 0):
     XX, YY = np.meshgrid(xs - ox, ys - oy)
     dtm = interp(XX, YY).astype(np.float32)
     return dtm, np.isfinite(dtm)
+
+
+def build_rasters(grid: Grid, pts, before=None, ground_classes=(2, 9), before_ground_classes=(2,),
+                  with_target: bool = True) -> dict:
+    """Every channel used in training/inference for one grid. `pts` is the
+    final ("after") point set, `before` the lasground_new-classified one."""
+    out = rasterise_points(grid, pts.x, pts.y, pts.z, pts.return_number, pts.number_of_returns)
+    if with_target:
+        g = np.isin(pts.cls, np.asarray(ground_classes, np.uint8))
+        gt, gt_valid = tin_dtm(grid, pts.x[g], pts.y[g], pts.z[g])
+        out["gt_dtm"], out["gt_valid"] = gt, gt_valid.astype(np.float32)
+        out["top_ground"] = top_return_is(grid, pts.x, pts.y, pts.z, g)
+    if before is not None:
+        bg = np.isin(before.cls, np.asarray(before_ground_classes, np.uint8))
+        dtm_b, b_valid = tin_dtm(grid, before.x[bg], before.y[bg], before.z[bg])
+        out["dtm_before"], out["before_valid"] = dtm_b, b_valid.astype(np.float32)
+        sem = class_mode_onehot(grid, before.x, before.y, bg)
+        out["sem_ground"], out["sem_nonground"] = sem[0], sem[1]
+    return out
