@@ -182,3 +182,19 @@ def test_points_only_scene_needs_no_lasground(laz):
                                                                                index_rasters(d2)),
                           gsd=1.0, lasground=False)
     assert meta2["quality"]["suspect"]
+
+
+def test_match_survey_pairs_dtm_files_with_their_flight():
+    from groundiff.data.preprocess import match_survey, survey_dates, survey_id
+    rows = [{"path": f"d/lidar_tiles_dtm_2022_1/z/{n}"} for n in (
+        "DTM_F0223204_20220109_20220109.tif", "DTM_F0231367_20221125_20221125.tif")]
+    got, how = match_survey("TQ9585ne_P_12999_20221125_20221125.copc.laz", rows)
+    assert how == "dates" and [r["path"][-12:] for r in got] == ["20221125.tif"]
+    got, how = match_survey("TQ9585ne_P_12999_20221124_20221126.copc.laz", rows)
+    assert how == "date-overlap" and len(got) == 1
+    nlp = [{"path": "d/DTM_TM0010_P_12506_20220127_20220127.tif"}, {"path": "d/DTM_TM0010_P_12507_20220127.tif"}]
+    got, how = match_survey("TM0010_P_12506_20220127_20220127.laz", nlp)
+    assert how == "survey" and len(got) == 1
+    assert match_survey("SU6570.laz", rows)[1] == "footprint"
+    assert survey_dates("TL4378nw_P_12534_20220315_20220316.laz") == ("20220315", "20220316")
+    assert survey_id("TL4378nw_P_12534_20220315_20220316.laz") == "12534"

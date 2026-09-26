@@ -70,3 +70,34 @@ def test_run_downloads_extracts_and_resumes(tmp_path, monkeypatch):
     assert not r3["failed"] and calls["fetch"] == 2
     r4 = ea_dtm.run(pts, tmp_path / "dtm2", year="2020", log=lambda *a: None)
     assert r4["failed"] and calls["fetch"] == 2
+
+
+def test_candidates_fall_back_and_25cm_opt_in(tmp_path, monkeypatch):
+    from groundiff.data import ea_dtm
+    offers = [{"product": "lidar_tiles_dtm", "year": "2022", "res": "0.25", "tile": "TL5595", "label": "TL59ne"},
+              {"product": "national_lidar_programme_dtm", "year": "2018", "res": "1", "tile": "TL5595", "label": "x"}]
+    assert ea_dtm.candidates(offers, "TL5595", "2022") == []
+    assert [c["res"] for c in ea_dtm.candidates(offers, "TL5595", "2022", allow_25cm=True)] == ["0.25"]
+    offers2 = [{"product": "lidar_tiles_dtm", "year": "2022", "res": "1", "tile": "T", "label": "t"},
+               {"product": "national_lidar_programme_dtm", "year": "2022", "res": "1", "tile": "T", "label": "t"}]
+    assert [c["product"] for c in ea_dtm.candidates(offers2, "T", "2022")] == [
+        "lidar_tiles_dtm", "national_lidar_programme_dtm"]
+    # a metadata-only zip for the first offer: the next offer is downloaded
+    tif = tmp_path / "src.tif"
+    write_geotiff(tif, np.full((4, 4), 1.0), 540000.0, 280000.0, 1250.0)
+    monkeypatch.setattr(ea_dtm, "search", lambda b, **k: [dict(r, tile="TL4075") for r in offers2])
+
+    def fake_fetch(url, dst, **kw):
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("meta.gpkg", b"x")
+            if "national_lidar_programme_dtm" in url:
+                z.write(tif, "DTM_TL4075_P_1_20220101_20220101.tif")
+        dst.write_bytes(buf.getvalue())
+        return dst
+
+    monkeypatch.setattr(ea_dtm, "fetch_zip", fake_fetch)
+    r = ea_dtm.run([tmp_path / NAMES[0]], tmp_path / "o", log=lambda *a: None)
+    assert not r["failed"]
+    assert r["manifest"]["TL4075/2022/auto"]["product"] == "national_lidar_programme_dtm"

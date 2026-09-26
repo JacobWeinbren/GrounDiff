@@ -216,29 +216,36 @@ def _res_m(r: str) -> float:
 RES_PREFERENCE = (1.0, 0.5, 2.0)        # 1 m = the training grid; 50 cm averages exactly onto it
 
 
-def choose(avail: list[dict], tile: str, year: str, product: str = "auto", res: str = "auto") -> dict | None:
-    """Pick one catalogue entry for (tile, year): products in AUTO_ORDER (or
-    the one named), resolution 1 m, else 50 cm, else 2 m (25 cm tiles are
-    ~16x larger than 1 m and are only taken when named with --res)."""
+def candidates(avail: list[dict], tile: str, year: str, product: str = "auto", res: str = "auto",
+               allow_25cm: bool = False) -> list[dict]:
+    """Catalogue entries for (tile, year), best first: products in AUTO_ORDER
+    (or the one named), resolution 1 m, else 50 cm, else 2 m; 25 cm (16x the
+    download of 1 m) last and only with allow_25cm."""
     rows = [r for r in avail if r["tile"] == tile and r["year"] == year]
     products = AUTO_ORDER if product == "auto" else (product,)
+    out = []
     for p in products:
         cand = [r for r in rows if r["product"] == p]
         if res != "auto":
-            cand = [r for r in cand if r["res"] == res]
-            if cand:
-                return cand[0]
+            out += [r for r in cand if r["res"] == res]
             continue
         for want in RES_PREFERENCE:
-            hit = [r for r in cand if abs(_res_m(r["res"]) - want) < 1e-6]
-            if hit:
-                return hit[0]
-    return None
+            out += [r for r in cand if abs(_res_m(r["res"]) - want) < 1e-6]
+    if allow_25cm and res == "auto":
+        for p in products:
+            out += [r for r in rows if r["product"] == p and abs(_res_m(r["res"]) - 0.25) < 1e-6]
+    return out
+
+
+def choose(avail: list[dict], tile: str, year: str, product: str = "auto", res: str = "auto",
+           allow_25cm: bool = False) -> dict | None:
+    c = candidates(avail, tile, year, product, res, allow_25cm)
+    return c[0] if c else None
 
 
 def run(point_files: list, out: Path, product: str = "auto", year: str | None = None,
         res: str = "auto", workers: int = 3, dry_run: bool = False, check: bool = True, keep_zip: bool = False,
-        log=print) -> dict:
+        log=print, allow_25cm: bool = False) -> dict:
     out = Path(out)
     want = wanted_tiles(point_files, year)
     by_year = defaultdict(list)
@@ -263,21 +270,31 @@ def run(point_files: list, out: Path, product: str = "auto", year: str | None = 
         tid, y, t = item
         if check:
             avail = search(t["bounds"])
-            pick = choose(avail, tid, y, product, res)
-            if pick is None:
-                offered = sorted({(r["product"], r["year"], r["res"], r["tile"]) for r in avail})
-                return tid, y, None, f"no {product} DTM for {y} at {tid} ({t['label']}); offered: {offered}"
-            prod, rs = pick["product"], pick["res"]
+            cands = candidates(avail, tid, y, product, res, allow_25cm)
+            if not cands:
+                offered = sorted({(r["product"], r["year"], r["res"]) for r in avail
+                                  if r["tile"] == tid and r["product"].endswith("dtm")})
+                hint = " (only 25 cm offered: add --allow-25cm)" if any(
+                    abs(_res_m(o[2]) - 0.25) < 1e-6 and o[1] == y for o in offered) else ""
+                return tid, y, None, f"no {product} DTM for {y} at {tid} ({t['label']}){hint}; DTMs offered: {offered}"
         else:
-            prod, rs = product, res
-        url = TILE_URL.format(product=prod, year=y, res=rs, tile=tid) + f"?subscription-key={KEY}"
-        z = fetch_zip(url, out / "zips" / f"{prod}-{y}-{rs}-{tid}.zip")
-        files = extract(z, out / f"{prod}_{y}_{rs}")
-        if not keep_zip:
-            z.unlink(missing_ok=True)
-        if not files:
-            return tid, y, None, f"{tid}: the {prod} zip holds no raster (metadata-only delivery)"
-        return tid, y, {"product": prod, "res": rs, "files": [str(f) for f in files]}, None
+            cands = [{"product": product, "res": res}]
+        errors = []
+        for c in cands:                         # metadata-only zips and refused downloads: try the next offer
+            prod, rs = c["product"], c["res"]
+            url = TILE_URL.format(product=prod, year=y, res=rs, tile=tid) + f"?subscription-key={KEY}"
+            try:
+                z = fetch_zip(url, out / "zips" / f"{prod}-{y}-{rs}-{tid}.zip")
+            except RuntimeError as e:
+                errors.append(f"{prod} {rs}: {e}")
+                continue
+            files = extract(z, out / f"{prod}_{y}_{rs}")
+            if not keep_zip:
+                z.unlink(missing_ok=True)
+            if files:
+                return tid, y, {"product": prod, "res": rs, "files": [str(f) for f in files]}, None
+            errors.append(f"{prod} {rs}: the zip holds no raster (metadata-only delivery)")
+        return tid, y, None, f"{tid} ({t['label']}): " + "; ".join(errors)
 
     failed = {}
     with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
@@ -315,6 +332,8 @@ def main(argv=None):
     ap.add_argument("--workers", type=int, default=3)
     ap.add_argument("--no-check", action="store_true", help="skip the catalogue search, download directly")
     ap.add_argument("--keep-zip", action="store_true")
+    ap.add_argument("--allow-25cm", action="store_true",
+                    help="where the survey's DTM exists only at 25 cm, download that (about 16x the size of 1 m)")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args(argv)
     files = []
@@ -325,7 +344,8 @@ def main(argv=None):
         print("no point tiles found", file=sys.stderr)
         return 1
     year = a.year if a.year or a.product != "lidar_composite_dtm" else "2022"
-    r = run(files, a.out, a.product, year, a.res, a.workers, a.dry_run, not a.no_check, a.keep_zip)
+    r = run(files, a.out, a.product, year, a.res, a.workers, a.dry_run, not a.no_check, a.keep_zip,
+            allow_25cm=a.allow_25cm)
     if r.get("failed"):
         print(f"{len(r['failed'])} tiles failed; re-run to retry. First: {next(iter(r['failed'].values()))}",
               file=sys.stderr)

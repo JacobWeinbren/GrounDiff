@@ -296,10 +296,51 @@ def _raster_rank(path: str, year: str | None) -> tuple:
     return year_ok, prod
 
 
-def rasters_for(bounds, index: list[dict], year: str | None = None) -> list[str]:
-    """Rasters covering bounds, best first (earlier ones win where they overlap)."""
+DATES_RE = re.compile(r"(?<!\d)(20\d{6})_(20\d{6})(?!\d)")
+SURVEY_RE = re.compile(r"_P_(\d+)_")
+
+
+def survey_dates(name: str) -> tuple | None:
+    """(start, end) flight dates from EA file names: TL4378nw_P_12534_20220315_20220316.laz,
+    DTM_F0224538_20220319_20220319.tif, DTM_TM0010_P_12506_20220127_20220127.tif."""
+    m = DATES_RE.search(Path(name).name)
+    return (m.group(1), m.group(2)) if m else None
+
+
+def survey_id(name: str) -> str | None:
+    m = SURVEY_RE.search(Path(name).name)
+    return m.group(1) if m else None
+
+
+def match_survey(point_name: str, rasters: list[dict]) -> tuple[list[dict], str]:
+    """Keep the DTM rasters of the point tile's own survey: same P number when
+    the raster names carry one (NLP), else the same flight dates (time-stamped
+    tiles are named by date, DTM_F<id>_<start>_<end>), else overlapping dates.
+    Returns (rasters, how) with how = survey / dates / date-overlap / footprint."""
+    pid, pd = survey_id(point_name), survey_dates(point_name)
+    if pid:
+        same = [r for r in rasters if survey_id(r["path"]) == pid]
+        if same:
+            return same, "survey"
+    if pd:
+        same = [r for r in rasters if survey_dates(r["path"]) == pd]
+        if same:
+            return same, "dates"
+        over = [r for r in rasters if (d := survey_dates(r["path"])) and d[0] <= pd[1] and d[1] >= pd[0]]
+        if over:
+            return over, "date-overlap"
+    return rasters, "footprint"
+
+
+def rasters_for(bounds, index: list[dict], year: str | None = None, point_name: str | None = None
+                ) -> list[str]:
+    """Rasters covering bounds, best first (earlier ones win where they overlap).
+    With point_name, only the rasters of the same survey are kept when they
+    can be identified (see match_survey)."""
     x0, y0, x1, y1 = bounds
     hits = [r for r in index if r["xmin"] < x1 and r["xmax"] > x0 and r["ymin"] < y1 and r["ymax"] > y0]
+    if point_name:
+        hits, _ = match_survey(point_name, hits)
     hits.sort(key=lambda r: _raster_rank(r["path"], year) + (r["res"], r["path"]))
     return [r["path"] for r in hits]
 
@@ -338,6 +379,7 @@ def main(argv=None):
     if a.dtm_dir:
         from .laz import header_info
         index = index_rasters(a.dtm_dir, a.out / "dtm_index.json")
+        match_counts = {}
         print(f"{len(index)} DTM rasters under {a.dtm_dir}")
         for k, p in before.items():
             try:
@@ -346,7 +388,11 @@ def main(argv=None):
                 print(f"  {p.name}: FAILED reading header {e!r}", file=sys.stderr)
                 continue
             from .ea_dtm import survey_year
-            hits = rasters_for(b, index, survey_year(p.name))
+            x0, y0, x1, y1 = b
+            cover = [r for r in index if r["xmin"] < x1 and r["xmax"] > x0 and r["ymin"] < y1 and r["ymax"] > y0]
+            _, how = match_survey(p.name, cover)
+            match_counts[how] = match_counts.get(how, 0) + 1
+            hits = rasters_for(b, index, survey_year(p.name), p.name)
             if not hits:
                 print(f"[warn] {k}: no DTM raster covers it; skipped")
                 continue
@@ -357,6 +403,9 @@ def main(argv=None):
         if missing:
             print(f"[warn] {len(missing)} tiles have no after file and are skipped: {missing[:5]}...")
         jobs = [(p, {"after": after[k]}) for k, p in before.items() if k in after]
+    if a.dtm_dir and match_counts:
+        print("DTM paired with its point tile by: " + ", ".join(f"{k} {v}" for k, v in sorted(match_counts.items()))
+              + " (footprint = no survey id/dates to match; the quality gate checks those)")
     print(f"{len(jobs)} scenes -> {a.out}")
     failures, suspect, exact = 0, 0, []
     with ProcessPoolExecutor(max_workers=max(1, a.workers)) as ex:
