@@ -42,6 +42,25 @@ def _inline_weights(onnx_path: Path):
     data.unlink()
 
 
+SPEC_KEY = "groundiff_spec"
+
+
+def _embed_spec(onnx_path: Path, spec_json: str):
+    """Store the RuntimeSpec inside the .onnx (metadata_props), so the model is
+    one self-contained file; the .json next to it stays for reference."""
+    try:
+        import onnx
+    except ImportError:
+        print("[warn] onnx not installed: spec not embedded; keep the .json next to the .onnx")
+        return
+    m = onnx.load(str(onnx_path))
+    for p in list(m.metadata_props):
+        if p.key == SPEC_KEY:
+            m.metadata_props.remove(p)
+    m.metadata_props.add(key=SPEC_KEY, value=spec_json)
+    onnx.save_model(m, str(onnx_path))
+
+
 def export(ckpt: str | Path, out: str | Path, use_ema: bool = True, opset: int = 18,
            check: bool = True) -> tuple[Path, Path]:
     model, cfg, ck = load_model(ckpt, "cpu", use_ema=use_ema)
@@ -71,6 +90,7 @@ def export(ckpt: str | Path, out: str | Path, use_ema: bool = True, opset: int =
                           dynamic_shapes=shapes, opset_version=opset, dynamo=True)
         _inline_weights(onnx_path)
     spec.to_json(json_path)
+    _embed_spec(onnx_path, json_path.read_text())
     if check:
         ref = TorchNet(model, "cpu")
         ox = OnnxNet(onnx_path, ["CPUExecutionProvider"])

@@ -49,12 +49,18 @@ class OnnxNet:
                 ort.preload_dlls()
             except Exception:
                 pass
-        self.session = ort.InferenceSession(str(path), providers=providers)
+        self.warning = None
+        try:
+            self.session = ort.InferenceSession(str(path), providers=providers)
+        except Exception as e:                     # e.g. CoreML/DirectML cannot take this graph: use the CPU
+            if providers == ["CPUExecutionProvider"]:
+                raise
+            self.session = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+            self.warning = f"{providers[0]} could not load the model ({e}); running on the CPU"
         self.inputs = [i.name for i in self.session.get_inputs()]
         self.providers = self.session.get_providers()
         wanted = [p for p in providers if p in GPU_PROVIDERS]
-        self.warning = None
-        if wanted and self.providers[0] not in GPU_PROVIDERS:
+        if not self.warning and wanted and self.providers[0] not in GPU_PROVIDERS:
             self.warning = (f"requested {wanted[0]} but ONNX Runtime is using {self.providers[0]} "
                             f"(available: {avail}); check the GPU build of onnxruntime and its CUDA/cuDNN")
 

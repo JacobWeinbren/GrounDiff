@@ -4,14 +4,24 @@ import sys
 import types
 
 
+_SETTINGS: dict = {}
+
+
 def install(new_enums: bool = True):
     core = types.ModuleType("qgis.core")
 
     class _Param:
         Integer, Double = 0, 1
+        FlagAdvanced = 2
 
         def __init__(self, name, description="", *a, **kw):
-            self.name, self.kw = name, kw
+            self.name, self.kw, self._flags = name, kw, 0
+
+        def flags(self):
+            return self._flags
+
+        def setFlags(self, f):
+            self._flags = f
 
     class QgsProcessingParameterNumber(_Param):
         pass
@@ -25,7 +35,20 @@ def install(new_enums: bool = True):
 
     class QgsProcessing:
         TypeFile = 99
+        TypePointCloud = 98
+        TEMPORARY_OUTPUT = "TEMPORARY_OUTPUT"
     core.QgsProcessing = QgsProcessing
+    core.QgsProcessingParameterDefinition = _Param
+
+    class QgsSettings:
+        store = _SETTINGS                  # shared across re-installs, like QGIS's settings file
+
+        def value(self, k, default=None):
+            return self.store.get(k, default)
+
+        def setValue(self, k, v):
+            self.store[k] = v
+    core.QgsSettings = QgsSettings
 
     if new_enums:
         class Qgis:
@@ -34,6 +57,10 @@ def install(new_enums: bool = True):
 
             class ProcessingSourceType:
                 File = 99
+                PointCloud = 98
+
+            class ProcessingParameterFlag:
+                Advanced = 2
         core.Qgis = Qgis
     else:                         # QGIS 3.22-3.34: Qgis exists but without these enums
         core.Qgis = type("Qgis", (), {})
@@ -80,6 +107,9 @@ def install(new_enums: bool = True):
         def source(self):
             return self._src
 
+        def name(self):
+            return self._src.split("/")[-1]
+
     class QgsProcessingAlgorithm:
         def __init__(self):
             self.params = {}
@@ -100,6 +130,9 @@ def install(new_enums: bool = True):
 
         def parameterAsFileList(self, parameters, name, context):
             return list(self._get(parameters, name) or [])
+
+        def parameterAsLayerList(self, parameters, name, context):
+            return [_Layer(p) for p in (self._get(parameters, name) or [])]
 
         def parameterAsDouble(self, parameters, name, context):
             return float(self._get(parameters, name))

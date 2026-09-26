@@ -345,41 +345,35 @@ squares.
 | `dz_before` | size of the predicted correction (either sign) | 0.15 m |
 | `std` | spread across samples / flips | 0.1 m |
 
-## QGIS plugin (QGIS 3.22 – 4.x)
+## QGIS plugin (QGIS 3.22 – 4.x, Windows and Mac)
 
 ```bash
 python tools/build_qgis_plugin.py        # -> dist/groundiff_qgis.zip
 ```
 
-Install with *Plugins → Manage and Install Plugins → Install from ZIP*, then
-add the runtime to QGIS's Python:
+1. *Plugins → Manage and Install Plugins → Install from ZIP* → `groundiff_qgis.zip`.
+2. The first time, QGIS shows "GrounDiff needs a few components" → **Install now**
+   (or *Plugins → GrounDiff → Install / check GrounDiff components*). It installs
+   ONNX Runtime (DirectML on Windows, which uses any GPU including NVIDIA
+   without CUDA; CPU + CoreML on Mac) and laspy into your QGIS profile with
+   QGIS's own Python, about 160 MB, once. Nothing to type, and QGIS's own
+   packages are left alone.
+3. Click the **GrounDiff** toolbar button (*Find edits in point clouds*):
+   * pick your `lasground_new` tiles, either point-cloud layers already in the
+     project or LAS/LAZ files (… → Add File(s) / Add Directory);
+   * pick the model `.onnx` the first time (it is remembered; the model's
+     settings are stored inside the `.onnx`, so that one file is all you copy);
+   * Run. The edit probability, predicted edit (styled) and ranked priority
+     blocks are added to the map. Results go to a temporary folder unless you
+     choose an output folder (do so when you want the files for LP360:
+     `*_overlay.tif`, `priority.shp`).
 
-* Windows (OSGeo4W Shell): `python -m pip install numpy scipy "laspy[lazrs]" onnxruntime-directml`
-  — DirectML uses any GPU (NVIDIA included) with no CUDA install; choose
-  "DirectML" as the device. `onnxruntime` instead gives CPU only. The CUDA
-  build (`onnxruntime-gpu`) needs CUDA/cuDNN versions matching QGIS's Python
-  and often fails inside QGIS; the log warns if a requested GPU is not used.
-  Install only one onnxruntime package.
-* macOS: `/Applications/QGIS.app/Contents/MacOS/bin/python3 -m pip install scipy "laspy[lazrs]" onnxruntime`
-* pyproj is optional.
-
-Copy the model's `.onnx` and `.json` (e.g. `models/no_lastools.*`) together.
-The plugin's input is the tiles as they come out of `lasground_new` in your
-normal production chain (no extra processing on the PC).
-Processing Toolbox → GrounDiff:
-
-* **Predict DTM and edit priorities from point-cloud tiles**: select any
-  number of `lasground_new` tiles (… → Add File(s) / Add Directory), an output
-  folder and how many tiles to prepare in parallel. Loads the edit probability
-  and predicted edit (styled), the DTM and the priority blocks when done. The
-  log says which device ONNX Runtime used and warns if a requested GPU was not
-  available.
-* **Predict DTM from rasters**: channel rasters already on one grid (e.g. from
-  `preprocess --geotiff`); outputs the model cannot produce are skipped.
-* **Inspect LAS/LAZ file**: the inspector above, optionally comparing two files.
-
-The plugin reads point clouds itself (laspy), so files that QGIS's own
-point-cloud layers (PDAL) refuse can still be processed.
+Everything else (device, samples, cell size, buffer, workers, …) is under
+*Advanced* and can normally be left alone. The log says which device ONNX
+Runtime used; if a GPU cannot take the model it falls back to the CPU and
+says so. Also in the toolbox: **Predict DTM from rasters** and **Inspect
+LAS/LAZ file**. The plugin reads point clouds itself (laspy), so files that
+QGIS's own point-cloud layers (PDAL) refuse can still be given as files.
 
 ## Faithfulness to the papers
 

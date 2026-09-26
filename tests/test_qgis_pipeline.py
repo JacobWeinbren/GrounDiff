@@ -1,6 +1,7 @@
 """The QGIS plugin's logic, run without QGIS (the thin QGIS wrapper is only
 compiled here)."""
 import importlib
+import os
 import json
 import py_compile
 import sys
@@ -102,7 +103,7 @@ def test_algorithms_run_under_stub_qgis(trained, plugin, tmp_path, new_enums):  
     alg = alg_mod.PredictTilesAlgorithm().createInstance()
     alg.initAlgorithm()
     ctx, fb = qgis_stub.install(new_enums).QgsProcessingContext(), qgis_stub.Feedback()
-    params = {"MODEL": str(onnx_path), "TILES": [meta["before_file"], str(tmp_path / "notes.txt")],
+    params = {"MODEL": str(onnx_path), "LAYERS": [meta["before_file"]], "TILES": [str(tmp_path / "notes.txt")],
               "OUTPUT_FOLDER": str(tmp_path / "out"), "BACKEND": 4, "BATCH": 4, "WORKERS": 1}
     res = alg.processAlgorithm(params, ctx, fb)
     assert res["OUTPUT_FOLDER"] == str(tmp_path / "out")
@@ -111,6 +112,13 @@ def test_algorithms_run_under_stub_qgis(trained, plugin, tmp_path, new_enums):  
     assert "GrounDiff DTM" in loaded and "Edit priority blocks" in loaded
     styled = [d for d in loaded.values() if d.post is not None]
     assert styled and all(d.post.qml.endswith(".qml") for d in styled)
+
+    assert alg.params["BACKEND"].flags() and not alg.params["TILES"].flags()     # technical ones are 'Advanced'
+    # second run: no model given -> the remembered one; no folder -> a temporary one
+    ctx, fb = qgis_stub.install(new_enums).QgsProcessingContext(), qgis_stub.Feedback()
+    res2 = alg.processAlgorithm({"LAYERS": [meta["before_file"]], "BACKEND": 4, "BATCH": 4, "SAMPLES": 1,
+                                 "OUTPUT_FOLDER": "TEMPORARY_OUTPUT"}, ctx, fb)
+    assert os.path.exists(os.path.join(res2["OUTPUT_FOLDER"], "dtm.tif"))
 
     # rasters: std needs several samples; with SAMPLES=1 it is not producible -> warning, no output
     alg = alg_mod.PredictRastersAlgorithm().createInstance()
@@ -138,3 +146,25 @@ def test_algorithms_run_under_stub_qgis(trained, plugin, tmp_path, new_enums):  
     assert any("point_format" in m for m in fb.info)
     for m in ("qgis", "qgis.core"):
         sys.modules.pop(m, None)
+
+
+def test_spec_embedded_in_onnx_is_enough(trained, plugin, tmp_path):  # noqa: F811
+    root, _, _ = trained
+    _, pipe = plugin
+    onnx_path, json_path = export(root / "run" / "last.pt", tmp_path / "m")
+    json_path.unlink()                                    # only the .onnx is copied to the other machine
+    spec = pipe.load_spec(str(onnx_path))
+    assert spec.cond_channels and spec.tile > 0
+
+
+def test_dependency_installer_commands(plugin, tmp_path, monkeypatch):
+    folder, _ = plugin
+    deps = importlib.import_module("groundiff_qgis.deps")
+    cmds = deps.pip_commands(["onnxruntime", "laspy", "lazrs"], tmp_path)
+    flat = [" ".join(c) for c in cmds]
+    assert all("--target" in c and str(tmp_path) in c for c in flat)
+    assert any("--no-deps" in c and "onnxruntime" in c and "laspy" in c for c in flat)
+    assert not any("numpy" in c.split() for c in flat)                     # QGIS's numpy is never replaced
+    assert "lazrs" in flat[-1] and "--no-deps" not in flat[-1]
+    assert deps.missing() == [] or all(isinstance(m, str) for m in deps.missing())
+    assert os.path.exists(deps.python_exe())

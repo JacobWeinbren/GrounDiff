@@ -21,10 +21,26 @@ OVERLAY_PRESET = {"p_edit": "edit", "dz_before": "dz", "std": "uncertainty"}
 
 
 def load_spec(onnx_path: str) -> RuntimeSpec:
+    """The model's settings: embedded in the .onnx (current exports), or the
+    .json next to it (older exports)."""
     js = Path(onnx_path).with_suffix(".json")
-    if not js.exists():
-        raise FileNotFoundError(f"{js} not found: export the model with `python -m groundiff.export`")
-    return RuntimeSpec.from_json(js)
+    if js.exists():
+        return RuntimeSpec.from_json(js)
+    if not Path(onnx_path).exists():
+        raise FileNotFoundError(f"model {onnx_path} not found")
+    import json
+    import tempfile
+
+    import onnxruntime as ort
+    meta = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"]).get_modelmeta()
+    text = meta.custom_metadata_map.get("groundiff_spec")
+    if not text:
+        raise FileNotFoundError(f"{onnx_path} has no embedded settings and no {js.name} next to it: re-export it "
+                                "with `python -m groundiff.export`")
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "spec.json"
+        p.write_text(text)
+        return RuntimeSpec.from_json(p)
 
 
 def producible(spec: RuntimeSpec, n_samples: int = 1, tta: bool = False, has_before: bool = True) -> list[str]:
