@@ -142,7 +142,7 @@ class PredictTilesAlgorithm(QgsProcessingAlgorithm):
                                                        type=NUM_DOUBLE, defaultValue=-1.0, minValue=-1.0))
         self.addParameter(QgsProcessingParameterNumber("WORKERS", "Tiles prepared in parallel (each needs a few GB RAM)",
                                                        type=NUM_INT,
-                                                       defaultValue=2,
+                                                       defaultValue=1,
                                                        minValue=1, maxValue=32))
         self.addParameter(QgsProcessingParameterNumber("BLOCK", "Priority block size (m)", type=NUM_DOUBLE,
                                                        defaultValue=100.0, minValue=5.0))

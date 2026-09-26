@@ -43,7 +43,7 @@ import urllib.error
 import urllib.request
 import zipfile
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from .osgrid import LETTERS, parse_tile
@@ -265,7 +265,7 @@ def run(point_files: list, out: Path, product: str = "auto", year: str | None = 
             avail = search(t["bounds"])
             pick = choose(avail, tid, y, product, res)
             if pick is None:
-                offered = sorted({(r["product"], r["year"], r["res"]) for r in avail if r["tile"] == tid})
+                offered = sorted({(r["product"], r["year"], r["res"], r["tile"]) for r in avail})
                 return tid, y, None, f"no {product} DTM for {y} at {tid} ({t['label']}); offered: {offered}"
             prod, rs = pick["product"], pick["res"]
         else:
@@ -281,8 +281,9 @@ def run(point_files: list, out: Path, product: str = "auto", year: str | None = 
 
     failed = {}
     with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
-        futs = [ex.submit(one, item) for item in todo]
-        for i, (f, item) in enumerate(zip(futs, todo), 1):
+        futs = {ex.submit(one, item): item for item in todo}
+        for i, f in enumerate(as_completed(futs), 1):          # record each download as soon as it finishes
+            item = futs[f]
             try:
                 tid, y, rec, err = f.result()
             except Exception as e:

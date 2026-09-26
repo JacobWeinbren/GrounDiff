@@ -298,16 +298,19 @@ neither paper defines one.
 
 ```bash
 python -m groundiff.export runs/no_lastools/best.pt --out models/no_lastools     # checked vs PyTorch
-python -m groundiff.batch --onnx models/no_lastools.onnx --tiles "lasground/*.laz" --out results/area1 --workers 2 --samples 4
+python -m groundiff.batch --onnx models/no_lastools.onnx --tiles "lasground/*.laz" --out results/area1 --samples 4
 ```
 
 Inputs are tiles as `lasground_new` wrote them (quote wildcards; folders work
 too, and Windows is handled). Each tile is read with a buffer of neighbour
 points (one network tile + 32 m), network tiles lie on one lattice anchored to
 the National Grid, and each tile's sampling noise is seeded by its position,
-so neighbouring tiles agree exactly where they meet and re-running part of an
-area reproduces the same values. Tiles are prepared in parallel while the
-network runs; a bad file is reported in `batch_summary.json` and the rest
+so neighbouring tiles agree exactly where they meet (and re-running part of
+an area reproduces the same values, except within one buffer of the new
+selection's edge, where neighbouring points are missing). A tile is prepared in the background while the network runs
+(each job needs roughly 550 bytes per point read, ~6-7 GB for a 500 m tile at
+EA density; the log prints an estimate; raise `--workers` only with RAM to
+spare); a bad file is reported in `batch_summary.json` and the rest
 carry on. Header extents are checked against point counts and tile names and
 replaced by the points' own extent when they cannot be right (stale LP360
 headers). Cell size and read options default to what the model was trained

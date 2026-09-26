@@ -126,6 +126,10 @@ def quality(arrs: dict, alpha: float = 0.2, ground_tin: np.ndarray | None = None
     if g.sum() >= 50:
         d = (arrs["gt_dtm"] - ref)[g].astype(np.float64)
         q["median_dz"] = float(np.median(d))
+        # offset from the histogram peak: heavy one-sided edits (e.g. roofs kept as ground) move the
+        # median but not the mode
+        h, e = np.histogram(np.clip(d, -1, 1), bins=200, range=(-1, 1))
+        q["mode_dz"] = float(0.5 * (e[h.argmax()] + e[h.argmax() + 1]))
         q["agree_frac"] = float((np.abs(d) < alpha).mean())
     tin = arrs.get("dtm_before", ground_tin)
     if tin is not None:
@@ -151,10 +155,13 @@ def is_suspect(q: dict, min_agree: float = 0.6, max_offset: float = 0.15, min_co
                    "return where there are several echoes): a DSM, not a DTM?")
     if q.get("target_coverage", 0) < min_coverage:
         why.append(f"target covers {q.get('target_coverage', 0):.0%} of the survey area")
-    if "agree_frac" in q and q["agree_frac"] < min_agree:
-        why.append(f"only {q['agree_frac']:.0%} of lasground_new ground cells within 0.2 m of the target")
-    if "median_dz" in q and abs(q["median_dz"]) > max_offset:
-        why.append(f"median offset {q['median_dz']:+.2f} m on lasground_new ground")
+    fallback = q.get("exact_frac") is None or not min_exact     # no survey-match test: use the coarse ones
+    if (fallback and "agree_frac" in q and q.get("n_ground_cells", 0) >= 2000
+            and q["agree_frac"] < min_agree):
+        why.append(f"only {q['agree_frac']:.0%} of ground cells within 0.2 m of the target")
+    offset = q.get("mode_dz", q.get("median_dz"))
+    if offset is not None and abs(offset) > max_offset:
+        why.append(f"offset {offset:+.2f} m between the target and the points on open ground")
     return why
 
 

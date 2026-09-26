@@ -124,6 +124,11 @@ def run_tiles(onnx_path: str, tiles: list, out_dir: str, providers: list | None 
 
     if not tiles:
         raise ValueError("no .las/.laz files selected")           # folders and wildcards are expanded by run_batch
+    import laspy  # noqa: F401  (fail here, with the install hint, rather than per tile)
+    import scipy.interpolate  # noqa: F401
+    import scipy.ndimage  # noqa: F401
+    if not any(b.is_available() for b in getattr(laspy, "LazBackend", [])):
+        raise ImportError("no LAZ backend for laspy: install laspy[lazrs]")
     spec = load_spec(onnx_path)
     net = OnnxNet(onnx_path, providers)
     log(f"ONNX Runtime providers: {net.providers}")

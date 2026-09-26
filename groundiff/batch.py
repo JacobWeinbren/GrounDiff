@@ -17,10 +17,15 @@ How tiles are processed
     neighbouring points (default: one network tile + 32 m) and cropped back.
     Network tiles sit on one lattice anchored to the British National Grid
     origin and each tile's sampling noise is seeded by its position, so
-    neighbouring jobs compute identical values where they overlap: no seams,
-    and re-running a subset reproduces the same numbers.
-  * Tiles are read and rasterised in background threads while the network
-    works on the previous one. Up to workers + 2 prepared tiles are in memory.
+    neighbouring jobs compute identical values where they overlap: no seams.
+    Re-running part of an area reproduces the same numbers away from the edge
+    of the new selection (within one buffer of it, neighbouring points are
+    missing unless those tiles are selected too).
+  * Tiles are read and rasterised in the background while the network works
+    on the previous one. A job holds roughly 550 bytes per point read: about
+    6-7 GB for a 500 m tile at EA density with the automatic buffer, so the
+    default is one background worker (it already overlaps reading with the
+    GPU); the log gives an estimate per run.
   * A tile that fails (unreadable file, wrong classes) is reported in
     batch_summary.json and the run carries on.
 
@@ -39,7 +44,7 @@ import json
 import math
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -89,6 +94,8 @@ def expand_inputs(paths: list) -> list[Path]:
             hp = Path(h)
             files = (sorted(q for q in hp.rglob("*") if q.suffix.lower() in (".las", ".laz"))
                      if hp.is_dir() else ([hp] if hp.suffix.lower() in (".las", ".laz") else []))
+            if not files:
+                print(f"[warn] {p}: matches no .las/.laz file")
             for f in files:
                 key = str(f.resolve())
                 key = key.lower() if sys.platform.startswith("win") else key
@@ -160,8 +167,10 @@ def plan(tiles: list, gsd: float, buffer_m: float, max_block_m: float = 1000.0,
                 blk = (xs[i], ys[j], xs[i + 1], ys[j + 1])
                 buf = _snap((blk[0] - buffer_m, blk[1] - buffer_m, blk[2] + buffer_m, blk[3] + buffer_m), gsd)
                 src = [q for q, e in extents.items() if _intersects(e, buf)]
-                name = scene_name(p) + (f"_b{i}_{j}" if nx * ny > 1 else "")
+                name = scene_name(p) + (f"_b{i:02d}_{j:02d}" if nx * ny > 1 else "")
                 jobs.append(Job(name, blk, buf, src, p.name))
+    names = [j.name for j in jobs]
+    assert len(set(names)) == len(names), "duplicate job names"
     if not jobs:
         return [], (0.0, 0.0, 0.0, 0.0), problems
     cores = [j.core for j in jobs]
@@ -357,8 +366,23 @@ class Priorities:
         return written
 
 
+def _job_points(job: Job, counts: dict, extents: dict) -> float:
+    """Rough number of points a job reads (header counts x overlap share)."""
+    n = 0.0
+    b = job.buffered
+    for f in job.files:
+        e = extents.get(f)
+        if e is None:
+            continue
+        ix = max(0.0, min(b[2], e[2]) - max(b[0], e[0]))
+        iy = max(0.0, min(b[3], e[3]) - max(b[1], e[1]))
+        area = max((e[2] - e[0]) * (e[3] - e[1]), 1e-9)
+        n += counts.get(f, 0) * min(1.0, ix * iy / area)
+    return n
+
+
 def run_batch(tiles: list, out_dir: str | Path, net, spec: RuntimeSpec, *, gsd: float | None = None,
-              buffer_m: float | None = None, workers: int = 2, read_opts: dict | None = None,
+              buffer_m: float | None = None, workers: int = 1, read_opts: dict | None = None,
               overlays: bool = True, predict_kwargs: dict | None = None, max_block_m: float = 1000.0,
               block_m: float = 100.0, progress: Callable | None = None, log: Callable = print,
               cancelled: Callable = lambda: False, default_epsg: int | None = 27700) -> dict:
@@ -397,6 +421,16 @@ def run_batch(tiles: list, out_dir: str | Path, net, spec: RuntimeSpec, *, gsd: 
         raise ValueError("none of the input tiles could be read: "
                          + "; ".join(f"{k}: {v}" for k, v in problems.items()))
     G = Grid.from_bounds(*union, gsd)
+    try:                                       # memory: roughly 550 bytes per point read (TIN, rasters)
+        infos = {Path(f): header_info(f) for f in {f for j in jobs for f in j.files}}
+        counts = {f: i["point_count"] for f, i in infos.items()}
+        extents = {f: i["bounds"] for f, i in infos.items()}
+        worst = max(_job_points(j, counts, extents) for j in jobs)
+        gb = worst * 550 / 1e9
+        log(f"[info] largest tile job reads ~{worst / 1e6:.0f}M points, ~{gb:.1f} GB RAM per worker "
+            f"({max(1, workers)} worker(s) + 1 queued)")
+    except Exception:
+        pass
     keys = output_keys(spec, predict_kwargs)
     ov_keys = [k for k in keys if k in OUTPUT_PRESETS] if overlays else []
     tiles_dir = out / "tiles"
@@ -419,7 +453,8 @@ def run_batch(tiles: list, out_dir: str | Path, net, spec: RuntimeSpec, *, gsd: 
     def submit_upto(limit):
         nonlocal nxt
         while nxt < len(jobs) and len(pending) < limit:
-            pending[nxt] = ex.submit(prepare_job, jobs[nxt], gsd, ro, lasground)
+            pending[nxt] = ex.submit(prepare_job, jobs[nxt], gsd, ro, lasground,
+                                     tuple(spec.before_ground_classes or (2,)))
             nxt += 1
 
     try:
@@ -427,8 +462,12 @@ def run_batch(tiles: list, out_dir: str | Path, net, spec: RuntimeSpec, *, gsd: 
         for idx, job in enumerate(jobs):
             check_cancel()
             rec = {"name": job.name, "tile": job.tile}
+            fut = pending.pop(idx)
+            while not fut.done():                  # stay responsive to cancel during a slow read
+                check_cancel()
+                wait([fut], timeout=0.5)
             try:
-                arrs, grid, info = pending.pop(idx).result()
+                arrs, grid, info = fut.result()
             except ImportError:
                 raise                            # missing package: stop, the caller shows how to install it
             except Exception as e:
@@ -518,6 +557,25 @@ def run_batch(tiles: list, out_dir: str | Path, net, spec: RuntimeSpec, *, gsd: 
 
     # mosaics: VRT index over the tile files, then one compressed GeoTIFF each
     outputs = {}
+    try:
+        _mosaic(placed, outputs, out, G, gsd, crs)
+    except BaseException as e:
+        summary["error"] = f"writing mosaics failed: {e!r}"
+        summary["outputs"] = outputs
+        (out / "batch_summary.json").write_text(json.dumps(summary, indent=1))
+        raise
+    summary["outputs"] = outputs
+    prio.add_mosaics(outputs, G)
+    epsg = default_epsg if crs_is_default else epsg_of(crs)
+    summary["priority"] = prio.write(out, gsd, epsg)
+    summary["seconds"] = round(time.time() - t_start, 1)
+    if summary["failed"]:
+        log(f"[warn] {len(summary['failed'])} tiles/blocks failed; see batch_summary.json")
+    (out / "batch_summary.json").write_text(json.dumps(summary, indent=1))
+    return summary
+
+
+def _mosaic(placed: dict, outputs: dict, out: Path, G: Grid, gsd: float, crs):
     for name, items in placed.items():
         if not items:
             continue
@@ -538,15 +596,6 @@ def run_batch(tiles: list, out_dir: str | Path, net, spec: RuntimeSpec, *, gsd: 
                 tif.with_name(tif.stem + ".qml").write_text(qml_style(OUTPUT_PRESETS[name]))
         _write_sidecars(tif, G.xmin, G.ymax, gsd, crs)
         outputs[name] = str(tif)
-    summary["outputs"] = outputs
-    prio.add_mosaics(outputs, G)
-    epsg = default_epsg if crs_is_default else epsg_of(crs)
-    summary["priority"] = prio.write(out, gsd, epsg)
-    summary["seconds"] = round(time.time() - t_start, 1)
-    if summary["failed"]:
-        log(f"[warn] {len(summary['failed'])} tiles/blocks failed; see batch_summary.json")
-    (out / "batch_summary.json").write_text(json.dumps(summary, indent=1))
-    return summary
 
 
 def main(argv=None):
@@ -559,7 +608,9 @@ def main(argv=None):
     ap.add_argument("--out", required=True)
     ap.add_argument("--gsd", type=float, help="cell size (default: as trained)")
     ap.add_argument("--buffer", type=float, help="metres of neighbouring points (default: one network tile + 32 m)")
-    ap.add_argument("--workers", type=int, default=2, help="tiles read/rasterised in parallel")
+    ap.add_argument("--workers", type=int, default=1,
+                    help="tiles read/rasterised in the background (each needs several GB RAM; 1 already overlaps "
+                         "reading with prediction)")
     ap.add_argument("--device", default="auto")
     ap.add_argument("--blend", choices=["min", "linear", "mean"], default="linear")
     ap.add_argument("--prior", choices=["auto", "global", "channel", "none"], default="auto")

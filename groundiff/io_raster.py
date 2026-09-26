@@ -265,7 +265,12 @@ def vrt_to_geotiff(vrt_path: str | Path, out_path: str | Path, rgba: bool = Fals
         pass
     from osgeo import gdal
     co = ["COMPRESS=LZW", "TILED=YES", "BIGTIFF=IF_SAFER"] + (["PHOTOMETRIC=RGB", "ALPHA=YES"] if rgba else [])
-    gdal.Translate(str(out_path), str(vrt_path), creationOptions=co)
+    gdal.ErrorReset()
+    ds = gdal.Translate(str(out_path), str(vrt_path), creationOptions=co)
+    if ds is None:
+        raise OSError(f"writing {out_path} failed: {gdal.GetLastErrorMsg()}")
+    ds = None
+    _gdal_check(out_path)
 
 
 def epsg_of(crs_wkt: str | None) -> int | None:
@@ -309,6 +314,8 @@ def build_overviews(path: str | Path, resampling: str = "average", min_size: int
         pass
     from osgeo import gdal
     ds = gdal.Open(str(path), gdal.GA_Update)
+    if ds is None:
+        raise OSError(f"cannot open {path} to add overviews: {gdal.GetLastErrorMsg()}")
     factors, f = [], 2
     while max(ds.RasterXSize, ds.RasterYSize) / f >= min_size:
         factors.append(f)
