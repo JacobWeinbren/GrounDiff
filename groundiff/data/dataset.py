@@ -27,10 +27,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from ..normalise import normalise, tile_range
+from ..normalise import HEIGHT_CHANNELS, NEAREST_CHANNELS, channel_transform, tile_range
 
-HEIGHT_CHANNELS = {"dsm_max", "dsm_min", "dsm_last", "dtm_before", "gt_dtm"}
-NEAREST_CHANNELS = {"has_return", "sem_ground", "sem_nonground", "gt_valid", "before_valid"}
 
 
 @dataclass
@@ -58,18 +56,6 @@ class DataConfig:
     samples_per_epoch: int = 20000
     min_valid_frac: float = 0.05
     val_stride: int | None = None
-
-
-def channel_transform(name: str, x: np.ndarray, lo: float, scale: float) -> np.ndarray:
-    if name in HEIGHT_CHANNELS:
-        return normalise(x, lo, scale)
-    if name == "z_std":
-        return 2.0 * x / scale
-    if name == "density":
-        return np.log1p(np.maximum(x, 0.0)) / 4.0
-    if name == "echoes":
-        return (x - 1.0) / 2.0
-    return x
 
 
 class Scene:

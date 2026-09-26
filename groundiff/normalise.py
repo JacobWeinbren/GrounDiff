@@ -43,3 +43,20 @@ def normalise(x, lo, scale):
 
 def denormalise(xn, lo, scale):
     return (xn + 1.0) * 0.5 * scale + lo
+
+
+HEIGHT_CHANNELS = {"dsm_max", "dsm_min", "dsm_last", "dtm_before", "gt_dtm"}
+NEAREST_CHANNELS = {"has_return", "sem_ground", "sem_nonground", "gt_valid", "before_valid"}
+
+
+def channel_transform(name: str, x: np.ndarray, lo: float, scale: float) -> np.ndarray:
+    """Map a raster channel (metres or counts) into network units."""
+    if name in HEIGHT_CHANNELS:
+        return normalise(x, lo, scale)
+    if name == "z_std":
+        return 2.0 * x / scale
+    if name == "density":
+        return np.log1p(np.maximum(x, 0.0)) / 4.0
+    if name == "echoes":
+        return (x - 1.0) / 2.0
+    return x

@@ -116,7 +116,8 @@ class GrounDiff(nn.Module):
     # ----------------------------------------------------------------- sampling
 
     def initial_state(self, cond: torch.Tensor, init: str, prior: torch.Tensor | None,
-                      t_start: int, generator: torch.Generator | None = None) -> torch.Tensor:
+                      t_start: int, generator: torch.Generator | None = None,
+                      add_noise: bool = True) -> torch.Tensor:
         if init not in INITS:
             raise ValueError(f"init must be one of {INITS}")
         s = self.gate_surface(cond).float()
@@ -129,6 +130,8 @@ class GrounDiff(nn.Module):
         else:
             base = s
         noise = torch.randn(s.shape, device=s.device, generator=generator)
+        if not add_noise:
+            noise = torch.zeros_like(noise)
         if t_start < self.T:
             # Extension: q(g_{t_start} | base) instead of the paper's g_T.
             return self.q_sample(base, self.alphas_bar[t_start - 1].expand(s.shape[0]), noise)
@@ -138,12 +141,14 @@ class GrounDiff(nn.Module):
 
     @torch.no_grad()
     def sample(self, cond: torch.Tensor, init: str = "dsm_noise", prior: torch.Tensor | None = None,
-               t_start: int | None = None, generator: torch.Generator | None = None):
-        """Reverse process Eq. 6-10. Returns (g0, logit) of the final step."""
+               t_start: int | None = None, generator: torch.Generator | None = None,
+               add_noise: bool = True):
+        """Reverse process Eq. 6-10. Returns (g0, logit) of the final step.
+        add_noise=False gives the deterministic mean path (for tests/analysis)."""
         t_start = self.T if t_start is None else int(t_start)
         if not 1 <= t_start <= self.T:
             raise ValueError(f"t_start must be in [1, {self.T}]")
-        g_t = self.initial_state(cond, init, prior, t_start, generator)
+        g_t = self.initial_state(cond, init, prior, t_start, generator, add_noise)
         bsz = cond.shape[0]
         g0_hat = logit = None
         for t in range(t_start, 0, -1):
@@ -154,5 +159,7 @@ class GrounDiff(nn.Module):
             if t > 1:
                 mean = self.coef_x0[t - 1] * g0_hat + self.coef_xt[t - 1] * g_t
                 noise = torch.randn(g_t.shape, device=g_t.device, generator=generator)
+                if not add_noise:
+                    noise = torch.zeros_like(noise)
                 g_t = mean + self.posterior_var[t - 1].sqrt() * noise
         return g0_hat, logit
