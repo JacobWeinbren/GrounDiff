@@ -143,8 +143,11 @@ def quality(arrs: dict, alpha: float = 0.2, ground_tin: np.ndarray | None = None
     return q
 
 
-def is_suspect(q: dict, min_agree: float = 0.6, max_offset: float = 0.15, min_coverage: float = 0.8,
+def is_suspect(q: dict, min_agree: float = 0.6, max_offset: float = 0.15, min_coverage: float = 0.2,
                min_exact: float = 0.15) -> list:
+    """min_coverage is only a sanity check: on the coast the EA DTM leaves the
+    sea blank while the points include beach and sea returns, and only
+    covered cells are trained on anyway."""
     why = []
     if min_exact and q.get("exact_frac") is not None and q["exact_frac"] < min_exact:
         why.append(f"only {q['exact_frac']:.0%} of open-ground cells match the tile's ground within 5 mm: "
@@ -182,11 +185,19 @@ def process_scene(before: Path, out_root: Path, *, dtm_paths: list | None = None
     key = {"schema": SCHEMA, "gsd": gsd, "before": _stamp(before), "after": _stamp(after),
            "dtm": sorted(_stamp(Path(p)) for p in (dtm_paths or [])), "ground_classes": list(ground_classes),
            "before_ground_classes": list(before_ground_classes), "lasground": lasground,
-           "read_opts": read_opts, "coverage_close_m": coverage_close_m, "gate": gate or {}}
+           "read_opts": read_opts, "coverage_close_m": coverage_close_m}
     key = json.loads(json.dumps(key))
     if meta_path.exists() and not overwrite:
         meta = json.loads(meta_path.read_text())
-        if meta.get("cache_key") == key:
+        stored = dict(meta.get("cache_key") or {})
+        stored.pop("gate", None)               # older runs kept the thresholds in the key; they are re-applied below
+        if stored == key:
+            q = meta.get("quality")
+            if q is not None:                  # re-apply the current quality thresholds to the stored statistics
+                why = is_suspect({k: v for k, v in q.items() if k not in ("suspect", "reasons")}, **(gate or {}))
+                if bool(why) != q.get("suspect") or why != q.get("reasons"):
+                    q.update({"suspect": bool(why), "reasons": why})
+                    meta_path.write_text(json.dumps(meta, indent=1))
             if geotiff:                        # cached scene, GeoTIFFs asked for now: write them from the .npy
                 from ..io_raster import write_geotiff
                 g = meta["grid"]
@@ -390,9 +401,10 @@ def main(argv=None):
             from .ea_dtm import survey_year
             x0, y0, x1, y1 = b
             cover = [r for r in index if r["xmin"] < x1 and r["xmax"] > x0 and r["ymin"] < y1 and r["ymax"] > y0]
-            _, how = match_survey(p.name, cover)
-            match_counts[how] = match_counts.get(how, 0) + 1
             hits = rasters_for(b, index, survey_year(p.name), p.name)
+            if hits:
+                _, how = match_survey(p.name, cover)
+                match_counts[how] = match_counts.get(how, 0) + 1
             if not hits:
                 print(f"[warn] {k}: no DTM raster covers it; skipped")
                 continue
@@ -420,14 +432,17 @@ def main(argv=None):
                 failures += 1
                 print(f"  {name}: FAILED {e}", file=sys.stderr)
                 continue
-            if meta is None:
-                print(f"  {name}: cached")
-                continue
+            cached = meta is None
+            if cached:
+                meta = json.loads((a.out / scene_name(futures[fut]) / "meta.json").read_text())
             q = meta["quality"]
-            suspect += q["suspect"]
+            suspect += bool(q["suspect"])
             if q.get("exact_frac") is not None:
                 exact.append(q["exact_frac"])
-            print(f"  {name}: {meta['seconds']} s, agree {q.get('agree_frac', float('nan')):.0%}"
+            ex = q.get("exact_frac")
+            print(f"  {name}: " + ("cached" if cached else f"{meta['seconds']} s")
+                  + (f", 5 mm match {ex:.0%}" if ex is not None else "")
+                  + f", coverage {q.get('target_coverage', float('nan')):.0%}"
                   + (f"  SUSPECT: {'; '.join(q['reasons'])}" if q["suspect"] else ""))
     print(f"done: {len(jobs) - failures} scenes ({suspect} suspect, skipped by training), {failures} failed")
     if exact:

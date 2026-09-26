@@ -198,3 +198,17 @@ def test_match_survey_pairs_dtm_files_with_their_flight():
     assert match_survey("SU6570.laz", rows)[1] == "footprint"
     assert survey_dates("TL4378nw_P_12534_20220315_20220316.laz") == ("20220315", "20220316")
     assert survey_id("TL4378nw_P_12534_20220315_20220316.laz") == "12534"
+
+
+def test_cached_scene_is_regated_without_recomputing(laz):
+    root, _, before = laz
+    d = _dtm(root, name="dtm_regate")
+    hits = rasters_for((X0, Y0, X0 + 96, Y0 + 96), index_rasters(d))
+    meta = process_scene(before, root / "scenes_regate", dtm_paths=hits, gsd=1.0)
+    assert not meta["quality"]["suspect"]
+    npy = root / "scenes_regate" / "SX0000_dtm" / "gt_dtm.npy"
+    t0 = npy.stat().st_mtime_ns
+    assert process_scene(before, root / "scenes_regate", dtm_paths=hits, gsd=1.0,
+                         gate={"min_exact": 0.99}) is None                          # cached, not recomputed
+    m2 = json.loads((root / "scenes_regate" / "SX0000_dtm" / "meta.json").read_text())
+    assert m2["quality"]["suspect"] and npy.stat().st_mtime_ns == t0
