@@ -86,7 +86,17 @@ def bench_one(model: str, device: str, batch: int, reps: int, out: str) -> dict:
         y = net(x, g)
         times.append(time.time() - t0)
     np.save(out, y)
-    return {"device": device, "providers": net.providers, "warning": net.warning, "load_s": round(load_s, 1),
+    steps = 10                                         # network passes per tile: the diffusion steps
+    try:
+        spec = json.loads(net.session.get_modelmeta().custom_metadata_map.get("groundiff_spec") or "{}")
+        if spec.get("kind", "groundiff") == "groundiff":
+            steps = 1 if spec.get("one_step") else int(spec.get("T", 10))
+        else:
+            steps = 1
+    except Exception:
+        pass
+    return {"device": device, "steps": steps, "providers": net.providers, "warning": net.warning,
+            "load_s": round(load_s, 1),
             "warmup_s": round(warm_s, 1), "s_per_tile_step": min(times) / batch}
 
 
@@ -231,7 +241,7 @@ def run(model: str, devices: list | None = None, batch: int | list = 8, reps: in
             overall = bestr
         if best:
             log(f"{Path(mdl).name}: fastest with results matching the CPU: {best}, batch {bestr['batch']} "
-                f"(~{bestr['s_per_tile_step'] * TILES_5KM * 10 / 60:.0f} min per 5 km tile at 1 sample); "
+                f"(~{_tile_min(bestr)} min per 5 km tile at 1 sample); "
                 "'Auto' uses it for this file.")
     if overall and len(models) > 1:
         log(f"Overall fastest within the limit: {Path(overall['model']).name} on {overall['device']} - choose that "
@@ -239,11 +249,17 @@ def run(model: str, devices: list | None = None, batch: int | list = 8, reps: in
     return results
 
 
+def _tile_min(r: dict) -> str:
+    """Estimated minutes for a 5 km tile: tiles x network passes per tile (1 for a single-step model)."""
+    m = r["s_per_tile_step"] * TILES_5KM * r.get("steps", 10) / 60
+    return f"{m:.1f}" if m < 10 else f"{m:.0f}"
+
+
 def _line(r: dict) -> str:
     name = f"{r['device']}, batch {r.get('batch')}{r.get('tag', '')}"
     if not r.get("s_per_tile_step"):
         return f"{name}: not usable ({r.get('error')}); peak {r.get('peak_gb')} GB"
-    est = r["s_per_tile_step"] * TILES_5KM * 10 / 60
+    est = _tile_min(r)
     acc = (f"difference from the CPU: max {r['max_diff']:.1e}, mean {r['mean_diff']:.1e}"
            if "max_diff" in r else "")
     if "coreml_nodes" in r:
@@ -252,7 +268,7 @@ def _line(r: dict) -> str:
         if r.get("not_on_coreml"):
             acc += " (on the CPU: " + ", ".join(f"{k} x{v}" for k, v in sorted(r["not_on_coreml"].items())) + ")"
     flag = "" if r.get("ok") else f" - NOT USED: {r.get('error')}"
-    return (f"{name}: {r['s_per_tile_step']:.3f} s per tile-step (~{est:.0f} min per 5 km tile at 1 sample), "
+    return (f"{name}: {r['s_per_tile_step']:.3f} s per tile-step (~{est} min per 5 km tile at 1 sample), "
             f"peak {r['peak_gb']} GB, compile/warm-up {r.get('warmup_s')} s, {acc}{flag}")
 
 
