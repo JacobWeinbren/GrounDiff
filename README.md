@@ -135,7 +135,7 @@ tail -f runs/no_lastools.out                             # raw log
 
 # 7. evaluate on the held-out tiles, export for the PC / QGIS
 python -m groundiff.infer --checkpoint runs/no_lastools/best.pt --scenes data/scenes_1m \
-    --split-file data/split.json --split test --out results/test --samples 4
+    --split-file data/split.json --split test --out results/test
 python -m groundiff.export runs/no_lastools/best.pt --out models/no_lastools      # .onnx + .json
 python tools/build_qgis_plugin.py                                                # dist/groundiff_qgis.zip
 ```
@@ -285,7 +285,7 @@ exactly, batch 16 (loss means are per micro-batch). Inference needs ≈ 2–3 GB
 
 ```bash
 python -m groundiff.infer --checkpoint runs/no_lastools/best.pt --scenes data/scenes_1m \
-    --split-file data/split.json --split test --out results/test --samples 4
+    --split-file data/split.json --split test --out results/test
 ```
 
 Per scene: GeoTIFFs, overlays, `metrics.json` (as above, plus roughness) and
@@ -298,7 +298,7 @@ neither paper defines one.
 
 ```bash
 python -m groundiff.export runs/no_lastools/best.pt --out models/no_lastools     # checked vs PyTorch
-python -m groundiff.batch --onnx models/no_lastools.onnx --tiles "lasground/*.laz" --out results/area1 --samples 4
+python -m groundiff.batch --onnx models/no_lastools.onnx --tiles "lasground/*.laz" --out results/area1
 ```
 
 Inputs are tiles as `lasground_new` wrote them (quote wildcards; folders work

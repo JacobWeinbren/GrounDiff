@@ -205,8 +205,10 @@ def prepare_job(job: Job, gsd: float, read_opts: dict | None = None, lasground: 
                 cancelled: Callable = lambda: False) -> tuple[dict, Grid, dict]:
     """lasground: True = the model needs lasground_new classes (error if the
     tiles do not look like lasground_new output); "optional" = build the
-    lasground_new rasters only if they do (for dz_before / p_edit of models
-    that do not use them as inputs); False = never.
+    ground rasters if the tiles have class 2 (class 2 = ground, everything
+    else not: EA production also keeps bridge / noise classes), for
+    dz_before / p_edit of models that do not use them as inputs; False =
+    never.
     Each file is read once, chunk by chunk, straight into the rasters
     (data.stream); progress(fraction) follows the points read."""
     t0 = time.time()
@@ -237,10 +239,14 @@ def prepare_job(job: Job, gsd: float, read_opts: dict | None = None, lasground: 
     use_classes = False
     if lasground:
         hist = acc.class_histogram()
-        problem = check_lasground_classes(hist)
-        if problem and lasground is True:
-            raise ValueError(f"{problem} (classes {hist}); this model needs tiles classified by lasground_new")
-        use_classes = problem is None
+        info["classes"] = hist
+        if lasground is True:                  # the model takes lasground_new's classes as an input
+            problem = check_lasground_classes(hist)
+            if problem:
+                raise ValueError(f"{problem} (classes {hist}); this model needs tiles classified by lasground_new")
+            use_classes = True
+        else:                                  # only the reference DTM: class 2 is ground, all else is not
+            use_classes = bool(hist.get(2))
         info["lasground_classes"] = use_classes
     if progress:
         progress(1.0)
@@ -559,13 +565,12 @@ def run_batch(tiles: list, out_dir: str | Path, net, spec: RuntimeSpec, *, gsd: 
                 continue
             rec.update({k: v for k, v in info.items() if k != "crs_wkt"})
             log(f"{job.name}: {info['n_points'] / 1e6:.1f}M points read in {info.get('read_s')} s, rasters "
-                f"{'with' if info.get('lasground_classes') else 'without'} the lasground_new TIN in "
-                f"{info.get('tin_s')} s")
+                f"{'with' if info.get('lasground_classes') else 'without'} the ground TIN in "
+                f"{info.get('tin_s')} s; classes {info.get('classes')}")
             if lasground == "optional" and info.get("lasground_classes") is False and not warned_classes:
                 warned_classes = True
-                log(f"[info] {job.name} does not look like lasground_new output (it has classes other than 1/2, "
-                    "e.g. a published EA tile), so no lasground_new DTM, predicted edit or edit probability "
-                    "can be made for it: only the predicted DTM. Run it on your lasground_new tiles.")
+                log(f"[info] {job.name} has no ground (class 2) points, so no ground DTM, predicted edit or "
+                    "edit probability can be made for it: only the predicted DTM.")
             if not arrs:
                 rec["skipped"] = "no points"
                 summary["tiles"].append(rec)
@@ -634,8 +639,8 @@ def run_batch(tiles: list, out_dir: str | Path, net, spec: RuntimeSpec, *, gsd: 
         raise
     ex.shutdown(wait=True)
     if lasground == "optional" and not any(t.get("lasground_classes") for t in summary["tiles"]):
-        log("[info] the tiles do not look like lasground_new output (classes other than 1/2), so there is no "
-            "predicted edit (dz_before / p_edit), only the predicted DTM")
+        log("[info] the tiles have no ground (class 2) points, so there is no predicted edit "
+            "(dz_before / p_edit), only the predicted DTM")
     if not any("skipped" not in t for t in summary["tiles"]):
         (out / "batch_summary.json").write_text(json.dumps(summary, indent=1))
         errs = "; ".join(f"{f.get('job', f['file'])}: {f['error']}" for f in summary["failed"][:5])

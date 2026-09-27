@@ -4,7 +4,7 @@ import os
 import numpy as np
 import pytest
 
-from groundiff.batch import Cancelled, plan, run_batch
+from groundiff.batch import Cancelled, expand_inputs, plan, run_batch
 from groundiff.data.laz import concat, read_points
 from groundiff.data.rasterise import Grid, tin_dtm
 from groundiff.runtime import RuntimeSpec
@@ -198,8 +198,19 @@ def test_dsm_only_model_gives_edit_map_on_lasground_tiles(tiles, tmp_path):
     assert np.nanmean(pe[trees]) > 0.8 and np.nanmean(dz[trees]) > 5.0
     assert np.nanmean(pe[open_ground]) < 0.1
     assert (tmp_path / "o" / "p_edit_overlay.tif").exists() and (tmp_path / "o" / "std.tif").exists()
-    # published-style classes: no lasground reference -> DTM only, no error
+    # other classes besides 1/2 (published EA tiles, or EA production's bridge / noise): class 2 is
+    # still the ground reference -> edit maps
     s = run_batch(after, tmp_path / "p", keep_gate_net, spec, buffer_m=40.0, workers=1,
+                  predict_kwargs={"batch_size": 4})
+    assert "p_edit" in s["outputs"] and "dz_before" in s["outputs"]
+    # no class 2 at all: DTM only, no error
+    import laspy
+    for f in expand_inputs([str(a) for a in after]):
+        las = laspy.read(str(f))
+        las.classification = np.where(las.classification == 2, 1, las.classification).astype(np.uint8)
+        (tmp_path / "noground").mkdir(exist_ok=True)
+        las.write(str(tmp_path / "noground" / f.name))
+    s = run_batch([tmp_path / "noground"], tmp_path / "q", keep_gate_net, spec, buffer_m=40.0, workers=1,
                   predict_kwargs={"batch_size": 4})
     assert "dtm" in s["outputs"] and "p_edit" not in s["outputs"] and "dz_before" not in s["outputs"]
 

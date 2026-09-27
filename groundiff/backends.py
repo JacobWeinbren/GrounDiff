@@ -30,6 +30,23 @@ class TorchNet:
 GPU_PROVIDERS = ("CUDAExecutionProvider", "DmlExecutionProvider", "CoreMLExecutionProvider")
 
 
+def cpu_threads() -> int:
+    """Threads for ONNX Runtime on the CPU: the performance cores on Apple
+    silicon (efficiency cores would hold every step back), else all cores."""
+    import os
+    import subprocess
+    import sys
+    if sys.platform == "darwin":
+        try:
+            n = int(subprocess.run(["sysctl", "-n", "hw.perflevel0.physicalcpu"], capture_output=True,
+                                   text=True, timeout=5).stdout.strip())
+            if n > 0:
+                return n
+        except Exception:
+            pass
+    return max(1, os.cpu_count() or 1)
+
+
 class OnnxNet:
     """ONNX Runtime session. providers: e.g. ["CUDAExecutionProvider",
     "CPUExecutionProvider"], ["DmlExecutionProvider", ...] on Windows
@@ -51,12 +68,14 @@ class OnnxNet:
             except Exception:
                 pass
         self.warning = None
+        so = ort.SessionOptions()
+        so.intra_op_num_threads = cpu_threads()
         try:
-            self.session = ort.InferenceSession(str(path), providers=providers)
+            self.session = ort.InferenceSession(str(path), so, providers=providers)
         except Exception as e:                     # e.g. CoreML/DirectML cannot take this graph: use the CPU
             if providers == ["CPUExecutionProvider"]:
                 raise
-            self.session = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+            self.session = ort.InferenceSession(str(path), so, providers=["CPUExecutionProvider"])
             self.warning = f"{providers[0]} could not load the model ({e}); running on the CPU"
         self.inputs = [i.name for i in self.session.get_inputs()]
         self.providers = self.session.get_providers()

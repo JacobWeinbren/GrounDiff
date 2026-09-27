@@ -119,8 +119,9 @@ def _run_params(alg):
     add(QgsProcessingParameterEnum("BLEND", "Tile blending", options=BLENDS, defaultValue=0))
     add(QgsProcessingParameterEnum("PRIOR", "Prior (PrioStitch)", options=PRIORS, defaultValue=0))
     add(QgsProcessingParameterNumber(
-        "SAMPLES", "Diffusion samples (more = smoother edit probability and an uncertainty map; time x samples)",
-        type=NUM_INT, defaultValue=4, minValue=1, maxValue=16))
+        "SAMPLES", "Diffusion samples per network tile (the 50 % tile overlap already gives each cell ~4; "
+        "time x samples; 2+ also writes an uncertainty map)",
+        type=NUM_INT, defaultValue=1, minValue=1, maxValue=16))
     add(QgsProcessingParameterBoolean("TTA", "Average 8 flips/rotations", defaultValue=False))
     add(QgsProcessingParameterNumber("BATCH", "Network tiles per batch", type=NUM_INT,
                                      defaultValue=8, minValue=1, maxValue=128))

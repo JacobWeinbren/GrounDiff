@@ -371,6 +371,20 @@ def predict_scene(arrs: dict, spec: RuntimeSpec, net: Callable, *, stride: int |
     window = lambda a, r, c: _window(a, r, c, t)
 
     jobs = [(r, c) for r in rows for c in cols]
+    # progress after every network call (a batch is views x samples x steps calls: minutes on a CPU)
+    steps = (spec.T if t_start is None else int(t_start)) if is_diff else 1
+    per_batch = len(views) * (n_samples if is_diff else 1) * steps
+    n_batches = max(1, -(-len(jobs) // batch_size))
+    calls = [0]
+    net_main = net
+
+    def net(*a, _f=net_main):
+        out = _f(*a)
+        calls[0] += 1
+        if progress:
+            progress(min(calls[0] / (n_batches * per_batch), 1.0))
+        return out
+
     for j0 in range(0, len(jobs), batch_size):
         chunk = jobs[j0:j0 + batch_size]
         tiles, los, scs, priors = [], [], [], []
@@ -434,7 +448,7 @@ def predict_scene(arrs: dict, spec: RuntimeSpec, net: Callable, *, stride: int |
             if pg is not None:
                 pg_acc[sl] += pg[i, 0][tl]
         if progress:
-            progress(min(j0 + batch_size, len(jobs)) / len(jobs))
+            progress(min(j0 // batch_size + 1, n_batches) / n_batches)
 
     dtm = acc if blend == "min" else acc / np.maximum(wsum, 1e-12)
     has_data = survey_mask(arrs, spec, gsd) & (cnt > 0)
