@@ -7,7 +7,8 @@
 #
 # Resumable: run the same command again after a stop; finished steps are skipped (markers in
 # data/v2/done/), downloads and scenes are cached, training continues from last.pt.
-# Settings (environment): TARGET=700 tiles, WORKERS=4 preprocess processes, MIN_FREE_GB=120,
+# Settings (environment): TARGET=700 tiles, WORKERS=4 preprocess processes, MIN_FREE_GB (default: estimated
+# from the steps left),
 # FROM_SCRATCH=1 to train the diffusion model from scratch (SCRATCH_STEPS=20000) instead of
 # fine-tuning runs/no_lastools/best.pt; STOP_AFTER=split for the data steps only.
 set -euo pipefail
@@ -16,7 +17,6 @@ cd "$(dirname "$0")/.."
 
 TARGET=${TARGET:-700}
 WORKERS=${WORKERS:-4}
-MIN_FREE_GB=${MIN_FREE_GB:-120}
 FROM_SCRATCH=${FROM_SCRATCH:-0}
 SCRATCH_STEPS=${SCRATCH_STEPS:-20000}
 D=data/v2
@@ -26,14 +26,26 @@ say() { echo; echo "=== $(date '+%a %H:%M') $*"; }
 done_() { [ -f "$D/done/$1" ]; }
 mark() { touch "$D/done/$1"; }
 
+# free space needed for the steps still to do (finished ones already hold their data)
 free_gb=$(df -Pk . | awk 'NR==2 {print int($4 / 1048576)}')
-used_gb=$(du -sk "$D" 2>/dev/null | awk '{print int($1 / 1048576)}')
-if [ $((free_gb + used_gb)) -lt "$MIN_FREE_GB" ]; then
-  echo "Only ${free_gb} GB free (+${used_gb} GB already in $D): this needs about ${MIN_FREE_GB} GB"
-  echo "(laz ~20 GB, EA DTM ~30 GB, scenes ~50 GB). Free some space, lower TARGET, or set MIN_FREE_GB."
+n_laz=$(find "$D/laz" -maxdepth 1 -name '*.laz' 2>/dev/null | wc -l | tr -d ' ')
+n_scenes=$(find "$D/scenes" -mindepth 2 -maxdepth 2 -name meta.json 2>/dev/null | wc -l | tr -d ' ')
+need_gb=10                                            # checkpoints, results, models
+done_ download || need_gb=$((need_gb + 25))
+done_ ea_dtm || need_gb=$((need_gb + 30))
+if ! done_ preprocess; then
+  if done_ download && [ "$n_laz" -gt 0 ]; then left=$((n_laz - n_scenes)); else left=$TARGET; fi
+  if [ "$left" -lt 0 ]; then left=0; fi
+  need_gb=$((need_gb + left * 65 / 1024 + 1))        # ~65 MB per 2 km scene
+fi
+if [ -n "${MIN_FREE_GB:-}" ]; then need_gb=$MIN_FREE_GB; fi   # explicit override
+say "GrounDiff v2: ${TARGET} tiles, ${free_gb} GB free, about ${need_gb} GB needed for the steps left" \
+    "(point clouds: ${n_laz}, scenes done: ${n_scenes}), $(git rev-parse --short HEAD)"
+if [ "$free_gb" -lt "$need_gb" ]; then
+  echo "Not enough free space: ${free_gb} GB free, about ${need_gb} GB needed. Free some space (the finished"
+  echo "steps' data stays), or set MIN_FREE_GB to the space you know is needed."
   exit 1
 fi
-say "GrounDiff v2: ${TARGET} tiles, ${free_gb} GB free, $(git rev-parse --short HEAD)"
 
 if ! done_ select; then
   say "1/10 choosing tiles (lidar scan of every DEFRA 2022 tile + OpenStreetMap; ~30-60 min, resumable)"
