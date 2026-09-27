@@ -9,6 +9,7 @@
 # data/v2/done/), downloads and scenes are cached, training continues from last.pt.
 # Settings (environment): TARGET=700 tiles, WORKERS=4 preprocess processes, MIN_FREE_GB=120.
 set -euo pipefail
+export PYTHONUNBUFFERED=1                # progress lines reach the log as they happen
 cd "$(dirname "$0")/.."
 
 TARGET=${TARGET:-700}
