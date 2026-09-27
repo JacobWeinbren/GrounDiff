@@ -13,7 +13,7 @@ How tiles are processed
   * Each tile's extent comes from its header, checked against its point count
     and its OS grid name (e.g. TL4378nw = 500 m quadrant); a header that
     cannot be right is replaced by the bounds of the points themselves.
-  * Every tile (or 1 km block of a larger tile) is processed with a buffer of
+  * Every tile (or 6 km block of a larger one) is processed with a buffer of
     neighbouring points (default: one network tile + 32 m) and cropped back.
     Network tiles sit on one lattice anchored to the British National Grid
     origin and each tile's sampling noise is seeded by its position, so
@@ -21,11 +21,12 @@ How tiles are processed
     Re-running part of an area reproduces the same numbers away from the edge
     of the new selection (within one buffer of it, neighbouring points are
     missing unless those tiles are selected too).
-  * Tiles are read and rasterised in the background while the network works
-    on the previous one. A job holds roughly 550 bytes per point read: about
-    6-7 GB for a 500 m tile at EA density with the automatic buffer, so the
-    default is one background worker (it already overlaps reading with the
-    GPU); the log gives an estimate per run.
+  * Each file is read once, chunk by chunk, straight into the rasters
+    (data.stream): memory is ~50 bytes per cell plus 12 per ground point
+    (about 2 GB for a 2 km tile at 1 m), not per point read. The ground TIN
+    is built in blocks that give exactly one TIN of all points
+    (rasterise.tin_dtm_local). The next tile is read while the network works
+    on the current one; the log gives an estimate per run.
   * A tile that fails (unreadable file, wrong classes) is reported in
     batch_summary.json and the run carries on.
 
@@ -52,10 +53,11 @@ from typing import Callable
 
 import numpy as np
 
-from .data.laz import class_histogram, concat, data_bounds, header_info, read_points_bbox
+from .data.laz import data_bounds, header_info
 from .data.osgrid import parse_tile
 from .data.preprocess import check_lasground_classes, scene_name
-from .data.rasterise import Grid, input_rasters
+from .data.rasterise import Grid
+from .data.stream import Accumulator, stream_file
 from .io_raster import (build_overviews, build_vrt, crs_wkt_from_epsg, epsg_of, iter_rows, vrt_to_geotiff,
                         write_geotiff)
 from .overlay import _write_sidecars, qml_style, render_rgba, write_rgba_geotiff
@@ -108,7 +110,11 @@ def expand_inputs(paths: list) -> list[Path]:
                 if key not in seen:
                     seen.add(key)
                     out.append(f)
-    return out
+    # QGIS writes <name>.copc.laz next to a tile it loads: the same points, so keep the original
+    names = {str(f.with_name(f.name[:-len(f.suffix)])).lower() for f in out
+             if not f.name.lower().endswith(".copc.laz")}
+    return [f for f in out if not (f.name.lower().endswith(".copc.laz")
+                                   and str(f.with_name(f.name[:-len(".copc.laz")])).lower() in names)]
 
 
 def _find_las(folder: Path) -> list[Path]:
@@ -145,9 +151,9 @@ def tile_extent(path: Path, max_extent_m: float = 5000.0, log: Callable = print)
     return b
 
 
-def plan(tiles: list, gsd: float, buffer_m: float, max_block_m: float = 1000.0,
+def plan(tiles: list, gsd: float, buffer_m: float, max_block_m: float = 6000.0,
          log: Callable = print) -> tuple[list[Job], tuple, dict]:
-    """One job per tile, split into blocks of at most max_block_m on a side.
+    """One job per tile (tiles larger than max_block_m are split into blocks).
     Returns (jobs, union of cores, {file name: error} for unusable files)."""
     tiles = [Path(p) for p in tiles]
     names: dict = {}
@@ -195,30 +201,54 @@ def plan(tiles: list, gsd: float, buffer_m: float, max_block_m: float = 1000.0,
 
 
 def prepare_job(job: Job, gsd: float, read_opts: dict | None = None, lasground: bool | str = True,
-                before_ground_classes=(2,)) -> tuple[dict, Grid, dict]:
+                before_ground_classes=(2,), progress: Callable | None = None,
+                cancelled: Callable = lambda: False) -> tuple[dict, Grid, dict]:
     """lasground: True = the model needs lasground_new classes (error if the
     tiles do not look like lasground_new output); "optional" = build the
     lasground_new rasters only if they do (for dz_before / p_edit of models
-    that do not use them as inputs); False = never."""
-    read_opts = dict(read_opts or {})
+    that do not use them as inputs); False = never.
+    Each file is read once, chunk by chunk, straight into the rasters
+    (data.stream); progress(fraction) follows the points read."""
     t0 = time.time()
-    pts = concat([read_points_bbox(f, job.buffered, **read_opts) for f in job.files])
     grid = Grid(job.buffered[0], job.buffered[3], gsd, int(round((job.buffered[2] - job.buffered[0]) / gsd)),
                 int(round((job.buffered[3] - job.buffered[1]) / gsd)))
-    info = {"n_points": len(pts), "crs_wkt": pts.crs_wkt}
-    if len(pts) == 0:
+    acc = Accumulator(grid, keep_ground=bool(lasground), ground_classes=before_ground_classes)
+    sizes = []
+    for f in job.files:
+        try:
+            sizes.append(max(header_info(f)["point_count"], 1))
+        except Exception:
+            sizes.append(1)
+    done = 0.0
+    for f, n in zip(job.files, sizes):
+        def prog(fr, _done=done, _n=n):
+            if progress:
+                progress((_done + fr * _n) / sum(sizes))
+        try:
+            stream_file(f, job.buffered, acc, read_opts, progress=prog, cancelled=cancelled)
+        except RuntimeError as e:
+            if str(e) == "cancelled":
+                raise Cancelled() from e
+            raise RuntimeError(f"cannot read {Path(f).name}: {e}") from e
+        done += n
+    info = {"n_points": acc.n_points, "crs_wkt": acc.crs_wkt}
+    if acc.n_points == 0:
         return {}, grid, info
     use_classes = False
     if lasground:
-        hist = class_histogram(pts.cls)
+        hist = acc.class_histogram()
         problem = check_lasground_classes(hist)
         if problem and lasground is True:
             raise ValueError(f"{problem} (classes {hist}); this model needs tiles classified by lasground_new")
         use_classes = problem is None
         info["lasground_classes"] = use_classes
-    arrs = input_rasters(grid, pts, use_classes, before_ground_classes)
+    if progress:
+        progress(1.0)
     info["read_s"] = round(time.time() - t0, 1)
-    return {k: v.astype(np.float64) for k, v in arrs.items()}, grid, info
+    t1 = time.time()
+    arrs = acc.rasters(use_classes)
+    info["tin_s"] = round(time.time() - t1, 1)
+    return arrs, grid, info
 
 
 def output_keys(spec: RuntimeSpec, predict_kwargs: dict | None = None) -> list[str]:
@@ -398,7 +428,7 @@ def _job_points(job: Job, counts: dict, extents: dict) -> float:
 
 def run_batch(tiles: list, out_dir: str | Path, net, spec: RuntimeSpec, *, gsd: float | None = None,
               buffer_m: float | None = None, workers: int = 1, read_opts: dict | None = None,
-              overlays: bool = True, predict_kwargs: dict | None = None, max_block_m: float = 1000.0,
+              overlays: bool = True, predict_kwargs: dict | None = None, max_block_m: float = 6000.0,
               block_m: float = 100.0, progress: Callable | None = None, log: Callable = print,
               cancelled: Callable = lambda: False, default_epsg: int | None = 27700,
               status: Callable | None = None) -> dict:
@@ -441,14 +471,15 @@ def run_batch(tiles: list, out_dir: str | Path, net, spec: RuntimeSpec, *, gsd: 
                          + "; ".join(f"{k}: {v}" for k, v in problems.items()))
     G = Grid.from_bounds(*union, gsd)
     counts, extents = {}, {}
-    try:                                       # memory: roughly 550 bytes per point read (TIN, rasters)
+    try:                                       # memory: ~50 bytes per cell + 12 per ground point + TIN blocks
         infos = {Path(f): header_info(f) for f in {f for j in jobs for f in j.files}}
         counts = {f: i["point_count"] for f, i in infos.items()}
         extents = {f: i["bounds"] for f, i in infos.items()}
-        worst = max(_job_points(j, counts, extents) for j in jobs)
-        gb = worst * 550 / 1e9
-        log(f"[info] largest tile job reads ~{worst / 1e6:.0f}M points, ~{gb:.1f} GB RAM per worker "
-            f"({max(1, workers)} worker(s) + 1 queued)")
+        worst = max(jobs, key=lambda j: _job_points(j, counts, extents))
+        pts = _job_points(worst, counts, extents)
+        cells = (worst.buffered[2] - worst.buffered[0]) * (worst.buffered[3] - worst.buffered[1]) / gsd ** 2
+        gb = (cells * 60 + pts * 0.6 * 12) / 1e9 + 1.0
+        log(f"[info] largest tile: ~{pts / 1e6:.0f}M points; reading it needs about {gb:.1f} GB RAM")
     except Exception:
         pass
     keys = output_keys(spec, predict_kwargs)
@@ -463,6 +494,7 @@ def run_batch(tiles: list, out_dir: str | Path, net, spec: RuntimeSpec, *, gsd: 
     crs, crs_is_default = None, False
     t_start = time.time()
     TILES_SHARE = 0.95
+    READ_SHARE = 0.3                           # of each tile's slot (reads overlap the previous tile's model run)
     done_frac = [0.0]
 
     def say(text):
@@ -483,42 +515,43 @@ def run_batch(tiles: list, out_dir: str | Path, net, spec: RuntimeSpec, *, gsd: 
             raise Cancelled()
 
     ex = ThreadPoolExecutor(max_workers=max(1, workers))
-    pending, nxt = {}, 0
+    pending, nxt, read_frac = {}, 0, {}
 
     def submit_upto(limit):
         nonlocal nxt
         while nxt < len(jobs) and len(pending) < limit:
+            read_frac[nxt] = 0.0
             pending[nxt] = ex.submit(prepare_job, jobs[nxt], gsd, ro, lasground,
-                                     tuple(spec.before_ground_classes or (2,)))
+                                     tuple(spec.before_ground_classes or (2,)),
+                                     lambda f, _k=nxt: read_frac.__setitem__(_k, f), cancelled)
             nxt += 1
 
     try:
-        submit_upto(max(1, workers) + 1)
+        # workers=1: the next tile is read while this one runs through the model (2 tiles in memory)
+        submit_upto(max(1, workers))
         for idx, job in enumerate(jobs):
             check_cancel()
             rec = {"name": job.name, "tile": job.tile}
             fut = pending.pop(idx)
             label = f"Tile {idx + 1}/{len(jobs)} {job.name}"
-            try:
-                n_pts = _job_points(job, counts, extents) if counts else 0
-            except Exception:
-                n_pts = 0
             t_read = time.time()
             while not fut.done():                  # stay responsive to cancel during a slow read
                 check_cancel()
-                say(f"{label}: reading points" + (f" ({n_pts / 1e6:.1f}M)" if n_pts else "")
+                fr = read_frac.get(idx, 0.0)
+                report((idx + READ_SHARE * fr) / len(jobs))
+                say(f"{label}: " + (f"reading points {100 * fr:.0f} %" if fr < 1 else "building the ground TIN")
                     + f", {time.time() - t_read:.0f} s{left()}")
                 wait([fut], timeout=0.5)
             try:
                 arrs, grid, info = fut.result()
-            except ImportError:
+            except (ImportError, Cancelled):
                 raise                            # missing package: stop, the caller shows how to install it
             except Exception as e:
                 msg = str(e)
                 if "LazBackend" in msg or "lazrs" in msg or "laszip" in msg:
                     raise ImportError(f"LAZ support missing ({msg}); install laspy[lazrs]") from e
                 arrs, rec["error"] = None, msg
-            submit_upto(max(1, workers) + 1)
+            submit_upto(max(1, workers))
             if arrs is None:
                 log(f"[error] {job.name}: {rec['error']}")
                 summary["failed"].append({"file": job.tile, "job": job.name, "error": rec["error"]})
@@ -548,7 +581,7 @@ def run_batch(tiles: list, out_dir: str | Path, net, spec: RuntimeSpec, *, gsd: 
 
             def prog(f, _idx=idx, _label=label):
                 check_cancel()
-                report((_idx + f) / len(jobs))
+                report((_idx + READ_SHARE + (1 - READ_SHARE) * f) / len(jobs))
                 say(f"{_label}: model {100 * f:.0f} %{left()}")
 
             try:
@@ -677,7 +710,7 @@ def main(argv=None):
     ap.add_argument("--gsd", type=float, help="cell size (default: as trained)")
     ap.add_argument("--buffer", type=float, help="metres of neighbouring points (default: one network tile + 32 m)")
     ap.add_argument("--workers", type=int, default=1,
-                    help="tiles read/rasterised in the background (each needs several GB RAM; 1 already overlaps "
+                    help="tiles read/rasterised in the background (each needs a few GB RAM; 1 already overlaps "
                          "reading with prediction)")
     ap.add_argument("--device", default="auto")
     ap.add_argument("--blend", choices=["min", "linear", "mean"], default="linear")

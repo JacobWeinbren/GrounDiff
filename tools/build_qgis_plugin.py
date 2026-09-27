@@ -13,7 +13,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 CORE_FILES = ["runtime.py", "normalise.py", "io_raster.py", "backends.py", "schedule.py", "overlay.py",
               "batch.py", "data/rasterise.py", "data/laz.py", "data/lasinspect.py", "data/preprocess.py",
-              "data/osgrid.py"]
+              "data/osgrid.py", "data/stream.py"]
 
 
 def build(dest: Path) -> Path:

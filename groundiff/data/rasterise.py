@@ -23,6 +23,8 @@ rasters (`target_from_rasters`).
 """
 from __future__ import annotations
 
+import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import numpy as np
@@ -137,25 +139,264 @@ def top_return_is(grid: Grid, x, y, z, flag) -> np.ndarray:
     return out.reshape(grid.height, grid.width).astype(np.float32)
 
 
-def tin_dtm(grid: Grid, x, y, z):
+def tin_dtm(grid: Grid, x, y, z, block_points: int = 300_000, workers: int | None = None):
     """Linear interpolation on a Delaunay triangulation (TIN) of all given
     points, evaluated at cell centres. Returns (dtm, valid) where valid is
-    False outside the convex hull. No thinning, so training scenes and
-    inference blocks of any size give the same surface (memory is roughly
-    300 bytes per point: keep inference blocks to ~1 km)."""
-    from scipy.interpolate import LinearNDInterpolator
+    False outside the convex hull. No thinning."""
+    # local coordinates: Delaunay on 6-7 digit BNG values loses precision
+    return tin_dtm_local(grid, np.asarray(x) - grid.xmin, np.asarray(y) - grid.ymax, z, block_points, workers)
 
-    if x.size < 3:
-        return (np.full((grid.height, grid.width), np.nan, np.float32),
-                np.zeros((grid.height, grid.width), bool))
-    xs, ys = grid.cell_centres()
-    # interpolate in local coordinates: Delaunay on 6-7 digit BNG values loses precision
-    ox, oy = grid.xmin, grid.ymax
-    interp = LinearNDInterpolator(np.column_stack([x - ox, y - oy]), z.astype(np.float64),
-                                  fill_value=np.nan)
-    XX, YY = np.meshgrid(xs - ox, ys - oy)
-    dtm = interp(XX, YY).astype(np.float32)
+
+def tin_dtm_local(grid: Grid, lx, ly, z, block_points: int = 300_000, workers: int | None = None):
+    """tin_dtm with coordinates relative to (grid.xmin, grid.ymax) (ly <= 0),
+    in any float dtype (float32 keeps big tiles small).
+
+    Large inputs are triangulated in blocks of ~block_points in parallel
+    threads (Qhull slows down sharply beyond a few 100k points and needs
+    ~300 bytes per point). Each block sees the points within a margin around
+    it, and a cell's value is only accepted when the circumcircle of its
+    triangle lies inside the points the block saw: such a triangle is then a
+    triangle of the full Delaunay triangulation (empty-circle property), so
+    the result equals one TIN of all points. Other cells (large voids:
+    water, buildings) are redone with a wider margin."""
+    H, W, gsd = grid.height, grid.width, grid.gsd
+    dtm = np.full((H, W), np.nan, np.float32)
+    n = int(np.size(lx))
+    if n < 3:
+        return dtm, np.zeros((H, W), bool)
+    lx, ly = np.asarray(lx), np.asarray(ly)
+    z = np.asarray(z)
+    ext = (float(lx.min()), float(ly.min()), float(lx.max()), float(ly.max()))     # all points
+    if n <= 2 * block_points:
+        _tin_cells(dtm, grid, lx, ly, z, (0, H, 0, W), None, ext)
+        return dtm, np.isfinite(dtm)
+    density = n / max(W * H * gsd * gsd, 1e-9)
+    side = int(np.clip(np.ceil(np.sqrt(block_points / density) / gsd), 32, max(H, W)))
+    margin = max(15.0, 0.1 * side * gsd)
+    workers = workers or min(8, os.cpu_count() or 1)
+    bins = _Bins(lx, ly, side * gsd, int(np.ceil(W / side)), int(np.ceil(H / side)))
+
+    def gather(reg):
+        i = bins.query(reg)
+        return lx[i], ly[i], z[i]
+
+    jobs = []
+    for c0 in range(0, W, side):
+        c1 = min(c0 + side, W)
+        for r0 in range(0, H, side):
+            r1 = min(r0 + side, H)
+            reg = (c0 * gsd - margin, -r1 * gsd - margin, c1 * gsd + margin, -r0 * gsd + margin)
+            jobs.append(((r0, r1, c0, c1), None, reg))
+    hull = None
+    while jobs:
+        def run(j):
+            blk, cells, reg = j
+            whole = reg is None or (reg[0] <= ext[0] and reg[2] >= ext[2] and reg[1] <= ext[1] and reg[3] >= ext[3])
+            if whole:
+                return _tin_cells(dtm, grid, lx, ly, z, blk, cells, ext, None)
+            return _tin_cells(dtm, grid, *gather(reg), blk, cells, ext, reg)
+        with ThreadPoolExecutor(workers) as ex:
+            res = list(ex.map(run, jobs))
+        jobs = []
+        if hull is None:
+            # every vertex of the full hull is a hull vertex of some block: hull of their union
+            hv = [r["hull"] for r in res if r["hull"] is not None]
+            hull = _Hull(np.concatenate(hv) if hv else np.zeros((0, 2)))
+        for r in res:
+            if r["redo"] is None:
+                continue
+            rows, cols, outside, (x0, y0, x1, y1) = r["redo"]
+            if outside.any():               # outside this block's TIN: fine if outside the full hull too
+                inh = hull.contains((cols + 0.5) * gsd, -(rows + 0.5) * gsd)
+                keep = ~outside | inh
+                rows, cols = rows[keep], cols[keep]
+                if not rows.size:
+                    continue
+            jobs.append(((0, H, 0, W), (rows, cols), (x0, y0, x1, y1)))
     return dtm, np.isfinite(dtm)
+
+
+class _Bins:
+    """Points sorted into square bins once, so a region's points are found
+    without scanning them all (int32 index: 4 bytes per point)."""
+
+    def __init__(self, lx, ly, size, nx, ny):
+        self.size, self.nx, self.ny = size, nx, ny
+        bx = np.clip(np.floor(lx / size), 0, nx - 1).astype(np.int32)
+        by = np.clip(np.floor(-ly / size), 0, ny - 1).astype(np.int32)
+        b = by * nx + bx
+        del bx, by
+        self.order = np.argsort(b, kind="stable").astype(np.int32 if b.size < 2 ** 31 else np.int64)
+        self.start = np.searchsorted(b[self.order], np.arange(nx * ny + 1))
+        self.lx, self.ly = lx, ly
+
+    def query(self, reg):
+        x0, y0, x1, y1 = reg
+        s = self.size
+        cx0, cx1 = int(np.clip(np.floor(x0 / s), 0, self.nx - 1)), int(np.clip(np.floor(x1 / s), 0, self.nx - 1))
+        cy0, cy1 = int(np.clip(np.floor(-y1 / s), 0, self.ny - 1)), int(np.clip(np.floor(-y0 / s), 0, self.ny - 1))
+        parts = [self.order[self.start[r * self.nx + cx0]:self.start[r * self.nx + cx1 + 1]]
+                 for r in range(cy0, cy1 + 1)]
+        i = np.sort(np.concatenate(parts)) if parts else np.zeros(0, np.int64)   # keep file order
+        px, py = self.lx[i], self.ly[i]
+        return i[(px >= x0) & (px <= x1) & (py >= y0) & (py <= y1)]
+
+
+class _Hull:
+    """Point-in-convex-hull test for a (small) set of hull candidate points."""
+
+    def __init__(self, pts):
+        from scipy.spatial import Delaunay
+        self.d = None
+        if len(pts) >= 3:
+            try:
+                self.d = Delaunay(np.unique(pts, axis=0))
+            except Exception:
+                pass
+
+    def contains(self, x, y):
+        if self.d is None:
+            return np.ones(np.size(x), bool)          # unknown: treat as inside (recomputed exactly)
+        return self.d.find_simplex(np.column_stack([x, y])) >= 0
+
+
+def _triangulate(pts: np.ndarray) -> np.ndarray:
+    """Delaunay triangles [m, 3] (indices into pts). Shewchuk's Triangle when
+    installed (~10x faster than Qhull on lidar), else scipy (Qhull)."""
+    try:
+        import triangle
+    except ImportError:
+        triangle = None
+    if triangle is not None:
+        try:
+            return np.asarray(triangle.triangulate({"vertices": pts}, "Q")["triangles"], np.int64)
+        except Exception:
+            pass
+    from scipy.spatial import Delaunay
+    return Delaunay(pts).simplices
+
+
+def _locate(pts, tris, rr, cc, gsd):
+    """For cells (rr, cc): the triangle holding each cell centre and its
+    barycentric weights, found by scanning each triangle's bounding box
+    (like PDAL's faceraster) instead of walking the triangulation per cell.
+    Returns (index into rr/cc, triangle index, weights [k, 3])."""
+    r0, r1, c0, c1 = int(rr.min()), int(rr.max()) + 1, int(cc.min()), int(cc.max()) + 1
+    want = np.full((r1 - r0, c1 - c0), -1, np.int64)
+    want[rr - r0, cc - c0] = np.arange(rr.size)
+    V = pts[tris]                                               # [m, 3, 2]
+    # cell-centre index ranges covered by each triangle's bounding box, cut to the wanted cells
+    cx0 = np.maximum(np.ceil(V[:, :, 0].min(1) / gsd - 0.5), c0)
+    cx1 = np.minimum(np.floor(V[:, :, 0].max(1) / gsd - 0.5), c1 - 1)
+    ry0 = np.maximum(np.ceil(-V[:, :, 1].max(1) / gsd - 0.5), r0)
+    ry1 = np.minimum(np.floor(-V[:, :, 1].min(1) / gsd - 0.5), r1 - 1)
+    nc, nr = cx1 - cx0 + 1, ry1 - ry0 + 1
+    keep = (nc > 0) & (nr > 0)
+    t = np.flatnonzero(keep)
+    nc, nr, cx0, ry0 = nc[keep].astype(np.int64), nr[keep].astype(np.int64), cx0[keep].astype(np.int64), \
+        ry0[keep].astype(np.int64)
+    cnt = nc * nr
+    if not cnt.size or cnt.sum() == 0:
+        return np.zeros(0, np.int64), np.zeros(0, np.int64), np.zeros((0, 3))
+    ti = np.repeat(np.arange(t.size), cnt)
+    k = np.arange(cnt.sum()) - np.repeat(np.cumsum(cnt) - cnt, cnt)       # position inside the box
+    col = cx0[ti] + k % nc[ti]
+    row = ry0[ti] + k // nc[ti]
+    cell = want[row - r0, col - c0]
+    ok = cell >= 0
+    ti, col, row, cell = ti[ok], col[ok], row[ok], cell[ok]
+    tri = t[ti]
+    a, b, c = V[tri, 0], V[tri, 1], V[tri, 2]
+    px, py = (col + 0.5) * gsd, -(row + 0.5) * gsd
+    den = (b[:, 1] - c[:, 1]) * (a[:, 0] - c[:, 0]) + (c[:, 0] - b[:, 0]) * (a[:, 1] - c[:, 1])
+    with np.errstate(divide="ignore", invalid="ignore"):
+        l1 = ((b[:, 1] - c[:, 1]) * (px - c[:, 0]) + (c[:, 0] - b[:, 0]) * (py - c[:, 1])) / den
+        l2 = ((c[:, 1] - a[:, 1]) * (px - c[:, 0]) + (a[:, 0] - c[:, 0]) * (py - c[:, 1])) / den
+    l3 = 1.0 - l1 - l2
+    eps = -1e-12
+    inside = np.isfinite(l1) & np.isfinite(l2) & (l1 >= eps) & (l2 >= eps) & (l3 >= eps)
+    cell, tri = cell[inside], tri[inside]
+    w = np.column_stack([l1[inside], l2[inside], l3[inside]])
+    cell, first = np.unique(cell, return_index=True)            # a centre on a shared edge: either triangle
+    return cell, tri[first], w[first]
+
+
+def _tin_cells(dtm, grid, px, py, pz, blk, cells, ext, region=None):
+    """Fill dtm cells of block blk = (r0, r1, c0, c1) (only `cells` = (rows,
+    cols) if given) from a TIN of the points px/py/pz. region: the extent
+    the points were taken from (None = all points: every value is final).
+    Returns {"hull": this TIN's hull vertices, "redo": None or (rows, cols,
+    outside_tin, region to redo them with)}: cells whose triangle may depend
+    on points outside the region, or that fall outside this TIN."""
+    r0, r1, c0, c1 = blk
+    if cells is None:
+        rr, cc = np.meshgrid(np.arange(r0, r1), np.arange(c0, c1), indexing="ij")
+        rr, cc = rr.ravel(), cc.ravel()
+    else:
+        rr, cc = cells
+    tris = None
+    if px.size >= 3:
+        pts = np.column_stack([px, py]).astype(np.float64)
+        try:
+            tris = _triangulate(pts)
+        except Exception:                               # e.g. all points on a line
+            tris = None
+        if tris is not None and not len(tris):
+            tris = None
+    if tris is None:
+        if region is None:
+            return {"hull": None, "redo": None}
+        # no TIN here (no points, e.g. the buffer beyond the last tile): like cells outside a
+        # TIN, fine if outside the full hull, else redone with a wider region
+        x0, y0, x1, y1 = region
+        g = max(30.0, 0.3 * max(x1 - x0, y1 - y0))
+        return {"hull": None, "redo": (rr, cc, np.ones(rr.size, bool), (x0 - g, y0 - g, x1 + g, y1 + g))}
+    ci, ti, w = _locate(pts, tris, rr, cc, grid.gsd)
+    val = (np.asarray(pz, np.float64)[tris[ti]] * w).sum(1)
+    try:
+        from scipy.spatial import ConvexHull
+        hull = pts[ConvexHull(pts).vertices]
+    except Exception:
+        hull = pts
+    inside = np.zeros(rr.size, bool)
+    inside[ci] = True
+    if region is None:
+        dtm[rr[ci], cc[ci]] = val
+        return {"hull": hull, "redo": None}
+    # accept a cell if its triangle's circumcircle holds no point the block did not see
+    V = pts[tris[ti]]                                   # [k, 3, 2]
+    ax, ay = V[:, 0, 0], V[:, 0, 1]
+    bx, by = V[:, 1, 0] - ax, V[:, 1, 1] - ay
+    cx, cy = V[:, 2, 0] - ax, V[:, 2, 1] - ay
+    dd = 2.0 * (bx * cy - by * cx)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ux = (cy * (bx * bx + by * by) - by * (cx * cx + cy * cy)) / dd
+        uy = (bx * (cx * cx + cy * cy) - cx * (bx * bx + by * by)) / dd
+        rad = np.hypot(ux, uy) * (1 + 1e-9) + 1e-9
+        ux, uy = ux + ax, uy + ay
+        # the circle's bounding box, cut to where points exist, must lie in the region
+        bx0, bx1 = np.maximum(ux - rad, ext[0]), np.minimum(ux + rad, ext[2])
+        by0, by1 = np.maximum(uy - rad, ext[1]), np.minimum(uy + rad, ext[3])
+    x0, y0, x1, y1 = region
+    ok = np.isfinite(rad) & (bx0 >= x0) & (bx1 <= x1) & (by0 >= y0) & (by1 <= y1)
+    ir, ic = rr[ci], cc[ci]
+    dtm[ir[ok], ic[ok]] = val[ok]
+    bad = ~ok
+    if not bad.any() and inside.all():
+        return {"hull": hull, "redo": None}
+    rows = np.concatenate([ir[bad], rr[~inside]])
+    cols = np.concatenate([ic[bad], cc[~inside]])
+    outside = np.concatenate([np.zeros(int(bad.sum()), bool), np.ones(int((~inside).sum()), bool)])
+    # next region: grown step by step (thin triangles at a void have huge circles), but never
+    # beyond the circles that failed; degenerate triangles: the step alone
+    fin = bad & np.isfinite(rad)
+    g = max(30.0, 0.3 * max(x1 - x0, y1 - y0))
+    if fin.any() and not (bad & ~np.isfinite(rad)).any() and inside.all():
+        nreg = (max(x0 - g, float(bx0[fin].min()) - 1.0), max(y0 - g, float(by0[fin].min()) - 1.0),
+                min(x1 + g, float(bx1[fin].max()) + 1.0), min(y1 + g, float(by1[fin].max()) + 1.0))
+    else:
+        nreg = (x0 - g, y0 - g, x1 + g, y1 + g)
+    return {"hull": hull, "redo": (rows, cols, outside, nreg)}
 
 
 def input_rasters(grid: Grid, pts, lasground: bool = True, before_ground_classes=(2,),

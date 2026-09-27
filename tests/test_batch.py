@@ -212,6 +212,8 @@ def test_expand_inputs_ignores_blanks_and_refuses_whole_disk(tmp_path, monkeypat
     (tmp_path / ".hidden" / "b.laz").write_bytes(b"")
     monkeypatch.chdir(tmp_path)
     assert expand_inputs(["", "  "]) == []                    # not "the current folder"
-    assert [p.name for p in expand_inputs([str(tmp_path)])] == ["a.laz"]
+    (tmp_path / "sub" / "a.copc.laz").write_bytes(b"")          # QGIS's index of a.laz
+    (tmp_path / "sub" / "c.copc.laz").write_bytes(b"")          # a COPC tile on its own
+    assert [p.name for p in expand_inputs([str(tmp_path)])] == ["a.laz", "c.copc.laz"]
     with pytest.raises(ValueError, match="whole disk"):
         expand_inputs([os.path.abspath(os.sep)])

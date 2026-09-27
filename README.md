@@ -307,10 +307,12 @@ points (one network tile + 32 m), network tiles lie on one lattice anchored to
 the National Grid, and each tile's sampling noise is seeded by its position,
 so neighbouring tiles agree exactly where they meet (and re-running part of
 an area reproduces the same values, except within one buffer of the new
-selection's edge, where neighbouring points are missing). A tile is prepared in the background while the network runs
-(each job needs roughly 550 bytes per point read, ~6-7 GB for a 500 m tile at
-EA density; the log prints an estimate; raise `--workers` only with RAM to
-spare); a bad file is reported in `batch_summary.json` and the rest
+selection's edge, where neighbouring points are missing). A tile is prepared in the background while the network runs:
+each file is read once, chunk by chunk, straight into the rasters (~50 bytes
+per cell + 12 per ground point, about 2 GB for a 2 km tile), and the ground
+TIN is built in blocks that reproduce one TIN of all points exactly, with
+[Triangle](https://www.cs.cmu.edu/~quake/triangle.html) when installed (free
+for private, research and institutional use) or scipy; a bad file is reported in `batch_summary.json` and the rest
 carry on. Header extents are checked against point counts and tile names and
 replaced by the points' own extent when they cannot be right (stale LP360
 headers). Cell size and read options default to what the model was trained

@@ -12,6 +12,7 @@ dependencies = [
     "numpy>=1.24",
     "scipy>=1.10",
     "laspy[lazrs]>=2.5",
+    "triangle>=20230923",          # fast Delaunay for the ground TIN (free for private, research and institutional use)
     "rasterio>=1.3",
 ]
 

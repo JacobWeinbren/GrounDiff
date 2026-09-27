@@ -10,6 +10,8 @@ their own numpy.
     onnxruntime            macOS (CPU + CoreML) and Linux
     laspy, lazrs           LAS/LAZ reading
     scipy                  only if QGIS does not already ship it
+    triangle               fast Delaunay for the ground TIN (~10x Qhull; free for private,
+                           research and institutional use)
 """
 from __future__ import annotations
 
@@ -46,7 +48,8 @@ def ort_package() -> str:
 def missing() -> list[str]:
     """pip names of what is not importable yet."""
     out = []
-    for mod, pkg in (("onnxruntime", ort_package()), ("laspy", "laspy"), ("lazrs", "lazrs"), ("scipy", "scipy")):
+    for mod, pkg in (("onnxruntime", ort_package()), ("laspy", "laspy"), ("lazrs", "lazrs"), ("scipy", "scipy"),
+                     ("triangle", "triangle")):
         try:
             importlib.import_module(mod)
         except Exception:
@@ -81,7 +84,7 @@ def pip_commands(pkgs: list[str], target: Path | None = None) -> list[list[str]]
     base = [py, "-m", "pip", "install", "--upgrade", "--target", str(target), "--no-warn-script-location",
             "--disable-pip-version-check"]
     cmds = []
-    nodeps = [p for p in pkgs if p.startswith("onnxruntime") or p in ("scipy", "laspy")]
+    nodeps = [p for p in pkgs if p.startswith("onnxruntime") or p in ("scipy", "laspy", "triangle")]
     plain = [p for p in pkgs if p not in nodeps]
     if nodeps:
         cmds.append(base + ["--no-deps"] + nodeps)
