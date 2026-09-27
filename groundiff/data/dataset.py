@@ -83,6 +83,7 @@ class DataConfig:
     min_valid_frac: float = 0.05
     val_stride: int | None = None
     include_suspect: bool = False            # also use scenes the preprocess quality gate flagged
+    bridge_oversample: float = 0.0           # share of training tiles centred on a bridge (preprocess --osm)
 
 
 class Scene:
@@ -184,6 +185,23 @@ class TileDataset(Dataset):
         else:
             areas = np.array([s.height * s.width for s in self.scenes], np.float64)
             self.scene_p = areas / areas.sum()
+            self.bridges = self._bridge_cells() if cfg.bridge_oversample > 0 else []
+
+    def _bridge_cells(self, per_scene: int = 4000) -> list:
+        """[(scene index, cell rows, cell cols)] for scenes with bridge cells (a subsample of each)."""
+        out, rng = [], np.random.default_rng(0)
+        for si, sc in enumerate(self.scenes):
+            if not sc.meta.get("bridge_cells") or not (sc.path / "bridge.npy").exists():
+                continue
+            r, c = np.nonzero(np.asarray(sc.array("bridge")) > 0.5)
+            if r.size > per_scene:
+                k = rng.choice(r.size, per_scene, replace=False)
+                r, c = r[k], c[k]
+            out.append((si, r.astype(np.int32), c.astype(np.int32)))
+        if out:
+            print(f"[info] {len(out)} training scenes with bridges; {self.cfg.bridge_oversample:.0%} of tiles "
+                  "are centred on one")
+        return out
 
     def set_epoch(self, epoch: int):
         """Call before building each DataLoader iterator so random tiles
@@ -199,13 +217,16 @@ class TileDataset(Dataset):
         t = self.cfg.tile
         return {n: np.rot90(sc.window(n, r0, c0, t, t), k).copy() for n in self.needed}
 
-    def _resampled(self, sc: Scene, rng, theta_deg: float, win: float) -> dict:
+    def _resampled(self, sc: Scene, rng, theta_deg: float, win: float, centre=None) -> dict:
         from scipy.ndimage import map_coordinates
 
         t = self.cfg.tile
         R = int(math.ceil(win * math.sqrt(2) / 2)) + 2
-        cy = int(rng.integers(min(R, sc.height // 2), max(sc.height - R, sc.height // 2) + 1))
-        cx = int(rng.integers(min(R, sc.width // 2), max(sc.width - R, sc.width // 2) + 1))
+        if centre is not None:
+            cy, cx = centre
+        else:
+            cy = int(rng.integers(min(R, sc.height // 2), max(sc.height - R, sc.height // 2) + 1))
+            cx = int(rng.integers(min(R, sc.width // 2), max(sc.width - R, sc.width // 2) + 1))
         th = math.radians(theta_deg)
         u = (np.arange(t) + 0.5) / t - 0.5                  # output offsets in [-0.5, 0.5)
         V, U = np.meshgrid(u * win, u * win, indexing="ij")
@@ -230,17 +251,29 @@ class TileDataset(Dataset):
     def _sample_train(self, rng) -> dict:
         cfg, t = self.cfg, self.cfg.tile
         aug = cfg.augment
-        sc = self.scenes[int(rng.choice(len(self.scenes), p=self.scene_p))]
+        centre = None
+        if self.bridges and rng.random() < cfg.bridge_oversample:
+            si, br, bc = self.bridges[int(rng.integers(len(self.bridges)))]
+            sc = self.scenes[si]
+            j = int(rng.integers(br.size))
+            off = rng.integers(-(t // 4), t // 4 + 1, 2)       # the bridge anywhere in the middle half
+            centre = (int(br[j] + off[0]), int(bc[j] + off[1]))
+        else:
+            sc = self.scenes[int(rng.choice(len(self.scenes), p=self.scene_p))]
         k = int(rng.integers(0, 4)) if aug and rng.random() < cfg.p_rot90 else 0
         jitter = float(rng.uniform(-cfg.jitter_deg, cfg.jitter_deg)) if aug and rng.random() < cfg.p_jitter else 0.0
         size = int(rng.choice(cfg.multiscale_sizes)) if aug and rng.random() < cfg.p_multiscale else t
         win = t * t / size                                  # source window width in pixels
         if jitter == 0.0 and size == t:
-            r0 = int(rng.integers(0, max(sc.height - t, 0) + 1))
-            c0 = int(rng.integers(0, max(sc.width - t, 0) + 1))
+            if centre is not None:
+                r0 = min(max(centre[0] - t // 2, 0), max(sc.height - t, 0))
+                c0 = min(max(centre[1] - t // 2, 0), max(sc.width - t, 0))
+            else:
+                r0 = int(rng.integers(0, max(sc.height - t, 0) + 1))
+                c0 = int(rng.integers(0, max(sc.width - t, 0) + 1))
             arrs = self._exact(sc, r0, c0, k)
         else:
-            arrs = self._resampled(sc, rng, 90.0 * k + jitter, win)
+            arrs = self._resampled(sc, rng, 90.0 * k + jitter, win, centre)
         if aug and rng.random() < cfg.p_hflip:
             arrs = {n: a[:, ::-1] for n, a in arrs.items()}
         if aug and rng.random() < cfg.p_vflip:

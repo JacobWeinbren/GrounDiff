@@ -212,3 +212,46 @@ def test_cached_scene_is_regated_without_recomputing(laz):
                          gate={"min_exact": 0.99}) is None                          # cached, not recomputed
     m2 = json.loads((root / "scenes_regate" / "SX0000_dtm" / "meta.json").read_text())
     assert m2["quality"]["suspect"] and npy.stat().st_mtime_ns == t0
+
+
+def test_bridges_keep_water_under_them_and_arrays_are_compact(laz):
+    """--osm: flattened water is masked except within 20 m of a bridge, where the model must
+    learn to take the deck out; masks are stored as uint8, statistics as float16."""
+    from groundiff.data.preprocess import tag_strata
+    from groundiff.data.laz import read_points
+    from groundiff.data.rasterise import tin_dtm
+    root, after, _ = laz
+    d = root / "dtm_river"
+    d.mkdir(exist_ok=True)
+    pts = read_points(root / "laz" / "after" / "SX0000_dtm.las")
+    k = pts.cls == 2
+    z, _ = tin_dtm(Grid(X0, Y0 + 100, 1.0, 100, 100), pts.x[k], pts.y[k], pts.z[k])
+    z = np.round(z, 3)
+    z[40:60, :] = 2.48                                                  # river across the tile, rows 40-59
+    write_geotiff(d / "SX00sw.tif", z, X0, Y0 + 100, 1.0)
+    bridge = [[X0 + 50.0, Y0 + 30.0], [X0 + 50.0, Y0 + 70.0]]          # north-south over the river at x = 50
+    meta = process_scene(after, root / "scenes_bridge", dtm_paths=rasters_for((X0, Y0, X0 + 96, Y0 + 96),
+                                                                                index_rasters(d)),
+                         gsd=1.0, lasground=False, gate={"min_agree": 0, "max_offset": 99, "min_exact": 0},
+                         bridges=[bridge])
+    sd = root / "scenes_bridge" / "SX0000_dtm"
+    g = meta["grid"]
+    ok = np.load(sd / "gt_valid.npy")
+    br = np.load(sd / "bridge.npy")
+    assert ok.dtype == np.uint8 and br.dtype == np.uint8 and np.load(sd / "density.npy").dtype == np.float16
+    assert np.load(sd / "gt_dtm.npy").dtype == np.float32 and meta["bridge_cells"] > 0
+    col = lambda x: int(np.floor(x - g["xmin"]))                     # noqa: E731
+    row = lambda y: int(np.floor(g["ymax"] - y))                     # noqa: E731
+    r = row(Y0 + 50)                                                  # middle of the river
+    assert ok[r, col(X0 + 50)] and ok[r, col(X0 + 65)]               # under / beside the bridge: kept
+    assert not ok[r, col(X0 + 80)] and not ok[r, col(X0 + 20)]       # open water: masked
+    assert br[r, col(X0 + 55)] and not br[r, col(X0 + 65)]           # bridge channel: within 10 m
+    # cached with the same bridges; recomputed when they change
+    kw = dict(dtm_paths=rasters_for((X0, Y0, X0 + 96, Y0 + 96), index_rasters(d)), gsd=1.0, lasground=False)
+    assert process_scene(after, root / "scenes_bridge", bridges=[bridge], **kw) is None
+    assert process_scene(after, root / "scenes_bridge", bridges=[], **kw) is not None
+    # strata from selection.json
+    sel = root / "selection.json"
+    sel.write_text(json.dumps({"tiles": [{"name": "SX0000_dtm.copc.laz", "stratum": "marsh", "osm": {"bridge": 1}}]}))
+    tag_strata(root / "scenes_bridge", sel)
+    assert json.loads((sd / "meta.json").read_text())["stratum"] == "marsh"

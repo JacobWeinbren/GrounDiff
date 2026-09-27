@@ -14,6 +14,7 @@ dependencies = [
     "laspy[lazrs]>=2.5",
     "triangle>=20230923",          # fast Delaunay for the ground TIN (free for private, research and institutional use)
     "rasterio>=1.3",
+    "requests>=2.28",              # laspy reads COPC tiles over HTTP with it (groundiff.data.select)
 ]
 
 [project.optional-dependencies]

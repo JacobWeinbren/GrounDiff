@@ -518,20 +518,49 @@ def flat_areas(z: np.ndarray, min_cells: int = 50) -> np.ndarray:
     return (sizes[lab] >= min_cells).reshape(H, W)
 
 
-def target_from_rasters(grid: Grid, paths: list, survey: np.ndarray, flat_min_cells: int = 50) -> dict:
+def target_from_rasters(grid: Grid, paths: list, survey: np.ndarray, flat_min_cells: int = 50,
+                        keep: np.ndarray | None = None) -> dict:
     """Target DTM from published DTM rasters (the EA product), sampled at
     our cell centres (exact copy when the grids coincide, e.g. gsd 1 m on
     the whole-metre OS grid). Hydro-flattened water (flat_areas) is excluded
-    from the target: its level is a production choice the points cannot show."""
+    from the target: its level is a production choice the points cannot show.
+    keep: cells kept even when flat (under and next to bridges, where the
+    model must learn to take the deck out down to the water)."""
     from ..io_raster import sample_rasters
 
     xs, ys = grid.cell_centres()
     gt = sample_rasters(paths, xs, ys)
     ok = np.isfinite(gt) & survey
     flat = flat_areas(gt, flat_min_cells) if flat_min_cells else np.zeros_like(ok)
-    ok &= ~flat
+    ok &= ~(flat & ~keep) if keep is not None else ~flat
     return {"gt_dtm": np.where(ok, gt, np.nan).astype(np.float32), "gt_valid": ok.astype(np.float32),
             "flat_water": flat.astype(np.float32)}
+
+
+def line_mask(grid: Grid, lines: list, half_width: float) -> np.ndarray:
+    """Cells within half_width metres of any polyline ([[x, y], ...], grid CRS)."""
+    from scipy.ndimage import distance_transform_edt
+
+    mark = np.zeros((grid.height, grid.width), bool)
+    pad = half_width + grid.gsd
+    x0, x1 = grid.xmin - pad, grid.xmin + grid.width * grid.gsd + pad
+    y1, y0 = grid.ymax + pad, grid.ymax - grid.height * grid.gsd - pad
+    for line in lines:
+        a = np.asarray(line, np.float64).reshape(-1, 2)
+        if len(a) == 1:
+            a = np.vstack([a, a])
+        if a[:, 0].max() < x0 or a[:, 0].min() > x1 or a[:, 1].max() < y0 or a[:, 1].min() > y1:
+            continue
+        for (xa, ya), (xb, yb) in zip(a[:-1], a[1:]):
+            n = max(2, int(np.hypot(xb - xa, yb - ya) / (grid.gsd / 2)) + 2)
+            t = np.linspace(0, 1, n)
+            c = np.floor((xa + t * (xb - xa) - grid.xmin) / grid.gsd).astype(np.int64)
+            r = np.floor((grid.ymax - (ya + t * (yb - ya))) / grid.gsd).astype(np.int64)
+            ok = (r >= 0) & (r < grid.height) & (c >= 0) & (c < grid.width)
+            mark[r[ok], c[ok]] = True
+    if not mark.any():
+        return mark
+    return distance_transform_edt(~mark) * grid.gsd <= half_width
 
 
 def build_rasters(grid: Grid, pts, before=None, ground_classes=(2,), before_ground_classes=(2,),

@@ -9,6 +9,8 @@ libraries or credentials). Tiles are 500 m OS grid quadrants named like
     python -m groundiff.data.download --out data/laz --target 1000 --min-per-grid 20
     # everything in given 1 km squares (with all four quadrants), e.g. for a test area
     python -m groundiff.data.download --out data/laz --squares SU6570 SU6571
+    # the stratified sample chosen by groundiff.data.select
+    python -m groundiff.data.download --out data/v2/laz --keys-file data/v2/selection.json
     # 3x3 blocks of neighbouring quadrants around sampled tiles (context for buffers/splits)
     python -m groundiff.data.download --out data/laz --target 200 --blocks 3
 
@@ -18,6 +20,7 @@ The listing (~tens of thousands of keys) is cached for a week in
 from __future__ import annotations
 
 import argparse
+import json
 import random
 import sys
 import time
@@ -157,6 +160,8 @@ def main(argv=None):
     ap.add_argument("--squares", nargs="*", default=[], help="1 km squares to fetch in full, e.g. SU6570")
     ap.add_argument("--grids", nargs="*", default=[], help="restrict to 100 km squares, e.g. SU TQ")
     ap.add_argument("--blocks", type=int, default=1, help="also fetch the NxN block of neighbours (odd N)")
+    ap.add_argument("--keys-file", type=Path,
+                    help="selection.json from groundiff.data.select (or a text file of keys, one per line)")
     ap.add_argument("--workers", type=int, default=8)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--refresh-listing", action="store_true")
@@ -171,6 +176,10 @@ def main(argv=None):
     if a.squares:
         sq = {s.upper() for s in a.squares}
         chosen += [k for k in keys if (parse_tile(k) or {}).get("square") in sq]
+    if a.keys_file:
+        txt = a.keys_file.read_text()
+        chosen += ([t["key"] for t in json.loads(txt)["tiles"]] if a.keys_file.suffix == ".json"
+                   else [ln.strip() for ln in txt.splitlines() if ln.strip()])
     if a.target:
         chosen += floor_fill(keys, a.target, a.min_per_grid, a.seed)
     if a.blocks > 1:

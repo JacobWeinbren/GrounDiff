@@ -127,8 +127,9 @@ def _progress(name: str):
 def run_scene(scene_dir: Path, net, spec: RuntimeSpec, out_dir: Path, args) -> dict:
     meta = json.loads((scene_dir / "meta.json").read_text())
     g = meta["grid"]
-    names = set(spec.needed_channels) | {"gt_dtm", "gt_valid", "dsm_max", "in_survey", "has_return"}
-    arrs = {n: np.load(scene_dir / f"{n}.npy") for n in names if (scene_dir / f"{n}.npy").exists()}
+    names = set(spec.needed_channels) | {"gt_dtm", "gt_valid", "dsm_max", "in_survey", "has_return", "bridge"}
+    arrs = {n: np.load(scene_dir / f"{n}.npy").astype(np.float32) for n in names
+            if (scene_dir / f"{n}.npy").exists()}
     res = predict_scene(arrs, spec, net, stride=args.stride, blend=args.blend, prior=args.prior,
                         init=args.init, t_start=args.t_start, n_samples=args.samples, tta=args.tta,
                         batch_size=args.batch_size, seed=args.seed, gsd=g["gsd"],
@@ -143,7 +144,7 @@ def run_scene(scene_dir: Path, net, spec: RuntimeSpec, out_dir: Path, args) -> d
         for k, preset in overlay_presets(res):
             write_overlays(res[k], out_dir / k, preset, *geo,
                            direction=res.get("dz_before") if k == "p_edit" else None)
-    summary = {"scene": meta["scene"]}
+    summary = {"scene": meta["scene"], "stratum": meta.get("stratum")}
     true_dz = None
     if "gt_dtm" in arrs:
         gt = np.where(arrs["gt_valid"] > 0.5, arrs["gt_dtm"], np.nan)
@@ -154,6 +155,14 @@ def run_scene(scene_dir: Path, net, spec: RuntimeSpec, out_dir: Path, args) -> d
         before = arrs.get(spec.prior_channel) if spec.prior_channel else None
         summary["model"] = dtm_metrics(res["dtm"], gt, valid, s, spec.alpha, gsd=g["gsd"], pred_ground=pg,
                                        before=before, p_edit=res.get("p_edit"))
+        if "bridge" in arrs:
+            near = valid & (arrs["bridge"] > 0.5)
+            if near.sum() >= 20:
+                d = (res["dtm"] - gt)[near]
+                summary["bridge"] = {"rmse": float(np.sqrt(np.mean(d * d))), "mae": float(np.mean(np.abs(d))),
+                                     "cells": int(near.sum())}
+        err = (res["dtm"] - gt)[valid]
+        summary["sq_err_sum"], summary["n_valid"] = float(np.sum(err.astype(np.float64) ** 2)), int(valid.sum())
         if before is not None:
             summary["lasground_new"] = dtm_metrics(before, gt, valid & np.isfinite(before), s, spec.alpha,
                                                    gsd=g["gsd"])
@@ -233,7 +242,30 @@ def main(argv=None):
         print(f"{len(r)} scenes: mean model RMSE {np.mean(r):.3f} m"
               + (f", mean MAE {np.mean(mae):.3f} m" if mae else "")
               + f"; {time.time() - t_all:.0f} s in total")
+        print(stratum_table(all_rows))
     return 0
+
+
+def stratum_table(rows: list) -> str:
+    """Pooled RMSE (every valid cell counts once) per stratum and near bridges."""
+    from collections import defaultdict
+    acc = defaultdict(lambda: [0.0, 0, 0])
+    for r in rows:
+        if r.get("n_valid"):
+            for k in ("all", r.get("stratum") or "unknown"):
+                acc[k][0] += r["sq_err_sum"]
+                acc[k][1] += r["n_valid"]
+                acc[k][2] += 1
+        b = r.get("bridge")
+        if b:
+            acc["near bridges"][0] += b["rmse"] ** 2 * b["cells"]
+            acc["near bridges"][1] += b["cells"]
+            acc["near bridges"][2] += 1
+    lines = [f"{'':15s} {'scenes':>6s} {'RMSE (m)':>9s}"]
+    for k in sorted(acc, key=lambda k: (k == "all", k == "near bridges", k)):
+        se, n, c = acc[k]
+        lines.append(f"{k:15s} {c:6d} {np.sqrt(se / max(n, 1)):9.3f}")
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":

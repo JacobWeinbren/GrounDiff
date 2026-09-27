@@ -23,10 +23,18 @@ on the published tiles first (groundiff.data.lasground).
 
 Output layout:
     <out>/<scene>/meta.json
-    <out>/<scene>/<channel>.npy          float32 [H, W], NaN = no data
+    <out>/<scene>/<channel>.npy          [H, W], NaN = no data; heights float32,
+                                         density / z_std / echoes float16, masks uint8
 Channels: dsm_max, dsm_min, dsm_last, density, z_std, echoes, has_return,
 in_survey, dtm_before (+ before_valid), sem_ground, sem_nonground, gt_dtm
-(+ gt_valid), and with --after-dir also top_ground.
+(+ gt_valid), flat_water, with --after-dir also top_ground, with --osm also
+bridge (cells within 10 m of an OpenStreetMap bridge).
+
+--osm <osm.json> (from groundiff.data.select): the hydro-flattened water under
+and next to bridges (20 m) is kept in the target instead of being masked, so
+the model learns to remove the deck down to the water. --selection
+<selection.json> writes each tile's stratum (quarry, urban, marsh, ...) into
+meta.json, for per-stratum evaluation.
 
 Quality gate: a scene whose target disagrees with the points (different
 survey, misregistration, wrong product) is marked "suspect" in meta.json and
@@ -69,8 +77,22 @@ def _default_crs():
     return crs_wkt_from_epsg(27700)
 
 
+MASK_CHANNELS = {"has_return", "in_survey", "gt_valid", "before_valid", "sem_ground", "sem_nonground",
+                 "flat_water", "top_ground", "bridge"}
+HALF_CHANNELS = {"density", "z_std", "echoes"}      # inputs only; float16 keeps 3 significant digits
+BRIDGE_M, BRIDGE_KEEP_M = 10.0, 20.0
+
+
 def _save(out: Path, name: str, arr: np.ndarray):
-    np.save(out / f"{name}.npy", np.ascontiguousarray(arr, dtype=np.float32))
+    """Readers cast to float32 (dataset windows, infer), so the smaller types are transparent."""
+    if name in MASK_CHANNELS and not np.isnan(arr).any():
+        dt = np.uint8
+    elif name in HALF_CHANNELS:
+        dt = np.float16
+        arr = np.clip(arr, -65000, 65000)
+    else:
+        dt = np.float32
+    np.save(out / f"{name}.npy", np.ascontiguousarray(arr, dtype=dt))
 
 
 def _stamp(p: Path | None) -> list | None:
@@ -171,11 +193,12 @@ def is_suspect(q: dict, min_agree: float = 0.6, max_offset: float = 0.15, min_co
 def process_scene(before: Path, out_root: Path, *, dtm_paths: list | None = None, after: Path | None = None,
                   gsd: float = 1.0, ground_classes=(2,), before_ground_classes=(2,), lasground: bool = True,
                   overwrite: bool = False, read_opts: dict | None = None, coverage_close_m: float = 30.0,
-                  gate: dict | None = None, geotiff: bool = False) -> dict | None:
+                  gate: dict | None = None, geotiff: bool = False, bridges: list | None = None) -> dict | None:
     """before: point tile classified by lasground_new (lasground=False: any
     point tile, no dtm_before/sem channels). Target from dtm_paths (rasters)
     or after (hand-edited tile, ground_classes). read_opts: drop_withheld /
     drop_overlap / drop_synthetic / drop_classes for read_points.
+    bridges: OpenStreetMap bridge centrelines near the tile ([[x, y], ...] in BNG).
     Returns meta, or None when an up-to-date cache exists."""
     before = Path(before)
     read_opts = dict(read_opts or {})
@@ -186,6 +209,9 @@ def process_scene(before: Path, out_root: Path, *, dtm_paths: list | None = None
            "dtm": sorted(_stamp(Path(p)) for p in (dtm_paths or [])), "ground_classes": list(ground_classes),
            "before_ground_classes": list(before_ground_classes), "lasground": lasground,
            "read_opts": read_opts, "coverage_close_m": coverage_close_m}
+    if bridges is not None:
+        import hashlib
+        key["bridges"] = hashlib.md5(json.dumps(bridges, sort_keys=True).encode()).hexdigest()
     key = json.loads(json.dumps(key))
     if meta_path.exists() and not overwrite:
         meta = json.loads(meta_path.read_text())
@@ -203,7 +229,7 @@ def process_scene(before: Path, out_root: Path, *, dtm_paths: list | None = None
                 g = meta["grid"]
                 for f in sorted(out.glob("*.npy")):
                     if not f.with_suffix(".tif").exists():
-                        write_geotiff(f.with_suffix(".tif"), np.load(f), g["xmin"], g["ymax"], g["gsd"],
+                        write_geotiff(f.with_suffix(".tif"), np.load(f).astype(np.float32), g["xmin"], g["ymax"], g["gsd"],
                                       meta.get("crs_wkt"))
             return None
     if not dtm_paths and after is None:
@@ -230,8 +256,14 @@ def process_scene(before: Path, out_root: Path, *, dtm_paths: list | None = None
             "crs_wkt": pts.crs_wkt or _default_crs(), "before_file": str(before), "n_points": len(pts),
             "class_hist_before": hist, "has_before": lasground, "lasground": lasground,
             "before_ground_classes": list(before_ground_classes), "read_opts": read_opts}
+    keep = None
+    if bridges is not None:
+        from .rasterise import line_mask
+        arrs["bridge"] = line_mask(grid, bridges, BRIDGE_M).astype(np.float32)
+        keep = line_mask(grid, bridges, BRIDGE_KEEP_M)
+        meta["bridge_cells"] = int(arrs["bridge"].sum())
     if dtm_paths:
-        arrs.update(target_from_rasters(grid, [str(p) for p in dtm_paths], survey))
+        arrs.update(target_from_rasters(grid, [str(p) for p in dtm_paths], survey, keep=keep))
         meta.update({"target": "dtm_raster", "dtm_files": [str(p) for p in dtm_paths]})
     else:
         ap = read_points(after, drop_withheld=read_opts.get("drop_withheld", True))
@@ -356,6 +388,29 @@ def rasters_for(bounds, index: list[dict], year: str | None = None, point_name: 
     return [r["path"] for r in hits]
 
 
+def lines_near(lines: list, bounds, pad: float) -> list:
+    x0, y0, x1, y1 = bounds[0] - pad, bounds[1] - pad, bounds[2] + pad, bounds[3] + pad
+    out = []
+    for ln in lines:
+        xs, ys = [q[0] for q in ln], [q[1] for q in ln]
+        if max(xs) >= x0 and min(xs) <= x1 and max(ys) >= y0 and min(ys) <= y1:
+            out.append(ln)
+    return out
+
+
+def tag_strata(root: Path, selection: Path) -> None:
+    """Copy each tile's stratum and OSM counts from selection.json into its meta.json."""
+    sel = {scene_name(Path(t["name"])): t for t in json.loads(Path(selection).read_text())["tiles"]}
+    for m in Path(root).glob("*/meta.json"):
+        t = sel.get(m.parent.name)
+        if t is None:
+            continue
+        meta = json.loads(m.read_text())
+        if meta.get("stratum") != t["stratum"] or meta.get("osm") != t.get("osm"):
+            meta.update({"stratum": t["stratum"], "osm": t.get("osm", {})})
+            m.write_text(json.dumps(meta, indent=1))
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     src = ap.add_mutually_exclusive_group(required=True)
@@ -379,6 +434,9 @@ def main(argv=None):
                          "(catches DTMs from another survey); 0 disables")
     ap.add_argument("--geotiff", action="store_true", help="also write every channel as GeoTIFF")
     ap.add_argument("--overwrite", action="store_true")
+    ap.add_argument("--osm", type=Path, help="osm.json from groundiff.data.select: bridge channel, and water "
+                    "under bridges kept in the target")
+    ap.add_argument("--selection", type=Path, help="selection.json from groundiff.data.select: strata into meta.json")
     a = ap.parse_args(argv)
 
     before = find_laz(a.before_dir or a.points_dir)
@@ -387,6 +445,7 @@ def main(argv=None):
     ro = {"drop_overlap": a.drop_overlap, "drop_synthetic": a.drop_synthetic, "drop_withheld": not a.keep_withheld}
     gate = {"min_agree": a.min_agree, "max_offset": a.max_offset, "min_exact": a.min_exact}
     jobs = []
+    osm_lines = json.loads(a.osm.read_text()).get("bridge", []) if a.osm else None
     if a.dtm_dir:
         from .laz import header_info
         index = index_rasters(a.dtm_dir, a.out / "dtm_index.json")
@@ -408,7 +467,10 @@ def main(argv=None):
             if not hits:
                 print(f"[warn] {k}: no DTM raster covers it; skipped")
                 continue
-            jobs.append((p, {"dtm_paths": hits}))
+            kw = {"dtm_paths": hits}
+            if osm_lines is not None:
+                kw["bridges"] = lines_near(osm_lines, b, 100.0)
+            jobs.append((p, kw))
     else:
         after = find_laz(a.after_dir)
         missing = sorted(set(before) - set(after))
@@ -444,6 +506,8 @@ def main(argv=None):
                   + (f", 5 mm match {ex:.0%}" if ex is not None else "")
                   + f", coverage {q.get('target_coverage', float('nan')):.0%}"
                   + (f"  SUSPECT: {'; '.join(q['reasons'])}" if q["suspect"] else ""))
+    if a.selection:
+        tag_strata(a.out, a.selection)
     print(f"done: {len(jobs) - failures} scenes ({suspect} suspect, skipped by training), {failures} failed")
     if exact:
         qs = np.quantile(exact, [0.1, 0.25, 0.5, 0.75, 0.9])
