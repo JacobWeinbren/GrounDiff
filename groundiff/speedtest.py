@@ -66,7 +66,7 @@ def available_devices() -> list[str]:
 def bench_one(model: str, device: str, batch: int, reps: int, out: str) -> dict:
     """Runs in the child process."""
     from .backends import OnnxNet
-    if device.startswith("coreml"):
+    if device.startswith("coreml") or os.environ.get("GROUNDIFF_ORT_VERBOSE"):
         import onnxruntime as ort
         ort.set_default_logger_severity(0)        # verbose: which operators CoreML takes (parsed by the parent)
     t0 = time.time()
@@ -158,7 +158,10 @@ def run(model: str, devices: list | None = None, batch: int | list = 8, reps: in
         log(f"{dev}, batch {bsz}{tag}: testing (a CoreML setting compiles the model the first time, "
             "a minute or two) ...")
         flags = 0x08000000 if sys.platform.startswith("win") else 0
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+        # output to files, not pipes: CoreML's verbose log is far more than a pipe holds, and a full pipe
+        # would block the child until the parent read it (it only reads at the end)
+        f_out, f_err = open(tmp / f"{len(results)}.out", "w+"), open(tmp / f"{len(results)}.err", "w+")
+        proc = subprocess.Popen(cmd, stdout=f_out, stderr=f_err, text=True, env=env,
                                 creationflags=flags)
         peak, t0, stopped = 0.0, time.time(), None
         while proc.poll() is None:
@@ -173,7 +176,12 @@ def run(model: str, devices: list | None = None, batch: int | list = 8, reps: in
                 proc.kill()
                 break
             time.sleep(0.5)
-        so, se = proc.communicate()
+        proc.wait()
+        f_out.seek(0)
+        f_err.seek(0)
+        so, se = f_out.read(), f_err.read()
+        f_out.close()
+        f_err.close()
         r = {"device": dev, "batch": bsz, "model": mdl, "tag": tag, "peak_gb": round(peak, 1)}
         if dev.startswith("coreml"):
             r.update(_coreml_report(se))
@@ -202,6 +210,8 @@ def run(model: str, devices: list | None = None, batch: int | list = 8, reps: in
         log(_line(r))
         if cancelled():
             break
+    import shutil
+    shutil.rmtree(tmp, ignore_errors=True)
     overall = None
     for mdl in models:
         good = [r for r in results if r.get("ok") and r.get("model", model) == mdl]
