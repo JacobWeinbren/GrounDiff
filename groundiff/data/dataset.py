@@ -29,7 +29,8 @@ from torch.utils.data import Dataset
 
 from collections import OrderedDict
 
-from ..normalise import FILL_CHANNELS, NEAREST_CHANNELS, channel_transform, fill_nearest, tile_range
+from ..normalise import (FILL_CHANNELS, NEAREST_CHANNELS, VIRTUAL_CHANNELS, channel_transform, fill_nearest,
+                         tile_range, virtual_channel)
 
 # Open memmaps are cached per process with a cap: every open .npy holds a file
 # descriptor, and macOS allows only 256 per process by default.
@@ -161,10 +162,10 @@ class TileDataset(Dataset):
         self.mode = mode
         self.epoch = 0
         self.scenes = scenes if scenes is not None else load_scenes(cfg, split)
-        self.needed = sorted(set(cfg.cond_channels) | set(cfg.norm_channels)
+        self.needed = sorted((set(cfg.cond_channels) | set(cfg.norm_channels)
                              | {cfg.gate_channel, "gt_dtm", "gt_valid", "dsm_max"}
                              | ({cfg.prior_channel} if cfg.prior_channel else set())
-                             | ({"top_ground"} if cfg.m_alpha_mode == "top_class" else set()))
+                             | ({"top_ground"} if cfg.m_alpha_mode == "top_class" else set())) - VIRTUAL_CHANNELS)
         if mode == "eval":
             t, stride = cfg.tile, cfg.val_stride or cfg.tile
             self.index = []
@@ -322,6 +323,8 @@ class TileDataset(Dataset):
             lo, scale = tile_range(ref, None, cfg.min_range, cfg.norm_quantile)
 
         def prep(name, fill=False):
+            if name in VIRTUAL_CHANNELS:
+                return virtual_channel(name, gate.shape, lo, scale)
             a = arrs[name].astype(np.float64)
             if fill and name in FILL_CHANNELS:
                 a = fill_nearest(a)

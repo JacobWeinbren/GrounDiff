@@ -32,7 +32,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
-from .schedule import build_schedule
+from .schedule import bridge_schedule, bridge_step, bridge_times, build_schedule
 
 INITS = ("dsm_noise", "noise", "dsm", "prior", "prior_noise", "dsm_q", "prior_q")
 
@@ -70,6 +70,17 @@ class DiffusionConfig:
     # replaced by its mean (zero), so the denoiser maps the conditioning straight to the DTM in
     # one pass; fine-tuned from a diffusion checkpoint with the same task losses. Deterministic.
     one_step: bool = False
+    # "gaussian": GrounDiff's DDPM (above). "rdbm": Residual Diffusion Bridge Model (Wang et al., CVPR
+    # 2026, github.com/MiliLab/RDBM): a bridge from the gate surface (DSM) to the DTM,
+    # x_t = s + Theta_t (g - s) + Sigma_t eps, sampled from x_T = s in bridge_steps x_0-prediction
+    # steps; the denoiser's noise level input is Theta_t (1 = clean, as abar for "gaussian").
+    process: str = "gaussian"
+    bridge_T: int = 100
+    bridge_steps: int = 10
+    bridge_lambda: float = 1e-4
+    # the paper's residual-modulated noise: eps scaled by |g - s|, so no noise where the surface is
+    # already ground (the released code has this line commented out; off by default to match it)
+    bridge_residual_noise: bool = False
 
 
 class GrounDiff(nn.Module):
@@ -95,6 +106,14 @@ class GrounDiff(nn.Module):
         for name in ("alphas_bar", "alphas_bar_prev", "posterior_var", "coef_x0", "coef_xt"):
             self.register_buffer(name, torch.tensor(getattr(sch, name), dtype=torch.float32),
                                  persistent=False)
+        if cfg.process not in ("gaussian", "rdbm"):
+            raise ValueError(f"diffusion.process must be gaussian or rdbm, got {cfg.process!r}")
+        self.bridge = cfg.process == "rdbm"
+        if self.bridge:
+            th, sg = bridge_schedule(cfg.bridge_T, cfg.bridge_lambda)
+            self.bridge_np = (th, sg)
+            self.register_buffer("bridge_theta", torch.tensor(th, dtype=torch.float32), persistent=False)
+            self.register_buffer("bridge_sigma", torch.tensor(sg, dtype=torch.float32), persistent=False)
 
     @property
     def T(self) -> int:
@@ -128,6 +147,8 @@ class GrounDiff(nn.Module):
         return gamma.sqrt() * g0 + (1.0 - gamma).sqrt() * noise
 
     def training_forward(self, g0: torch.Tensor, cond: torch.Tensor):
+        if self.bridge:
+            return self._bridge_training_forward(g0, cond)
         if self.cfg.one_step:
             b = g0.shape[0]
             gamma = self.alphas_bar[self.T - 1].expand(b)
@@ -139,6 +160,38 @@ class GrounDiff(nn.Module):
         g_t = self.q_sample(g0, gamma)
         g0_hat, r_hat, logit = self.denoise(g_t, cond, gamma)
         return {"g0_hat": g0_hat, "r_hat": r_hat, "logit": logit, "gamma": gamma, "t": t}
+
+    def _bridge_training_forward(self, g0: torch.Tensor, cond: torch.Tensor):
+        b, T = g0.shape[0], self.cfg.bridge_T
+        s = self.gate_surface(cond).float()
+        if self.cfg.one_step:
+            t = torch.full((b,), T - 1, device=g0.device, dtype=torch.long)
+            g_t = s                                           # x_{T-1} = mu exactly (Sigma = 0)
+        else:
+            t = torch.randint(0, T, (b,), device=g0.device)
+            eps = torch.randn_like(g0)
+            if self.cfg.bridge_residual_noise:
+                eps = eps * (g0 - s).abs()
+            th = self.bridge_theta[t].view(-1, 1, 1, 1)
+            g_t = s + th * (g0 - s) + self.bridge_sigma[t].view(-1, 1, 1, 1) * eps
+        gamma = self.bridge_theta[t]
+        g0_hat, r_hat, logit = self.denoise(g_t, cond, gamma)
+        return {"g0_hat": g0_hat, "r_hat": r_hat, "logit": logit, "gamma": gamma, "t": t}
+
+    @torch.no_grad()
+    def _bridge_sample(self, cond: torch.Tensor, one_step: bool):
+        """RDBM's deterministic x_0-prediction sampler from x_{T-1} = s."""
+        s = self.gate_surface(cond).float()
+        th, sg = self.bridge_np
+        T, bsz = self.cfg.bridge_T, cond.shape[0]
+        pairs = [(T - 1, -1)] if one_step else bridge_times(T, self.cfg.bridge_steps)
+        g_t, g0_hat, logit = s, None, None
+        for t, t_next in pairs:
+            g0_hat, _, logit = self.denoise(g_t, cond, self.bridge_theta[t].expand(bsz))
+            if self.cfg.clip_x0 is not None:
+                g0_hat = g0_hat.clamp(-self.cfg.clip_x0, self.cfg.clip_x0)
+            g_t = bridge_step(g_t, s, g0_hat, th, sg, t, t_next)
+        return g0_hat, logit
 
     # ----------------------------------------------------------------- sampling
 
@@ -172,7 +225,11 @@ class GrounDiff(nn.Module):
                add_noise: bool = True, one_step: bool | None = None):
         """Reverse process Eq. 6-10. Returns (g0, logit) of the final step.
         add_noise=False gives the deterministic mean path (for tests/analysis).
-        one_step (default: the model's cfg.one_step): a single pass at t = T from zeros."""
+        one_step (default: the model's cfg.one_step): a single pass at t = T from zeros.
+        Bridge models (process="rdbm") always start from the gate surface; init, prior and
+        t_start do not apply and sampling is deterministic."""
+        if self.bridge:
+            return self._bridge_sample(cond, bool(self.cfg.one_step if one_step is None else one_step))
         if self.cfg.one_step if one_step is None else one_step:
             s = self.gate_surface(cond).float()
             g0_hat, _, logit = self.denoise(torch.zeros_like(s), cond, self.alphas_bar[self.T - 1].expand(s.shape[0]))

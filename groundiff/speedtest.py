@@ -90,7 +90,12 @@ def bench_one(model: str, device: str, batch: int, reps: int, out: str) -> dict:
     try:
         spec = json.loads(net.session.get_modelmeta().custom_metadata_map.get("groundiff_spec") or "{}")
         if spec.get("kind", "groundiff") == "groundiff":
-            steps = 1 if spec.get("one_step") else int(spec.get("T", 10))
+            if spec.get("one_step"):
+                steps = 1
+            elif spec.get("process") == "rdbm":
+                steps = int(spec.get("bridge_steps", 10))
+            else:
+                steps = int(spec.get("T", 10))
         else:
             steps = 1
     except Exception:

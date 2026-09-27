@@ -27,7 +27,7 @@ from typing import Callable
 import numpy as np
 
 from .normalise import (FILL_CHANNELS, HEIGHT_CHANNELS, NEAREST_CHANNELS, channel_transform, coverage_mask,
-                        fill_nearest, tile_range)
+                        fill_nearest, tile_range, VIRTUAL_CHANNELS, virtual_channel)
 
 INITS = ("dsm_noise", "noise", "dsm", "prior", "prior_noise", "dsm_q", "prior_q")   # = diffusion.INITS
 
@@ -55,6 +55,10 @@ class RuntimeSpec:
     coverage_close_m: float = 30.0
     init: str | None = None               # sampler init used in validation (None: prior if any, else dsm_noise)
     one_step: bool = False                # single-step end-to-end model (diffusion.DiffusionConfig.one_step)
+    process: str = "gaussian"             # or "rdbm": residual diffusion bridge (diffusion.DiffusionConfig.process)
+    bridge_theta: list = field(default_factory=list)
+    bridge_sigma: list = field(default_factory=list)
+    bridge_steps: int = 10
     # how the training rasters were made (from the scenes' meta.json); batch and
     # the QGIS plugin use these as defaults so inference matches training
     gsd: float | None = None
@@ -77,7 +81,13 @@ class RuntimeSpec:
         d, dc = cfg.data, cfg.diffusion
         sch = build_schedule(dc.schedule, dc.T, dc.beta_start, dc.beta_end, dc.cosine_s)
         m = data_meta or {}
-        return cls(kind=cfg.model.kind, cond_channels=list(d.cond_channels), gate_channel=d.gate_channel,
+        bridge = {}
+        if getattr(dc, "process", "gaussian") == "rdbm":
+            from .schedule import bridge_schedule
+            th, sg = bridge_schedule(dc.bridge_T, dc.bridge_lambda)
+            bridge = {"process": "rdbm", "bridge_theta": th.tolist(), "bridge_sigma": sg.tolist(),
+                      "bridge_steps": int(dc.bridge_steps)}
+        return cls(**bridge,kind=cfg.model.kind, cond_channels=list(d.cond_channels), gate_channel=d.gate_channel,
                    norm_channels=list(d.norm_channels), prior_channel=d.prior_channel,
                    norm_mode=d.norm_mode, norm_std=d.norm_std, min_range=d.min_range, tile=d.tile,
                    alpha=d.alpha, T=dc.T, alphas_bar=sch.alphas_bar.tolist(), coef_x0=sch.coef_x0.tolist(),
@@ -90,6 +100,18 @@ class RuntimeSpec:
                    before_ground_classes=m.get("before_ground_classes"), read_opts=m.get("read_opts"))
 
     @property
+    def deterministic(self) -> bool:
+        """Same output every run: several samples would be identical."""
+        return self.kind != "groundiff" or self.one_step or self.process == "rdbm"
+
+    @property
+    def steps(self) -> int:
+        """Network passes per tile."""
+        if self.kind != "groundiff" or self.one_step:
+            return 1
+        return self.bridge_steps if self.process == "rdbm" else self.T
+
+    @property
     def needs_before(self) -> bool:
         """Needs the lasground_new classification (dtm_before / sem_* channels)."""
         return bool(self.prior_channel) or any(c.startswith("sem_") or c in ("dtm_before", "before_valid")
@@ -98,7 +120,8 @@ class RuntimeSpec:
     @property
     def needed_channels(self) -> list:
         extra = [self.prior_channel] if self.prior_channel else []
-        return sorted(set(self.cond_channels) | set(self.norm_channels) | {self.gate_channel} | set(extra))
+        need = set(self.cond_channels) | set(self.norm_channels) | {self.gate_channel} | set(extra)
+        return sorted(need - VIRTUAL_CHANNELS)
 
 
 # ----------------------------------------------------------------------------- tiles
@@ -116,6 +139,8 @@ def tile_norm(arrs: dict, spec: RuntimeSpec) -> tuple[float, float]:
 
 def _prep(arrs: dict, spec: RuntimeSpec, name: str, lo: float, scale: float) -> np.ndarray:
     """Same rule as TileDataset._finish."""
+    if name in VIRTUAL_CHANNELS:
+        return virtual_channel(name, arrs[spec.gate_channel].shape, lo, scale)
     a = arrs[name].astype(np.float64)
     if spec.fill_empty == "nearest" and name in FILL_CHANNELS:
         a = fill_nearest(a)
@@ -143,7 +168,10 @@ def sample(denoise: Callable, cond: np.ndarray, spec: RuntimeSpec, init: str = "
            prior: np.ndarray | None = None, t_start: int | None = None,
            rng=None, add_noise: bool = True, one_step: bool | None = None):
     """numpy mirror of GrounDiff.sample (diffusion.py). cond [B, C, T, T].
-    one_step (default spec.one_step): one deterministic pass at t = T from zeros."""
+    one_step (default spec.one_step): one deterministic pass at t = T from zeros.
+    Bridge models (spec.process == "rdbm"): RDBM's deterministic sampler from the gate surface."""
+    if spec.process == "rdbm":
+        return _bridge_sample(denoise, cond, spec, bool(spec.one_step if one_step is None else one_step))
     if spec.one_step if one_step is None else one_step:
         gi = spec.cond_channels.index(spec.gate_channel)
         s = cond[:, gi:gi + 1].astype(np.float64)
@@ -195,6 +223,26 @@ def sample(denoise: Callable, cond: np.ndarray, spec: RuntimeSpec, init: str = "
             mean = spec.coef_x0[t - 1] * g0 + spec.coef_xt[t - 1] * g
             eps = _normal(rng, g.shape) if add_noise else np.zeros(g.shape)
             g = mean + math.sqrt(spec.posterior_var[t - 1]) * eps
+    return g0.astype(np.float32), logit.astype(np.float32)
+
+
+def _bridge_sample(denoise: Callable, cond: np.ndarray, spec: RuntimeSpec, one_step: bool):
+    from .schedule import bridge_step, bridge_times
+    th, sg = np.asarray(spec.bridge_theta, np.float64), np.asarray(spec.bridge_sigma, np.float64)
+    T = len(th)
+    gi = spec.cond_channels.index(spec.gate_channel)
+    s = cond[:, gi:gi + 1].astype(np.float64)
+    bsz = cond.shape[0]
+    g, g0, logit = s, None, None
+    for t, t_next in ([(T - 1, -1)] if one_step else bridge_times(T, spec.bridge_steps)):
+        x = np.concatenate([g, cond], axis=1).astype(np.float32)
+        out = np.asarray(denoise(x, np.full(bsz, th[t], np.float32)), np.float64)
+        r_hat, logit = out[:, 0:1], out[:, 1:2]
+        p = _sigmoid(logit)
+        g0 = p * s + (1 - p) * (s - r_hat)
+        if spec.clip_x0 is not None:
+            g0 = np.clip(g0, -spec.clip_x0, spec.clip_x0)
+        g = bridge_step(g, s, g0, th, sg, t, t_next)
     return g0.astype(np.float32), logit.astype(np.float32)
 
 
@@ -343,7 +391,7 @@ def predict_scene(arrs: dict, spec: RuntimeSpec, net: Callable, *, stride: int |
         prior = "channel" if spec.prior_channel else ("none" if anchor is not None else "global")
     is_diff = spec.kind == "groundiff"
     one_step = bool(spec.one_step if one_step is None else one_step) and is_diff
-    if one_step:
+    if one_step or spec.process == "rdbm":
         n_samples = 1                          # deterministic: more samples would be identical
 
     prior_full = None
@@ -390,7 +438,12 @@ def predict_scene(arrs: dict, spec: RuntimeSpec, net: Callable, *, stride: int |
 
     jobs = [(r, c) for r in rows for c in cols]
     # progress after every network call (a batch is views x samples x steps calls: minutes on a CPU)
-    steps = 1 if one_step else ((spec.T if t_start is None else int(t_start)) if is_diff else 1)
+    if not is_diff or one_step:
+        steps = 1
+    elif spec.process == "rdbm":
+        steps = spec.bridge_steps
+    else:
+        steps = spec.T if t_start is None else int(t_start)
     per_batch = len(views) * (n_samples if is_diff else 1) * steps
     n_batches = max(1, -(-len(jobs) // batch_size))
     calls = [0]

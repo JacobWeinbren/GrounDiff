@@ -79,3 +79,42 @@ def build_schedule(schedule: str = "cosine", T: int = 10, beta_start: float = 1e
         coef_x0=betas * np.sqrt(abar_prev) / denom,
         coef_xt=(1.0 - abar_prev) * np.sqrt(alphas) / denom,
     )
+
+
+# ----------------------------------------------------------------------------- residual diffusion bridge
+
+def _cosine_thetas(T: int, max_beta: float = 0.999) -> np.ndarray:
+    """Improved-DDPM cosine betas, as RDBM uses for its theta_t."""
+    ab = lambda s: math.cos((s + 0.008) / 1.008 * math.pi / 2) ** 2      # noqa: E731
+    return np.array([min(1 - ab((i + 1) / T) / ab(i / T), max_beta) for i in range(T)], np.float64)
+
+
+def bridge_schedule(T: int = 100, lamb: float = 1e-4) -> tuple[np.ndarray, np.ndarray]:
+    """Residual Diffusion Bridge Model (Wang et al., CVPR 2026; github.com/MiliLab/RDBM, MIT):
+    x_t = mu + Theta_t (x_0 - mu) + Sigma_t eps, t = 0 .. T-1, with mu the degraded image
+    (here the gate surface, e.g. the DSM) and x_0 the clean one (the DTM).
+    Theta_t = sinh(S_{t..T}) / sinh(S_{0..T}),  Sigma_t^2 = 2 lamb sinh(S_{0..t}) sinh(S_{t..T}) / sinh(S_{0..T}),
+    S = cumulative sums of the cosine thetas. Theta goes 1 -> 0 and Sigma is 0 at t = T-1."""
+    th = _cosine_thetas(T)
+    c0t = np.cumsum(th)
+    c0T = c0t[-1]
+    ctT = c0T - c0t
+    Theta = np.sinh(ctT) / np.sinh(c0T)
+    Sigma = np.sqrt(2 * lamb * np.sinh(c0t) * np.sinh(ctT) / np.sinh(c0T))
+    return Theta, Sigma
+
+
+def bridge_times(T: int, steps: int) -> list[tuple[int, int]]:
+    """(t, t_next) pairs of RDBM's sampler, t_next = -1 on the last step."""
+    times = np.linspace(-1, T - 1, steps + 1).astype(int).tolist()[::-1]
+    return list(zip(times[:-1], times[1:]))
+
+
+def bridge_step(x_t, mu, x0_hat, Theta: np.ndarray, Sigma: np.ndarray, t: int, t_next: int):
+    """One step of RDBM's x_0-prediction sampler (works on numpy arrays and torch tensors)."""
+    if t_next < 0:
+        return x0_hat
+    if Sigma[t] <= 0:                                  # t = T-1: x_t = mu exactly
+        return mu + Theta[t_next] * (x0_hat - mu)
+    r = Sigma[t_next] / Sigma[t]
+    return mu + r * (x_t - mu) + (Theta[t_next] - Theta[t] * r) * (x0_hat - mu)

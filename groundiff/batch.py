@@ -268,8 +268,8 @@ def output_keys(spec: RuntimeSpec, predict_kwargs: dict | None = None) -> list[s
         keys += ["p_edit"] if edit else ["p_ground", "p_edit"]
     if spec.kind == "groundiff" or spec.prior_channel:
         keys.append("dz_before")
-    one_step = spec.kind == "groundiff" and getattr(spec, "one_step", False)
-    if (predict_kwargs.get("n_samples", 1) > 1 and not one_step) or predict_kwargs.get("tta"):
+    deterministic = spec.kind == "groundiff" and spec.deterministic
+    if (predict_kwargs.get("n_samples", 1) > 1 and not deterministic) or predict_kwargs.get("tta"):
         keys.append("std")                     # a single-step model is deterministic: spread from TTA only
     return keys
 

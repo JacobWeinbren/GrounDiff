@@ -53,6 +53,17 @@ HEIGHT_CHANNELS = {"dsm_max", "dsm_min", "dsm_last", "dtm_before", "gt_dtm"}
 NEAREST_CHANNELS = {"has_return", "sem_ground", "sem_nonground", "gt_valid", "before_valid", "top_ground",
                     "in_survey", "flat_water"}
 FILL_CHANNELS = {"dsm_max", "dsm_min", "dsm_last", "dtm_before"}
+# Channels computed per tile rather than read from a raster. tile_range tells the network the
+# tile's height range in metres (constant over the tile), which the [-1, 1] normalisation hides:
+# log(scale / 10 m) / 2, i.e. -0.8 for a flat tile (the 2 m minimum range), +1.2 for 500 m of relief.
+# The target stays normalised as in GrounDiff; absolute height is never given (no geography).
+VIRTUAL_CHANNELS = {"tile_range"}
+
+
+def virtual_channel(name: str, shape: tuple, lo: float, scale: float) -> np.ndarray:
+    if name == "tile_range":
+        return np.full(shape, 0.5 * np.log(max(float(scale), 1e-3) / 10.0), np.float32)
+    raise KeyError(name)
 
 
 def fill_nearest(a: np.ndarray) -> np.ndarray:
