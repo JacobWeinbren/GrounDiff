@@ -9,7 +9,7 @@
 # data/v2/done/), downloads and scenes are cached, training continues from last.pt.
 # Settings (environment): TARGET=700 tiles, WORKERS=4 preprocess processes, MIN_FREE_GB=120,
 # FROM_SCRATCH=1 to train the diffusion model from scratch (SCRATCH_STEPS=20000) instead of
-# fine-tuning runs/no_lastools/best.pt.
+# fine-tuning runs/no_lastools/best.pt; STOP_AFTER=split for the data steps only.
 set -euo pipefail
 export PYTHONUNBUFFERED=1                # progress lines reach the log as they happen
 cd "$(dirname "$0")/.."
@@ -68,6 +68,10 @@ fi
 if [ ! -f "$D/split.json" ]; then
   say "5/10 train / val / test split (10 km blocks)"
   python -m groundiff.data.split --root "$D/scenes" --out "$D/split.json"
+fi
+if [ "${STOP_AFTER:-}" = split ]; then
+  say "data ready ($(ls "$D/scenes" | wc -l | tr -d ' ') scenes); stopping before training (STOP_AFTER=split)"
+  exit 0
 fi
 
 if ! done_ train; then
