@@ -1,6 +1,6 @@
 from qgis.core import QgsProcessingProvider
 
-from .algorithm import InspectLasAlgorithm, PredictRastersAlgorithm, PredictTilesAlgorithm
+from .algorithm import InspectLasAlgorithm, PredictRastersAlgorithm, PredictTilesAlgorithm, TestDevicesAlgorithm
 
 
 class GrounDiffProvider(QgsProcessingProvider):
@@ -8,6 +8,7 @@ class GrounDiffProvider(QgsProcessingProvider):
         self.addAlgorithm(PredictTilesAlgorithm())
         self.addAlgorithm(PredictRastersAlgorithm())
         self.addAlgorithm(InspectLasAlgorithm())
+        self.addAlgorithm(TestDevicesAlgorithm())
 
     def id(self):
         return "groundiff"

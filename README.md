@@ -44,6 +44,33 @@ educational purposes, but its output is distorted above a point limit (a few
 million points), and full EA 500 m tiles have a median of ~6M points, so it
 cannot make usable training data. Without a licence, use `no_lastools`.
 
+## Compute devices: Apple GPU and NVIDIA GPU
+
+One pass of the network over a 256 px tile is ~413 GFLOP, and a 5 km tile needs ~1,600 tiles x
+10 diffusion steps, so the device matters far more than anything else (a Mac CPU takes well over
+an hour per 5 km tile). ONNX Runtime serves both kinds of GPU with few installations:
+
+| Machine | Package (the QGIS plugin installs it) | Extra installs |
+|---|---|---|
+| Apple silicon | `onnxruntime` (CoreML is built in) | none |
+| Windows / Linux + NVIDIA | `onnxruntime-gpu[cuda,cudnn]` (CUDA + cuDNN from pip, ~2.5 GB) | NVIDIA driver only |
+| Windows, other GPUs | `onnxruntime-directml` | none |
+
+CoreML runs as Apple's ML Program on the GPU with a fixed batch size (every Shape op folds away, so
+the whole network is one compiled graph; the default settings split it into pieces and used ~40 GB),
+cached after the first compile. CUDA runs without TF32, so results match the CPU.
+
+Check which device is fastest *and* gives the same numbers as the CPU:
+
+```bash
+python -m groundiff.speedtest models/no_lastools.onnx
+```
+
+(or in QGIS: Processing > GrounDiff > Test compute devices). Each device runs in its own process
+(stopped if it passes 12 GB); the table gives time per tile, the estimate for a 5 km tile, peak
+memory and the largest difference from the CPU's output. The fastest matching device is remembered
+for that model and used by "Auto".
+
 ## What is learned from what
 
 **Production chain.** Tiles are classified by `lasground_new` with default

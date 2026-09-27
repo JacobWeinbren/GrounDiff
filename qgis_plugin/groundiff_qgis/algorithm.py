@@ -1,4 +1,5 @@
 import os
+import re
 import time
 
 from qgis.core import (QgsProcessing, QgsProcessingAlgorithm, QgsProcessingContext, QgsProcessingException,
@@ -69,11 +70,11 @@ CHANNELS = [
     ("in_survey", "1 inside the LiDAR coverage"),
 ]
 PROVIDERS = [
-    ("Auto (GPU on Windows, CPU on Mac)", None),
-    ("DirectML (any Windows GPU)", ["DmlExecutionProvider", "CPUExecutionProvider"]),
-    ("NVIDIA CUDA (needs onnxruntime-gpu with matching CUDA/cuDNN)", ["CUDAExecutionProvider", "CPUExecutionProvider"]),
-    ("CoreML (Mac; experimental, can use a lot of memory)", ["CoreMLExecutionProvider", "CPUExecutionProvider"]),
-    ("CPU", ["CPUExecutionProvider"]),
+    ("Auto (NVIDIA GPU, else the device 'Test compute devices' chose, else CPU)", None),
+    ("NVIDIA GPU (CUDA)", "cuda"),
+    ("Apple GPU (CoreML)", "coreml"),
+    ("Any Windows GPU (DirectML)", "directml"),
+    ("CPU", "cpu"),
 ]
 BLENDS = ["linear", "min", "mean"]
 PRIORS = ["auto", "global", "channel", "none"]
@@ -267,13 +268,15 @@ def layer_file(source: str) -> str:
 
 
 def _status(feedback):
-    """feedback.setProgressText, called at most twice a second (it repaints the dialog)."""
+    """feedback.setProgressText (QGIS also writes each one to the log): on a new stage, else at most
+    every 10 s."""
     last = [0.0, None]
 
     def say(text):
         now = time.time()
-        new_stage = last[1] is None or text[:20] != last[1][:20]      # e.g. reading -> model
-        if text != last[1] and (new_stage or now - last[0] > 0.5):
+        stage = re.sub(r"[\d.]+", "", text.split(" - ")[0])      # the text without its numbers
+        new_stage = last[1] is None or stage != re.sub(r"[\d.]+", "", last[1].split(" - ")[0])
+        if text != last[1] and (new_stage or now - last[0] > 10):
             last[0], last[1] = now, text
             try:
                 feedback.setProgressText(text)
@@ -360,6 +363,43 @@ class PredictRastersAlgorithm(QgsProcessingAlgorithm):
                 _KEEP.append(pp)
                 context.layerToLoadOnCompletionDetails(path).setPostProcessor(pp)
         return {key.upper(): path for key, path in written.items()}
+
+
+class TestDevicesAlgorithm(QgsProcessingAlgorithm):
+    def name(self):
+        return "test_devices"
+
+    def displayName(self):
+        return "Test compute devices (speed and accuracy)"
+
+    def shortHelpString(self):
+        return ("Runs one batch of the model on every device available here (CPU, Apple GPU through CoreML, "
+                "NVIDIA CUDA, DirectML), each in its own process so a device that runs out of memory is "
+                "stopped safely. Reports the time per tile, the estimated time for a 5 km tile, peak memory "
+                "and the largest difference from the CPU's output. The fastest device with the same results "
+                "is remembered for this model and used by 'Auto'. The first CoreML run compiles the model "
+                "(a minute or two); later runs use the compiled copy.")
+
+    def createInstance(self):
+        return TestDevicesAlgorithm()
+
+    def initAlgorithm(self, config=None):
+        _model_params(self)
+        self.addParameter(_advanced(QgsProcessingParameterNumber(
+            "BATCH", "Network tiles per batch", type=NUM_INT, defaultValue=8, minValue=1, maxValue=128)))
+
+    def processAlgorithm(self, parameters, context, feedback):
+        from .core.speedtest import run
+        from .deps import python_exe
+        model = _model_path(self, parameters, context)
+        try:
+            res = run(model, batch=self.parameterAsInt(parameters, "BATCH", context), python=python_exe(),
+                      log=feedback.pushInfo, cancelled=feedback.isCanceled)
+        except Exception as e:
+            raise QgsProcessingException(str(e))
+        if not any(r.get("ok") for r in res):
+            raise QgsProcessingException("no device gave usable results; see the log")
+        return {}
 
 
 class InspectLasAlgorithm(QgsProcessingAlgorithm):

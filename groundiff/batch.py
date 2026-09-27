@@ -513,8 +513,26 @@ def run_batch(tiles: list, out_dir: str | Path, net, spec: RuntimeSpec, *, gsd: 
         if progress:
             progress(TILES_SHARE * f)
 
+    tile_secs = []                             # wall time of each finished tile
+    cur = {"start": time.time(), "model_start": None, "f": 0.0}
+
     def left():
-        return eta_text(time.time() - t_start, done_frac[0])
+        """time left from measured rates: the running model's own speed, and finished tiles for the rest"""
+        now = time.time()
+        idx_done = len(tile_secs)
+        rest = len(jobs) - idx_done - 1
+        per_tile = sum(tile_secs) / idx_done if idx_done else None
+        f, ms = cur["f"], cur["model_start"]
+        if ms is not None and f >= 0.02 and now - ms >= 10:
+            model_total = (now - ms) / f
+            this = model_total * (1 - f)
+            if per_tile is None:
+                per_tile = (ms - cur["start"]) + model_total
+        elif per_tile is not None:
+            this = max(per_tile - (now - cur["start"]), 0.0)
+        else:
+            return ""
+        return eta_seconds(this + rest * per_tile)
 
     def check_cancel(_frac=None):
         if cancelled():
@@ -592,10 +610,12 @@ def run_batch(tiles: list, out_dir: str | Path, net, spec: RuntimeSpec, *, gsd: 
             h = int(round((job.core[3] - job.core[1]) / gsd))
             anchor = lattice_anchor(grid.xmin, grid.ymax, gsd)
             t1 = time.time()
+            cur["model_start"], cur["f"] = t1, 0.0
             say(f"{label}: model starting ({predict_kwargs.get('n_samples', 1)} sample(s))")
 
             def prog(f, _idx=idx, _label=label):
                 check_cancel()
+                cur["f"] = f
                 report((_idx + READ_SHARE + (1 - READ_SHARE) * f) / len(jobs))
                 say(f"{_label}: model {100 * f:.0f} %{left()}")
 
@@ -610,6 +630,8 @@ def run_batch(tiles: list, out_dir: str | Path, net, spec: RuntimeSpec, *, gsd: 
                 summary["failed"].append({"file": job.tile, "job": job.name, "error": rec["error"]})
                 continue
             rec["predict_s"] = round(time.time() - t1, 1)
+            tile_secs.append(time.time() - cur["start"])
+            cur.update(start=time.time(), model_start=None, f=0.0)
             gc = int(round((job.core[0] - G.xmin) / gsd))
             gr = int(round((G.ymax - job.core[3]) / gsd))
             geo = (job.core[0], job.core[3], gsd, crs)
@@ -679,6 +701,14 @@ def run_batch(tiles: list, out_dir: str | Path, net, spec: RuntimeSpec, *, gsd: 
     return summary
 
 
+def eta_seconds(rem: float) -> str:
+    if rem < 90:
+        return " - under 2 min left"
+    if rem < 5400:
+        return f" - about {rem / 60:.0f} min left"
+    return f" - about {rem / 3600:.1f} h left"
+
+
 def eta_text(elapsed: float, frac: float) -> str:
     """' - about 14 min left' once there is enough progress to guess."""
     if frac < 0.02 or elapsed < 20:
@@ -727,7 +757,9 @@ def main(argv=None):
     ap.add_argument("--workers", type=int, default=1,
                     help="tiles read/rasterised in the background (each needs a few GB RAM; 1 already overlaps "
                          "reading with prediction)")
-    ap.add_argument("--device", default="auto")
+    ap.add_argument("--device", default="auto",
+                    help="auto | cuda | coreml | directml | cpu with --onnx (auto: NVIDIA GPU, else the speed test's "
+                         "choice, else CPU); auto | cuda | mps | cpu with --checkpoint")
     ap.add_argument("--blend", choices=["min", "linear", "mean"], default="linear")
     ap.add_argument("--prior", choices=["auto", "global", "channel", "none"], default="auto")
     ap.add_argument("--samples", type=int, default=1)

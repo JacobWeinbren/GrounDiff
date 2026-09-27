@@ -45,7 +45,8 @@ def load_net(checkpoint: str | None, onnx: str | None, device: str = "auto"):
     if onnx:
         from .backends import OnnxNet
         spec = RuntimeSpec.from_json(Path(onnx).with_suffix(".json"))
-        return OnnxNet(onnx), spec
+        dev = None if device in (None, "auto") else {"mps": "coreml"}.get(device, device)
+        return OnnxNet(onnx, dev), spec
     from .backends import TorchNet
     from .device import pick_device
     from .models.build import load_model

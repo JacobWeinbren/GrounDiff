@@ -94,7 +94,7 @@ def run(onnx_path: str, arrs: dict, info: dict, outputs: dict, providers: list |
     missing = [c for c in spec.needed_channels if c not in arrs]
     if missing:
         raise ValueError(f"the model needs these inputs, which were not provided: {missing}")
-    net = OnnxNet(onnx_path, providers)
+    net = OnnxNet(onnx_path, providers, batch=batch_size)
     # same tile lattice and per-tile noise as the tile mode (batch), so both give the same values
     res = predict_scene(arrs, spec, net, stride=stride, blend=blend, prior=prior, n_samples=n_samples,
                         tta=tta, batch_size=batch_size, seed=seed, progress=progress, gsd=info.get("gsd"),
@@ -156,8 +156,8 @@ def run_tiles(onnx_path: str, tiles: list, out_dir: str, providers: list | None 
     if status:
         status("Loading the model")
     spec = load_spec(onnx_path)
-    net = OnnxNet(onnx_path, providers)
-    log(f"ONNX Runtime providers: {net.providers}")
+    net = OnnxNet(onnx_path, providers, batch=int((predict_kwargs or {}).get("batch_size", 8)))
+    log(f"ONNX Runtime providers: {net.providers}" + (f" (fixed batch {net.fixed_batch})" if net.fixed_batch else ""))
     if net.warning:
         log(f"[warn] {net.warning}")
     s = run_batch(tiles, out_dir, net, spec, gsd=gsd, buffer_m=buffer_m, workers=workers, read_opts=read_opts,

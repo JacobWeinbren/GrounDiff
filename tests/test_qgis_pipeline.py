@@ -149,6 +149,16 @@ def test_algorithms_run_under_stub_qgis(trained, plugin, tmp_path, new_enums):  
     fb = qgis_stub.Feedback()
     alg.processAlgorithm({"FILE": meta["before_file"]}, ctx, fb)
     assert any("point_format" in m for m in fb.info)
+
+    # device test: runs the plugin's own copy in a child process and remembers the choice
+    os.environ["GROUNDIFF_CACHE"] = str(tmp_path / "cache")
+    alg = alg_mod.TestDevicesAlgorithm().createInstance()
+    alg.initAlgorithm()
+    fb = qgis_stub.Feedback()
+    alg.processAlgorithm({"MODEL": str(onnx_path), "BATCH": 2}, ctx, fb)
+    assert any(m.startswith("cpu: ") and "per tile-step" in m for m in fb.info), fb.info
+    assert (tmp_path / "cache" / "devices.json").exists()
+    del os.environ["GROUNDIFF_CACHE"]
     for m in ("qgis", "qgis.core"):
         sys.modules.pop(m, None)
 

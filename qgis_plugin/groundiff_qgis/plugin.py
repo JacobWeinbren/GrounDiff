@@ -67,7 +67,9 @@ class GrounDiffPlugin:
             return True
         if ask and QMessageBox.question(
                 win, "GrounDiff", "GrounDiff needs these components, installed into your QGIS profile "
-                "(about 100 MB, a minute or two):\n\n  " + "\n  ".join(todo) + "\n\nInstall now?") \
+                + ("(about 2.5 GB with the NVIDIA GPU libraries, several minutes; only the NVIDIA driver is "
+                   "needed besides):" if any("gpu" in t for t in todo) else "(about 100 MB, a minute or two):")
+                + "\n\n  " + "\n  ".join(todo) + "\n\nInstall now?") \
                 != QMessageBox.Yes:
             return False
         QApplication.setOverrideCursor(Qt.WaitCursor)
@@ -81,8 +83,8 @@ class GrounDiffPlugin:
         QApplication.restoreOverrideCursor()
         left = deps.missing()
         if left:
-            QMessageBox.warning(win, "GrounDiff", "Installed, but these still cannot be loaded: " + ", ".join(left)
-                                + ". Restart QGIS and try again.")
+            QMessageBox.warning(win, "GrounDiff", "Installed. Restart QGIS to load: " + ", ".join(left)
+                                + " (if this shows again after a restart, see View > Panels > Log Messages).")
             return False
         self.iface.messageBar().pushSuccess("GrounDiff", "components installed")
         return True
