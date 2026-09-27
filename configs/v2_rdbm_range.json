@@ -1,0 +1,60 @@
+{
+ "notes": "Residual diffusion bridge (RDBM, Wang et al. CVPR 2026) + tile_range input on the v2 data, trained from scratch: python -m groundiff.train configs/v2_rdbm_range.json (tools/run_overnight_rdbm.sh). GrounDiff converged in 10-20k steps.",
+ "data": {
+  "root": "data/v2/scenes",
+  "split_file": "data/v2/split.json",
+  "cond_channels": [
+   "dsm_max",
+   "dsm_min",
+   "dsm_last",
+   "density",
+   "z_std",
+   "echoes",
+   "tile_range"
+  ],
+  "gate_channel": "dsm_max",
+  "norm_channels": [
+   "dsm_max",
+   "dsm_min"
+  ],
+  "norm_quantile": 0.001,
+  "tile": 256,
+  "alpha": 0.2,
+  "loss_mask": "gt",
+  "fill_empty": "nearest",
+  "bridge_oversample": 0.15
+ },
+ "model": {
+  "kind": "groundiff"
+ },
+ "diffusion": {
+  "T": 10,
+  "schedule": "cosine",
+  "process": "rdbm",
+  "bridge_T": 100,
+  "bridge_steps": 10,
+  "bridge_lambda": 0.0001,
+  "bridge_residual_noise": false
+ },
+ "loss": {
+  "lam_l1": 1.0,
+  "lam_l2": 1.0,
+  "lam_grad": 0.1,
+  "lam_conf": 0.1
+ },
+ "optim": {
+  "name": "adamw",
+  "lr": 0.0001,
+  "weight_decay": 0.01,
+  "warmup_steps": 500,
+  "total_steps": 20000
+ },
+ "train": {
+  "out_dir": "runs/v2_rdbm_range",
+  "batch_size": 4,
+  "grad_accum": 4,
+  "val_init": "dsm_noise",
+  "val_every": 1000,
+  "save_every": 500
+ }
+}
