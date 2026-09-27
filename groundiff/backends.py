@@ -41,8 +41,9 @@ class OnnxNet:
         import onnxruntime as ort
         avail = ort.get_available_providers()
         if providers is None:
-            pref = ["CUDAExecutionProvider", "DmlExecutionProvider", "CoreMLExecutionProvider",
-                    "CPUExecutionProvider"]
+            # not CoreML: ONNX Runtime's CoreML provider splits this network into many pieces and
+            # was seen using ~40 GB on an M3 Max; the CPU provider is steady and uses all cores
+            pref = ["CUDAExecutionProvider", "DmlExecutionProvider", "CPUExecutionProvider"]
             providers = [p for p in pref if p in avail]
         if "CUDAExecutionProvider" in providers and hasattr(ort, "preload_dlls"):
             try:        # load pip-installed CUDA/cuDNN DLLs (onnxruntime-gpu[cuda,cudnn]), e.g. inside QGIS

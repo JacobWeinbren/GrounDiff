@@ -148,6 +148,11 @@ def run_tiles(onnx_path: str, tiles: list, out_dir: str, providers: list | None 
     import scipy.ndimage  # noqa: F401
     if not any(b.is_available() for b in getattr(laspy, "LazBackend", [])):
         raise ImportError("no LAZ backend for laspy: install laspy[lazrs]")
+    try:
+        meta = (Path(__file__).parent / "metadata.txt").read_text()
+        log("GrounDiff plugin " + next(l.split("=", 1)[1] for l in meta.splitlines() if l.startswith("version=")))
+    except Exception:
+        pass
     if status:
         status("Loading the model")
     spec = load_spec(onnx_path)

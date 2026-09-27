@@ -516,6 +516,7 @@ def run_batch(tiles: list, out_dir: str | Path, net, spec: RuntimeSpec, *, gsd: 
 
     ex = ThreadPoolExecutor(max_workers=max(1, workers))
     pending, nxt, read_frac = {}, 0, {}
+    warned_classes = False
 
     def submit_upto(limit):
         nonlocal nxt
@@ -539,7 +540,7 @@ def run_batch(tiles: list, out_dir: str | Path, net, spec: RuntimeSpec, *, gsd: 
                 check_cancel()
                 fr = read_frac.get(idx, 0.0)
                 report((idx + READ_SHARE * fr) / len(jobs))
-                say(f"{label}: " + (f"reading points {100 * fr:.0f} %" if fr < 1 else "building the ground TIN")
+                say(f"{label}: " + (f"reading points {100 * fr:.0f} %" if fr < 1 else "making the rasters")
                     + f", {time.time() - t_read:.0f} s{left()}")
                 wait([fut], timeout=0.5)
             try:
@@ -557,6 +558,14 @@ def run_batch(tiles: list, out_dir: str | Path, net, spec: RuntimeSpec, *, gsd: 
                 summary["failed"].append({"file": job.tile, "job": job.name, "error": rec["error"]})
                 continue
             rec.update({k: v for k, v in info.items() if k != "crs_wkt"})
+            log(f"{job.name}: {info['n_points'] / 1e6:.1f}M points read in {info.get('read_s')} s, rasters "
+                f"{'with' if info.get('lasground_classes') else 'without'} the lasground_new TIN in "
+                f"{info.get('tin_s')} s")
+            if lasground == "optional" and info.get("lasground_classes") is False and not warned_classes:
+                warned_classes = True
+                log(f"[info] {job.name} does not look like lasground_new output (it has classes other than 1/2, "
+                    "e.g. a published EA tile), so no lasground_new DTM, predicted edit or edit probability "
+                    "can be made for it: only the predicted DTM. Run it on your lasground_new tiles.")
             if not arrs:
                 rec["skipped"] = "no points"
                 summary["tiles"].append(rec)
@@ -578,6 +587,7 @@ def run_batch(tiles: list, out_dir: str | Path, net, spec: RuntimeSpec, *, gsd: 
             h = int(round((job.core[3] - job.core[1]) / gsd))
             anchor = lattice_anchor(grid.xmin, grid.ymax, gsd)
             t1 = time.time()
+            say(f"{label}: model starting ({predict_kwargs.get('n_samples', 1)} sample(s))")
 
             def prog(f, _idx=idx, _label=label):
                 check_cancel()

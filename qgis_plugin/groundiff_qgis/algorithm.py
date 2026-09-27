@@ -69,10 +69,10 @@ CHANNELS = [
     ("in_survey", "1 inside the LiDAR coverage"),
 ]
 PROVIDERS = [
-    ("Auto (best available)", None),
+    ("Auto (GPU on Windows, CPU on Mac)", None),
     ("DirectML (any Windows GPU)", ["DmlExecutionProvider", "CPUExecutionProvider"]),
     ("NVIDIA CUDA (needs onnxruntime-gpu with matching CUDA/cuDNN)", ["CUDAExecutionProvider", "CPUExecutionProvider"]),
-    ("CoreML (Mac)", ["CoreMLExecutionProvider", "CPUExecutionProvider"]),
+    ("CoreML (Mac; experimental, can use a lot of memory)", ["CoreMLExecutionProvider", "CPUExecutionProvider"]),
     ("CPU", ["CPUExecutionProvider"]),
 ]
 BLENDS = ["linear", "min", "mean"]
