@@ -47,7 +47,7 @@ def test_speedtest_remembers_best_device(tiny_onnx, tmp_path, monkeypatch):
     state = json.loads((tmp_path / "cache" / "devices.json").read_text())
     assert list(state.values())[0]["best"] == "cpu"
     assert auto_providers(["CPUExecutionProvider"], tiny_onnx) == "cpu"            # the tested device
-    assert any("Fastest" in m for m in logs)
+    assert any("fastest with results matching the CPU" in m for m in logs)
 
 
 def test_installer_picks_cuda_build_with_nvidia(monkeypatch, tmp_path):
@@ -74,3 +74,30 @@ def test_speedtest_batches_and_best_setting(tiny_onnx, tmp_path, monkeypatch):
     res = speedtest.run(str(tiny_onnx), devices=["cpu"], batch=[2, 4], reps=1, log=lambda m: None)
     assert [r["batch"] for r in res] == [2]            # the CPU reference runs once
     assert speedtest.best_setting(tiny_onnx) == ("cpu", 2)
+
+
+def test_fp16_export_close_to_fp32(tmp_path):
+    """The mixed-precision export runs and stays close to float32 (the speed test applies the limit)."""
+    import onnxruntime as ort
+    from groundiff.config import load_config
+    from groundiff.export import _Denoiser, _HalfDenoiser
+    from groundiff.models.build import build_model
+    cfg = load_config("configs/no_lastools.json")
+    cfg.model.inner_channel = 32
+    cfg.model.channel_mults = [1, 2]
+    torch.manual_seed(0)
+    m = build_model(cfg).eval()
+    for p in m.denoiser.parameters():               # zero-initialised output head: give it weights
+        if p.abs().sum() == 0:
+            torch.nn.init.normal_(p, std=0.02)
+    x = torch.clamp(torch.randn(2, 7, 64, 64), -1, 1)
+    g = torch.tensor([0.2, 0.8])
+    with torch.no_grad():
+        ref = _Denoiser(m.denoiser).eval()(x, g).numpy()
+        f = tmp_path / "h.onnx"
+        torch.onnx.export(_HalfDenoiser(m.denoiser).eval(), (x, g), str(f), input_names=["x", "gamma"],
+                          output_names=["out"], opset_version=18, dynamo=False)
+    out = ort.InferenceSession(str(f), providers=["CPUExecutionProvider"]).run(None, {"x": x.numpy(),
+                                                                                       "gamma": g.numpy()})[0]
+    assert out.dtype == np.float32 and out.shape == ref.shape
+    assert 0 < np.abs(out - ref).max() < 1e-2

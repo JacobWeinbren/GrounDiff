@@ -66,6 +66,9 @@ def available_devices() -> list[str]:
 def bench_one(model: str, device: str, batch: int, reps: int, out: str) -> dict:
     """Runs in the child process."""
     from .backends import OnnxNet
+    if device.startswith("coreml"):
+        import onnxruntime as ort
+        ort.set_default_logger_severity(0)        # verbose: which operators CoreML takes (parsed by the parent)
     t0 = time.time()
     net = OnnxNet(model, device, batch=batch)
     load_s = time.time() - t0
@@ -85,6 +88,24 @@ def bench_one(model: str, device: str, batch: int, reps: int, out: str) -> dict:
     np.save(out, y)
     return {"device": device, "providers": net.providers, "warning": net.warning, "load_s": round(load_s, 1),
             "warmup_s": round(warm_s, 1), "s_per_tile_step": min(times) / batch}
+
+
+def _coreml_report(stderr: str) -> dict:
+    """Partitions and the operator types CoreML did not take, from ONNX Runtime's verbose log."""
+    import re
+    out = {}
+    m = re.findall(r"number of partitions supported by CoreML: (\d+).*?number of nodes in the graph: (\d+)"
+                   r".*?number of nodes supported by CoreML: (\d+)", stderr)
+    if m:
+        p, n, k = (int(v) for v in m[-1])
+        out.update(coreml_partitions=p, graph_nodes=n, coreml_nodes=k)
+    bad = {}
+    for op, ok in re.findall(r"Operator type: \[(\w+)\][^\n]*?supported: \[(\d)\]", stderr):
+        if ok == "0":
+            bad[op] = bad.get(op, 0) + 1
+    if bad:
+        out["not_on_coreml"] = bad
+    return out
 
 
 def _rss_gb(pid: int) -> float:
@@ -111,8 +132,12 @@ def _child_cmd(python: str, args: list) -> tuple[list, dict]:
 
 
 def run(model: str, devices: list | None = None, batch: int | list = 8, reps: int = 3, max_gb: float = 12.0,
-        timeout_s: float = 1800.0, python: str | None = None, log=print, cancelled=lambda: False) -> list[dict]:
+        timeout_s: float = 1800.0, python: str | None = None, log=print, cancelled=lambda: False,
+        also: list | None = None, tolerance: float = TOLERANCE) -> list[dict]:
+    """also: other model files (e.g. the float16 export) tested on the accelerators against the same
+    CPU reference (this model on the CPU)."""
     model = str(Path(model).resolve())
+    models = [model] + [str(Path(m).resolve()) for m in (also or [])]
     devices = devices or available_devices()
     if "cpu" in devices:
         devices = ["cpu"] + [d for d in devices if d != "cpu"]       # the reference first
@@ -123,12 +148,15 @@ def run(model: str, devices: list | None = None, batch: int | list = 8, reps: in
     results, ref = [], None
     tmp = Path(tempfile.mkdtemp(prefix="groundiff_speed_"))
     # the CPU once (reference, first batch size); accelerators at every batch size
-    plan = [("cpu", batches[0])] + [(d, b) for d in devices if d != "cpu" for b in batches]
-    for dev, bsz in plan:
-        out = tmp / f"{dev}_{bsz}.npy"
+    plan = [(model, "cpu", batches[0])] + [(m, d, b) for m in models for d in devices
+                                            if not (d == "cpu" and m == model) for b in batches]
+    for mdl, dev, bsz in plan:
+        tag = "" if mdl == model else f" [{Path(mdl).name}]"
+        out = tmp / f"{len(results)}.npy"
         cmd, env = _child_cmd(python, ["--one", dev, "--batch", str(bsz), "--reps", str(reps),
-                                       "--out", str(out), model])
-        log(f"{dev}, batch {bsz}: testing (a CoreML setting compiles the model the first time, a minute or two) ...")
+                                       "--out", str(out), mdl])
+        log(f"{dev}, batch {bsz}{tag}: testing (a CoreML setting compiles the model the first time, "
+            "a minute or two) ...")
         flags = 0x08000000 if sys.platform.startswith("win") else 0
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
                                 creationflags=flags)
@@ -146,7 +174,9 @@ def run(model: str, devices: list | None = None, batch: int | list = 8, reps: in
                 break
             time.sleep(0.5)
         so, se = proc.communicate()
-        r = {"device": dev, "batch": bsz, "peak_gb": round(peak, 1)}
+        r = {"device": dev, "batch": bsz, "model": mdl, "tag": tag, "peak_gb": round(peak, 1)}
+        if dev.startswith("coreml"):
+            r.update(_coreml_report(se))
         if stopped or proc.returncode != 0:
             r.update(ok=False, error=stopped or (se.strip().splitlines() or ["failed"])[-1])
         else:
@@ -158,9 +188,10 @@ def run(model: str, devices: list | None = None, batch: int | list = 8, reps: in
                 k = min(len(y), len(ref))                   # same seeded input: the first k tiles agree
                 d = float(np.abs(y[:k] - ref[:k]).max())
                 r["max_diff"] = d
-                r["ok"] = d <= TOLERANCE * max(1.0, float(np.abs(ref).max()))
+                r["mean_diff"] = float(np.abs(y[:k] - ref[:k]).mean())
+                r["ok"] = d <= tolerance * max(1.0, float(np.abs(ref).max()))
                 if not r["ok"]:
-                    r["error"] = f"output differs from the CPU by {d:.2e} (limit {TOLERANCE:g})"
+                    r["error"] = f"output differs from the CPU by up to {d:.2e} (limit {tolerance:g})"
             else:
                 r["ok"] = False
                 r["error"] = "no CPU reference"
@@ -171,31 +202,45 @@ def run(model: str, devices: list | None = None, batch: int | list = 8, reps: in
         log(_line(r))
         if cancelled():
             break
-    good = [r for r in results if r.get("ok")]
-    bestr = min(good, key=lambda r: r["s_per_tile_step"]) if good else None
-    best = bestr["device"] if bestr else None
-    try:
-        f = _state_file()
-        f.parent.mkdir(parents=True, exist_ok=True)
-        state = json.loads(f.read_text()) if f.exists() else {}
-        state[_model_key(model)] = {"best": best, "best_batch": bestr["batch"] if bestr else None,
-                                    "results": results, "time": time.time()}
-        f.write_text(json.dumps(state, indent=1))
-    except Exception:
-        pass
-    if best:
-        log(f"Fastest with the same results: {best}, batch {bestr['batch']} "
-            f"(~{bestr['s_per_tile_step'] * TILES_5KM * 10 / 60:.0f} min per 5 km tile at 1 sample). 'Auto' now "
-            "uses it for this model (with the batch size unless you set another).")
+    overall = None
+    for mdl in models:
+        good = [r for r in results if r.get("ok") and r.get("model", model) == mdl]
+        bestr = min(good, key=lambda r: r["s_per_tile_step"]) if good else None
+        best = bestr["device"] if bestr else None
+        try:
+            f = _state_file()
+            f.parent.mkdir(parents=True, exist_ok=True)
+            state = json.loads(f.read_text()) if f.exists() else {}
+            state[_model_key(mdl)] = {"best": best, "best_batch": bestr["batch"] if bestr else None,
+                                      "results": [r for r in results if r.get("model", model) == mdl],
+                                      "time": time.time()}
+            f.write_text(json.dumps(state, indent=1))
+        except Exception:
+            pass
+        if bestr and (overall is None or bestr["s_per_tile_step"] < overall["s_per_tile_step"]):
+            overall = bestr
+        if best:
+            log(f"{Path(mdl).name}: fastest with results matching the CPU: {best}, batch {bestr['batch']} "
+                f"(~{bestr['s_per_tile_step'] * TILES_5KM * 10 / 60:.0f} min per 5 km tile at 1 sample); "
+                "'Auto' uses it for this file.")
+    if overall and len(models) > 1:
+        log(f"Overall fastest within the limit: {Path(overall['model']).name} on {overall['device']} - choose that "
+            "file in QGIS.")
     return results
 
 
 def _line(r: dict) -> str:
-    name = f"{r['device']}, batch {r.get('batch')}"
+    name = f"{r['device']}, batch {r.get('batch')}{r.get('tag', '')}"
     if not r.get("s_per_tile_step"):
         return f"{name}: not usable ({r.get('error')}); peak {r.get('peak_gb')} GB"
     est = r["s_per_tile_step"] * TILES_5KM * 10 / 60
-    acc = f"max difference from the CPU {r['max_diff']:.1e}" if "max_diff" in r else ""
+    acc = (f"difference from the CPU: max {r['max_diff']:.1e}, mean {r['mean_diff']:.1e}"
+           if "max_diff" in r else "")
+    if "coreml_nodes" in r:
+        acc += (f"; CoreML runs {r['coreml_nodes']}/{r['graph_nodes']} operators in {r['coreml_partitions']} "
+                "piece(s)")
+        if r.get("not_on_coreml"):
+            acc += " (on the CPU: " + ", ".join(f"{k} x{v}" for k, v in sorted(r["not_on_coreml"].items())) + ")"
     flag = "" if r.get("ok") else f" - NOT USED: {r.get('error')}"
     return (f"{name}: {r['s_per_tile_step']:.3f} s per tile-step (~{est:.0f} min per 5 km tile at 1 sample), "
             f"peak {r['peak_gb']} GB, compile/warm-up {r.get('warmup_s')} s, {acc}{flag}")
@@ -209,13 +254,17 @@ def main(argv=None):
                     help="batch sizes to try on the accelerators (the CPU reference uses the first)")
     ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--max-gb", type=float, default=12.0, help="stop a device that uses more memory than this")
+    ap.add_argument("--also", nargs="+", help="other model files to test against the same CPU reference, "
+                                               "e.g. the float16 export (groundiff.export --fp16)")
+    ap.add_argument("--tolerance", type=float, default=TOLERANCE,
+                    help="largest accepted difference from the CPU (1e-3 = 1 cm on a tile spanning 20 m)")
     ap.add_argument("--one", help=argparse.SUPPRESS)
     ap.add_argument("--out", help=argparse.SUPPRESS)
     a = ap.parse_args(argv)
     if a.one:
         print(json.dumps(bench_one(a.model, a.one, a.batch[0], a.reps, a.out)))
         return 0
-    res = run(a.model, a.devices, a.batch, a.reps, a.max_gb)
+    res = run(a.model, a.devices, a.batch, a.reps, a.max_gb, also=a.also, tolerance=a.tolerance)
     return 0 if any(r.get("ok") for r in res) else 1
 
 

@@ -30,6 +30,38 @@ class _Denoiser(torch.nn.Module):
         return self.unet(x, gamma)
 
 
+class _Keep32(torch.nn.Module):
+    """A sub-module kept in float32 inside a float16 network (its output is cast to float16)."""
+
+    def __init__(self, m):
+        super().__init__()
+        self.m = m.float()
+
+    def forward(self, x, *extra):
+        return self.m(x.float(), *[e.float() for e in extra]).to(torch.float16)
+
+
+class _HalfDenoiser(torch.nn.Module):
+    """Mixed-precision copy of the denoiser for GPUs: convolutions and attention in float16; the
+    first layer, the output head, the normalisations (GroupNorm32 computes in float32 anyway) and
+    the timestep embedding in float32, as in AMP training; float32 inputs and outputs."""
+
+    def __init__(self, unet):
+        super().__init__()
+        import copy
+        u = copy.deepcopy(unet).half()
+        for m in u.modules():
+            if isinstance(m, torch.nn.GroupNorm):
+                m.float()
+        u.cond_embed = _Keep32(u.cond_embed)
+        u.input_blocks[0] = _Keep32(u.input_blocks[0])
+        u.out = u.out.float()                 # the UNet feeds it h.float()
+        self.unet = u
+
+    def forward(self, x, gamma):
+        return self.unet(x, gamma).float()
+
+
 def _inline_weights(onnx_path: Path):
     """torch.export writes weights to <name>.onnx.data; fold them into the
     .onnx so the model is one file (plus its .json) to copy to the PC."""
@@ -62,7 +94,9 @@ def _embed_spec(onnx_path: Path, spec_json: str):
 
 
 def export(ckpt: str | Path, out: str | Path, use_ema: bool = True, opset: int = 18,
-           check: bool = True) -> tuple[Path, Path]:
+           check: bool = True, fp16: bool = False) -> tuple[Path, Path]:
+    """fp16: write a mixed-precision model instead (for GPUs; the speed test compares it with the
+    float32 model on the CPU)."""
     model, cfg, ck = load_model(ckpt, "cpu", use_ema=use_ema)
     spec = RuntimeSpec.from_config(cfg, ck.get("data_meta"))
     out = Path(out)
@@ -70,7 +104,7 @@ def export(ckpt: str | Path, out: str | Path, use_ema: bool = True, opset: int =
     onnx_path, json_path = out.with_suffix(".onnx"), out.with_suffix(".json")
     t = cfg.data.tile
     if spec.kind == "groundiff":
-        net = _Denoiser(model.denoiser).eval()
+        net = (_HalfDenoiser(model.denoiser) if fp16 else _Denoiser(model.denoiser)).eval()
         x = torch.randn(2, 1 + len(spec.cond_channels), t, t)
         args, names = (x, torch.rand(2)), ["x", "gamma"]
         dyn = {"x": {0: "batch"}, "gamma": {0: "batch"}, "out": {0: "batch"}}
@@ -101,9 +135,13 @@ def export(ckpt: str | Path, out: str | Path, use_ema: bool = True, opset: int =
         a = ref(xs, gs) if spec.kind == "groundiff" else ref(xs)
         b = ox(xs, gs)
         err = float(np.abs(a - b).max())
-        if err > 1e-3 * max(1.0, float(np.abs(a).max())):
+        if fp16:        # float16 differs by design: report it (the speed test applies the limit)
+            print(f"float16 model: max difference from float32 PyTorch {err:.2e} "
+                  f"(1e-3 = 1 cm on a tile spanning 20 m)")
+        elif err > 1e-3 * max(1.0, float(np.abs(a).max())):
             raise RuntimeError(f"ONNX output differs from PyTorch by {err}")
-        print(f"ONNX check passed (max abs diff {err:.2e})")
+        else:
+            print(f"ONNX check passed (max abs diff {err:.2e})")
     return onnx_path, json_path
 
 
@@ -113,9 +151,15 @@ def main(argv=None):
     ap.add_argument("--out", required=True)
     ap.add_argument("--raw", action="store_true", help="export raw weights instead of EMA")
     ap.add_argument("--opset", type=int, default=18)
+    ap.add_argument("--fp16", action="store_true",
+                    help="also write <out>_fp16.onnx, a mixed-precision copy for GPUs (compare it with "
+                         "python -m groundiff.speedtest <out>.onnx --also <out>_fp16.onnx)")
     a = ap.parse_args(argv)
     p, j = export(a.checkpoint, a.out, use_ema=not a.raw, opset=a.opset)
     print(f"wrote {p} and {j}")
+    if a.fp16:
+        p16, _ = export(a.checkpoint, str(a.out) + "_fp16", use_ema=not a.raw, opset=a.opset, fp16=True)
+        print(f"wrote {p16}")
     return 0
 
 
