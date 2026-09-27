@@ -1,5 +1,5 @@
 {
- "notes": "v2: no_lastools on a stratified sample of England (groundiff.data.select: quarries, embankments and flood defences, marsh, coast, urban / suburban / village, woodland, upland, farmland, 25% of tiles with OpenStreetMap bridges). 15% of training tiles are centred on a bridge, and the flattened water under and next to bridges is kept in the target so the model learns to take decks out. Fine-tuned from runs/no_lastools/best.pt when it exists (lower learning rate, 8000 steps); tools/run_v2.sh runs the whole pipeline.",
+ "notes": "v2: no_lastools on a stratified sample of England (groundiff.data.select: quarries, embankments and flood defences, marsh, coast, urban / suburban / village, woodland, upland, farmland, 25% of tiles with OpenStreetMap bridges). 15% of training tiles are centred on a bridge, and the flattened water under and next to bridges is kept in the target so the model learns to take decks out. Fine-tuned from runs/no_lastools/best.pt when it exists (lower learning rate, 12000 steps); tools/run_v2.sh runs the whole pipeline.",
  "data": {
   "root": "data/v2/scenes",
   "split_file": "data/v2/split.json",
@@ -41,7 +41,7 @@
   "lr": 5e-05,
   "weight_decay": 0.01,
   "warmup_steps": 300,
-  "total_steps": 8000
+  "total_steps": 12000
  },
  "train": {
   "out_dir": "runs/v2",
