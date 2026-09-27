@@ -113,6 +113,17 @@ def export(ckpt: str | Path, out: str | Path, use_ema: bool = True, opset: int =
         x = torch.randn(2, net.n_input_channels, t, t)     # [prior, guidance...]
         args, names = (x,), ["x"]
         dyn = {"x": {0: "batch"}, "out": {0: "batch"}}
+    if fp16:
+        # tracing runs the network once: in float16 that crawls on a CPU (no fast float16 kernels), so
+        # trace on the GPU when there is one (the exported file is the same)
+        dev = "cuda" if torch.cuda.is_available() else (
+            "mps" if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available() else None)
+        if dev:
+            net = net.to(dev)
+            args = tuple(a.to(dev) for a in args)
+            print(f"tracing the float16 model on {dev}", flush=True)
+        else:
+            print("[warn] no GPU for tracing: the float16 export runs the network on the CPU (slow)", flush=True)
     print(f"exporting {onnx_path} ...", flush=True)
     try:
         torch.onnx.export(net, args, str(onnx_path), input_names=names, output_names=["out"],
@@ -126,6 +137,9 @@ def export(ckpt: str | Path, out: str | Path, use_ema: bool = True, opset: int =
         _inline_weights(onnx_path)
     spec.to_json(json_path)
     _embed_spec(onnx_path, json_path.read_text())
+    if fp16:
+        print(f"wrote {onnx_path}; compare it with python -m groundiff.speedtest ... --also {onnx_path.name}")
+        return onnx_path, json_path
     print(f"wrote {onnx_path} (usable now); checking it against PyTorch, up to a few minutes ...", flush=True)
     if check:
         ref = TorchNet(model, "cpu")
@@ -135,13 +149,9 @@ def export(ckpt: str | Path, out: str | Path, use_ema: bool = True, opset: int =
         a = ref(xs, gs) if spec.kind == "groundiff" else ref(xs)
         b = ox(xs, gs)
         err = float(np.abs(a - b).max())
-        if fp16:        # float16 differs by design: report it (the speed test applies the limit)
-            print(f"float16 model: max difference from float32 PyTorch {err:.2e} "
-                  f"(1e-3 = 1 cm on a tile spanning 20 m)")
-        elif err > 1e-3 * max(1.0, float(np.abs(a).max())):
+        if err > 1e-3 * max(1.0, float(np.abs(a).max())):
             raise RuntimeError(f"ONNX output differs from PyTorch by {err}")
-        else:
-            print(f"ONNX check passed (max abs diff {err:.2e})")
+        print(f"ONNX check passed (max abs diff {err:.2e})")
     return onnx_path, json_path
 
 
@@ -151,15 +161,17 @@ def main(argv=None):
     ap.add_argument("--out", required=True)
     ap.add_argument("--raw", action="store_true", help="export raw weights instead of EMA")
     ap.add_argument("--opset", type=int, default=18)
+    ap.add_argument("--fp16-only", action="store_true", help="only the float16 copy (the float32 one exists)")
     ap.add_argument("--fp16", action="store_true",
                     help="also write <out>_fp16.onnx, a mixed-precision copy for GPUs (compare it with "
                          "python -m groundiff.speedtest <out>.onnx --also <out>_fp16.onnx)")
     a = ap.parse_args(argv)
-    p, j = export(a.checkpoint, a.out, use_ema=not a.raw, opset=a.opset)
-    print(f"wrote {p} and {j}")
+    if not a.fp16_only:
+        p, j = export(a.checkpoint, a.out, use_ema=not a.raw, opset=a.opset)
+        print(f"wrote {p} and {j}")
+    a.fp16 = a.fp16 or a.fp16_only
     if a.fp16:
-        p16, _ = export(a.checkpoint, str(a.out) + "_fp16", use_ema=not a.raw, opset=a.opset, fp16=True)
-        print(f"wrote {p16}")
+        export(a.checkpoint, str(a.out) + "_fp16", use_ema=not a.raw, opset=a.opset, fp16=True)
     return 0
 
 
