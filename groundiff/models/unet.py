@@ -200,9 +200,17 @@ class UNet(nn.Module):
                  channel_mults=(1, 2, 4, 8), res_blocks: int = 2, attn_res=(16,),
                  dropout: float = 0.2, num_heads: int = 1, num_head_channels: int = 32,
                  use_scale_shift_norm: bool = True, resblock_updown: bool = True,
-                 conv_resample: bool = True, use_checkpoint: bool = False):
+                 conv_resample: bool = True, use_checkpoint: bool = False,
+                 context_channels: int = 0, context_factor: int = 4):
+        """in_channel counts every input channel; the last context_channels of them are the wide-area
+        context (see normalise.context_window) and go to a separate branch whose features, cropped to
+        the tile's footprint, are added at the input of the middle block through a zero-initialised
+        projection (so a model without context is reproduced exactly at the start of a fine-tune)."""
         super().__init__()
         self.in_channel = in_channel
+        self.context_channels = int(context_channels)
+        self.context_factor = int(context_factor)
+        in_channel = in_channel - self.context_channels
         self.inner_channel = inner_channel
         emb_dim = inner_channel * 4
         self.cond_embed = nn.Sequential(
@@ -235,6 +243,18 @@ class UNet(nn.Module):
                 chans.append(ch)
                 ds *= 2
         self.middle_block = EmbedSequential(res(ch), attn(ch), res(ch))
+        if self.context_channels:
+            # context at factor x coarser scale: 3 halvings, attention on the coarsest grid (t/8 cells
+            # over factor*t metres, e.g. 32 x 32 cells of 32 m for a 256 m tile and factor 4)
+            cc = inner_channel
+            self.ctx_in = nn.Conv2d(self.context_channels, cc, 3, padding=1)
+            self.ctx_blocks = nn.ModuleList([
+                EmbedSequential(res(cc, cc, down=True)),
+                EmbedSequential(res(cc, 2 * cc), res(2 * cc, 2 * cc, down=True)),
+                EmbedSequential(res(2 * cc, 4 * cc), res(4 * cc, 4 * cc, down=True)),
+                EmbedSequential(res(4 * cc), attn(4 * cc), res(4 * cc)),
+            ])
+            self.ctx_proj = zero_module(nn.Conv2d(4 * cc, ch, 1))
         self.output_blocks = nn.ModuleList([])
         for level, mult in list(enumerate(channel_mults))[::-1]:
             for i in range(res_blocks + 1):
@@ -253,12 +273,24 @@ class UNet(nn.Module):
 
     def forward(self, x: torch.Tensor, gammas: torch.Tensor) -> torch.Tensor:
         emb = self.cond_embed(gamma_embedding(gammas.reshape(-1), self.inner_channel))
+        ctx = None
+        if self.context_channels:
+            x, ctx = x[:, :-self.context_channels], x[:, -self.context_channels:]
         with _fp32(x):
             h = self.input_blocks[0](x.float(), emb)
+            c = self.ctx_in(ctx.float()) if ctx is not None else None
         hs = [h]
         for module in self.input_blocks[1:]:
             h = module(h, emb)
             hs.append(h)
+        if c is not None:
+            for module in self.ctx_blocks:
+                c = module(c, emb)
+            n = c.shape[-1]
+            k = max(1, n // self.context_factor)           # the tile's footprint on the context grid
+            o = (n - k) // 2
+            c = F.interpolate(c[..., o:o + k, o:o + k], size=h.shape[-2:], mode="bilinear", align_corners=False)
+            h = h + self.ctx_proj(c).to(h.dtype)
         h = self.middle_block(h, emb)
         for module in self.output_blocks:
             h = module(torch.cat([h, hs.pop()], dim=1), emb)

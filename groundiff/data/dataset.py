@@ -29,8 +29,9 @@ from torch.utils.data import Dataset
 
 from collections import OrderedDict
 
-from ..normalise import (FILL_CHANNELS, NEAREST_CHANNELS, VIRTUAL_CHANNELS, channel_transform, fill_nearest,
-                         tile_range, virtual_channel)
+from ..normalise import (FILL_CHANNELS, NEAREST_CHANNELS, VIRTUAL_CHANNELS, base_channels, channel_transform,
+                         context_base, context_pool, context_window, fill_nearest, is_context, tile_range,
+                         virtual_channel)
 
 # Open memmaps are cached per process with a cap: every open .npy holds a file
 # descriptor, and macOS allows only 256 per process by default.
@@ -85,6 +86,15 @@ class DataConfig:
     val_stride: int | None = None
     include_suspect: bool = False            # also use scenes the preprocess quality gate flagged
     bridge_oversample: float = 0.0           # share of training tiles centred on a bridge (preprocess --osm)
+    context_factor: int = 4                  # ctx_* channels: window this many times wider than the tile
+
+
+def check_context_order(cond_channels) -> None:
+    """Context channels feed the network's context branch and must come last."""
+    names = list(cond_channels)
+    first = next((i for i, n in enumerate(names) if is_context(n)), len(names))
+    if any(not is_context(n) for n in names[first:]):
+        raise ValueError(f"ctx_* channels must come last in cond_channels, got {names}")
 
 
 class Scene:
@@ -162,10 +172,12 @@ class TileDataset(Dataset):
         self.mode = mode
         self.epoch = 0
         self.scenes = scenes if scenes is not None else load_scenes(cfg, split)
-        self.needed = sorted((set(cfg.cond_channels) | set(cfg.norm_channels)
-                             | {cfg.gate_channel, "gt_dtm", "gt_valid", "dsm_max"}
-                             | ({cfg.prior_channel} if cfg.prior_channel else set())
-                             | ({"top_ground"} if cfg.m_alpha_mode == "top_class" else set())) - VIRTUAL_CHANNELS)
+        self.needed = base_channels(set(cfg.cond_channels) | set(cfg.norm_channels)
+                                    | {cfg.gate_channel, "gt_dtm", "gt_valid", "dsm_max"}
+                                    | ({cfg.prior_channel} if cfg.prior_channel else set())
+                                    | ({"top_ground"} if cfg.m_alpha_mode == "top_class" else set()))
+        self.context = [n for n in cfg.cond_channels if is_context(n)]
+        check_context_order(cfg.cond_channels)
         if mode == "eval":
             t, stride = cfg.tile, cfg.val_stride or cfg.tile
             self.index = []
@@ -216,7 +228,11 @@ class TileDataset(Dataset):
 
     def _exact(self, sc: Scene, r0: int, c0: int, k: int) -> dict:
         t = self.cfg.tile
-        return {n: np.rot90(sc.window(n, r0, c0, t, t), k).copy() for n in self.needed}
+        out = {n: np.rot90(sc.window(n, r0, c0, t, t), k).copy() for n in self.needed}
+        for n in self.context:                  # the same function the runtime uses
+            out[n] = np.rot90(context_window(sc.array(context_base(n)), r0, c0, t, self.cfg.context_factor,
+                                             context_pool(n)), k).copy()
+        return out
 
     def _resampled(self, sc: Scene, rng, theta_deg: float, win: float, centre=None) -> dict:
         from scipy.ndimage import map_coordinates
@@ -247,6 +263,41 @@ class TileDataset(Dataset):
                 good = w > 0.5
                 val[good] = (v[good] / w[good]).astype(np.float32)
                 out[n] = val
+        if self.context:
+            out.update(self._resampled_context(sc, cy, cx, th, win, V, U))
+        return out
+
+    def _resampled_context(self, sc: Scene, cy: int, cx: int, th: float, win: float, V, U) -> dict:
+        """Context for a rotated/rescaled window: the same centre and rotation over a
+        context_factor times wider area, pooled over the matching footprint, then resampled."""
+        from scipy.ndimage import map_coordinates, maximum_filter, minimum_filter, uniform_filter
+
+        F, t = self.cfg.context_factor, self.cfg.tile
+        Rc = int(math.ceil(F * win * math.sqrt(2) / 2)) + 2
+        src_r = Rc + F * (math.cos(th) * V - math.sin(th) * U) - 0.5
+        src_c = Rc + F * (math.sin(th) * V + math.cos(th) * U) - 0.5
+        coords = np.stack([src_r, src_c])
+        size = max(1, int(round(F * win / t)))            # source pixels per output pixel
+        out = {}
+        for n in self.context:
+            reg = sc.window(context_base(n), cy - Rc, cx - Rc, 2 * Rc, 2 * Rc)
+            ok = np.isfinite(reg)
+            pool = context_pool(n)
+            if pool == "min":
+                f = minimum_filter(np.where(ok, reg, np.inf), size=size)
+            elif pool == "max":
+                f = maximum_filter(np.where(ok, reg, -np.inf), size=size)
+            else:
+                cnt = uniform_filter(ok.astype(np.float64), size=size)
+                f = np.where(cnt > 0, uniform_filter(np.where(ok, reg, 0.0), size=size) / np.maximum(cnt, 1e-12),
+                             np.nan)
+            good = np.isfinite(f)
+            v = map_coordinates(np.where(good, f, 0.0), coords, order=1, mode="constant", cval=0.0)
+            w = map_coordinates(good.astype(np.float64), coords, order=1, mode="constant", cval=0.0)
+            val = np.full(v.shape, np.nan, np.float32)
+            m = w > 0.5
+            val[m] = (v[m] / w[m]).astype(np.float32)
+            out[n] = val
         return out
 
     def _sample_train(self, rng) -> dict:

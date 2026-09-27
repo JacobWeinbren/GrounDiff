@@ -27,7 +27,8 @@ from typing import Callable
 import numpy as np
 
 from .normalise import (FILL_CHANNELS, HEIGHT_CHANNELS, NEAREST_CHANNELS, channel_transform, coverage_mask,
-                        fill_nearest, tile_range, VIRTUAL_CHANNELS, virtual_channel)
+                        fill_nearest, tile_range, VIRTUAL_CHANNELS, virtual_channel, base_channels,
+                        context_base, context_pool, context_window, is_context)
 
 INITS = ("dsm_noise", "noise", "dsm", "prior", "prior_noise", "dsm_q", "prior_q")   # = diffusion.INITS
 
@@ -59,6 +60,7 @@ class RuntimeSpec:
     bridge_theta: list = field(default_factory=list)
     bridge_sigma: list = field(default_factory=list)
     bridge_steps: int = 10
+    context_factor: int = 4               # ctx_* channels: window this many times wider than the tile
     # how the training rasters were made (from the scenes' meta.json); batch and
     # the QGIS plugin use these as defaults so inference matches training
     gsd: float | None = None
@@ -96,6 +98,7 @@ class RuntimeSpec:
                    coverage_close_m=d.coverage_close_m,
                    init=getattr(cfg.train, "val_init", None) if cfg.model.kind == "groundiff" else None,
                    one_step=bool(getattr(dc, "one_step", False)),
+                   context_factor=int(getattr(d, "context_factor", 4)),
                    gsd=m.get("gsd"), ground_classes=m.get("ground_classes"),
                    before_ground_classes=m.get("before_ground_classes"), read_opts=m.get("read_opts"))
 
@@ -120,8 +123,22 @@ class RuntimeSpec:
     @property
     def needed_channels(self) -> list:
         extra = [self.prior_channel] if self.prior_channel else []
-        need = set(self.cond_channels) | set(self.norm_channels) | {self.gate_channel} | set(extra)
-        return sorted(need - VIRTUAL_CHANNELS)
+        return base_channels(set(self.cond_channels) | set(self.norm_channels) | {self.gate_channel} | set(extra))
+
+    @property
+    def context_channels(self) -> list:
+        return [n for n in self.cond_channels if is_context(n)]
+
+    @property
+    def context_margin(self) -> int:
+        """Pixels of data needed around a tile for its context channels."""
+        return (self.context_factor - 1) * self.tile // 2 if self.context_channels else 0
+
+    def add_context(self, tiles: dict, arrs: dict, r: int, c: int) -> dict:
+        """tiles (the tile's windows) plus its ctx_* channels read from the full rasters arrs."""
+        for n in self.context_channels:
+            tiles[n] = context_window(arrs[context_base(n)], r, c, self.tile, self.context_factor, context_pool(n))
+        return tiles
 
 
 # ----------------------------------------------------------------------------- tiles
@@ -399,8 +416,8 @@ def predict_scene(arrs: dict, spec: RuntimeSpec, net: Callable, *, stride: int |
         # keep the aspect ratio: the scene's long side becomes one tile
         f = t / max(H, W)
         sh, sw = max(1, round(H * f)), max(1, round(W * f))
-        small = {n: _window(_resize(arrs[n], sh, sw, nearest=n in NEAREST_CHANNELS), 0, 0, t)
-                 for n in spec.needed_channels}
+        small_full = {n: _resize(arrs[n], sh, sw, nearest=n in NEAREST_CHANNELS) for n in spec.needed_channels}
+        small = spec.add_context({n: _window(a, 0, 0, t) for n, a in small_full.items()}, small_full, 0, 0)
         lo, sc = tile_norm(small, spec)
         g0, _ = sample(net, prepare(small, spec, lo, sc)[None], spec, init="dsm_noise", rng=rng,
                        add_noise=add_noise)
@@ -460,7 +477,7 @@ def predict_scene(arrs: dict, spec: RuntimeSpec, net: Callable, *, stride: int |
         chunk = jobs[j0:j0 + batch_size]
         tiles, los, scs, priors = [], [], [], []
         for r, c in chunk:
-            ta = {n: window(arrs[n], r, c) for n in spec.needed_channels}
+            ta = spec.add_context({n: window(arrs[n], r, c) for n in spec.needed_channels}, arrs, r, c)
             lo, sc = tile_norm(ta, spec)
             tiles.append(prepare(ta, spec, lo, sc))
             los.append(lo)

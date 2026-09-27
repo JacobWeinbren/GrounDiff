@@ -66,6 +66,56 @@ def virtual_channel(name: str, shape: tuple, lo: float, scale: float) -> np.ndar
     raise KeyError(name)
 
 
+# Wide-area context ("PrioStitch as an input"): ctx_<channel> is <channel> over a window
+# context_factor times wider than the tile, centred on it, pooled context_factor x context_factor
+# (min for low surfaces, max for dsm_max, mean otherwise) back to the tile's size, e.g. 1024 m at
+# 4 m/px around a 256 m tile. The network's context branch reads these channels (they must come last
+# in cond_channels); heights use the tile's own normalisation. NaN (outside the data) becomes 0.
+CONTEXT_PREFIX = "ctx_"
+_CONTEXT_POOL = {"dsm_min": "min", "dsm_last": "min", "dtm_before": "min", "dsm_max": "max"}
+
+
+def is_context(name: str) -> bool:
+    return name.startswith(CONTEXT_PREFIX)
+
+
+def context_base(name: str) -> str:
+    return name[len(CONTEXT_PREFIX):] if is_context(name) else name
+
+
+def context_pool(name: str) -> str:
+    return _CONTEXT_POOL.get(context_base(name), "mean")
+
+
+def base_channels(names) -> list:
+    """Rasters to read for these channels: context channels map to their base raster, virtual
+    channels need none."""
+    return sorted({context_base(n) for n in names} - VIRTUAL_CHANNELS)
+
+
+def context_window(a: np.ndarray, r0: int, c0: int, t: int, factor: int, pool: str) -> np.ndarray:
+    """[t, t] context for the tile a[r0:r0+t, c0:c0+t]: the factor*t window centred on it (NaN
+    outside a), pooled factor x factor. Reads only the needed part of a (works on memmaps)."""
+    size, off = factor * t, (factor - 1) * t // 2
+    R0, C0 = r0 - off, c0 - off
+    H, W = a.shape
+    reg = np.full((size, size), np.nan, np.float32)
+    rs, re, cs, ce = max(R0, 0), min(R0 + size, H), max(C0, 0), min(C0 + size, W)
+    if re > rs and ce > cs:
+        reg[rs - R0:re - R0, cs - C0:ce - C0] = a[rs:re, cs:ce]
+    blocks = reg.reshape(t, factor, t, factor)
+    ok = np.isfinite(blocks)
+    if pool == "min":
+        out = np.where(ok, blocks, np.inf).min(axis=(1, 3))
+        return np.where(np.isfinite(out), out, np.nan).astype(np.float32)
+    if pool == "max":
+        out = np.where(ok, blocks, -np.inf).max(axis=(1, 3))
+        return np.where(np.isfinite(out), out, np.nan).astype(np.float32)
+    n = ok.sum(axis=(1, 3))
+    tot = np.where(ok, blocks, 0.0).sum(axis=(1, 3))
+    return np.where(n > 0, tot / np.maximum(n, 1), np.nan).astype(np.float32)
+
+
 def fill_nearest(a: np.ndarray) -> np.ndarray:
     """Replace NaNs by the nearest valid value (no-op if none are valid)."""
     bad = ~np.isfinite(a)
@@ -77,7 +127,8 @@ def fill_nearest(a: np.ndarray) -> np.ndarray:
 
 
 def channel_transform(name: str, x: np.ndarray, lo: float, scale: float) -> np.ndarray:
-    """Map a raster channel (metres or counts) into network units."""
+    """Map a raster channel (metres or counts) into network units (context channels as their base)."""
+    name = context_base(name)
     if name in HEIGHT_CHANNELS:
         return normalise(x, lo, scale)
     if name == "z_std":

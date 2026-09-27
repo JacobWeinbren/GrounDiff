@@ -455,11 +455,12 @@ def run_batch(tiles: list, out_dir: str | Path, net, spec: RuntimeSpec, *, gsd: 
     if not spec.gsd:
         log(f"[warn] the model file does not record its training cell size; using {gsd} m (re-export the model "
             "with this version to record it)")
-    need = (spec.tile - 1) * gsd
-    buffer_m = float(buffer_m) if buffer_m is not None else spec.tile * gsd + 32.0
+    ctx_m = spec.context_margin * gsd          # wide-area context channels read this far beyond each tile
+    need = (spec.tile - 1) * gsd + ctx_m
+    buffer_m = float(buffer_m) if buffer_m is not None else spec.tile * gsd + ctx_m + 32.0
     if buffer_m < need:
-        log(f"[warn] buffer {buffer_m:g} m is smaller than one network tile ({need:g} m): values may differ "
-            "slightly where tiles meet")
+        log(f"[warn] buffer {buffer_m:g} m is smaller than one network tile" + (" plus its context" if ctx_m else "")
+            + f" ({need:g} m): values may differ slightly where tiles meet")
     ro = dict(spec.read_opts or {})
     ro.update(read_opts or {})
     lasground = True if spec.needs_before else "optional"
@@ -754,7 +755,8 @@ def main(argv=None):
                     help="lasground_new-classified LAS/LAZ/COPC files, folders or wildcards (quote them)")
     ap.add_argument("--out", required=True)
     ap.add_argument("--gsd", type=float, help="cell size (default: as trained)")
-    ap.add_argument("--buffer", type=float, help="metres of neighbouring points (default: one network tile + 32 m)")
+    ap.add_argument("--buffer", type=float, help="metres of neighbouring points (default: one network tile + 32 m, plus the context margin "
+                    "for models with ctx_* channels)")
     ap.add_argument("--workers", type=int, default=1,
                     help="tiles read/rasterised in the background (each needs a few GB RAM; 1 already overlaps "
                          "reading with prediction)")

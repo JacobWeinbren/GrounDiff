@@ -13,6 +13,7 @@ import torch.nn as nn
 from ..config import Config, config_from_dict
 from ..diffusion import GrounDiff
 from .resdepth import build_resdepth
+from ..normalise import is_context
 from .unet import UNet
 
 
@@ -36,10 +37,14 @@ class ResDepthModel(nn.Module):
 def build_model(cfg: Config) -> nn.Module:
     m = cfg.model
     if m.kind == "groundiff":
+        from ..data.dataset import check_context_order
+        check_context_order(cfg.data.cond_channels)
+        n_ctx = sum(is_context(c) for c in cfg.data.cond_channels)
         net = UNet(in_channel=1 + len(cfg.data.cond_channels), out_channel=2,
                    inner_channel=m.inner_channel, channel_mults=tuple(m.channel_mults),
                    res_blocks=m.res_blocks, attn_res=tuple(m.attn_res), dropout=m.dropout,
-                   num_head_channels=m.num_head_channels, use_checkpoint=m.use_checkpoint)
+                   num_head_channels=m.num_head_channels, use_checkpoint=m.use_checkpoint,
+                   context_channels=n_ctx, context_factor=cfg.data.context_factor)
         return GrounDiff(net, cfg.diffusion, cfg.data.cond_channels, cfg.data.gate_channel)
     if m.kind == "resdepth":
         return ResDepthModel(cfg)
@@ -83,8 +88,9 @@ def init_from_checkpoint(model: nn.Module, cfg: Config, path: str | Path) -> lis
     old_cfg = config_from_dict(ck["config"])
     src = ck.get("ema") or ck["model"]
     dst = model.state_dict()
-    old_names = ["g_t"] + list(old_cfg.data.cond_channels)
-    new_names = ["g_t"] + list(cfg.data.cond_channels)
+    # the stem sees the main channels; context channels go to the context branch
+    old_names = ["g_t"] + [c for c in old_cfg.data.cond_channels if not is_context(c)]
+    new_names = ["g_t"] + [c for c in cfg.data.cond_channels if not is_context(c)]
     notes = []
     for k, v in dst.items():
         if k not in src:

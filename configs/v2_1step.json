@@ -1,5 +1,5 @@
 {
- "notes": "Single-step end-to-end fine-tune (Garcia et al., WACV 2025) of the v2 model: python -m groundiff.train configs/v2_1step.json --init-from runs/v2/best.pt",
+ "notes": "Single-step end-to-end fine-tune (Garcia et al., WACV 2025) of the v2 model: python -m groundiff.train configs/v2_1step.json --init-from runs/v2/best.pt Inputs as configs/v2.json (tile_range and ctx_* context).",
  "data": {
   "root": "data/v2/scenes",
   "split_file": "data/v2/split.json",
@@ -9,7 +9,11 @@
    "dsm_last",
    "density",
    "z_std",
-   "echoes"
+   "echoes",
+   "tile_range",
+   "ctx_dsm_min",
+   "ctx_dsm_max",
+   "ctx_has_return"
   ],
   "gate_channel": "dsm_max",
   "norm_channels": [
@@ -21,7 +25,8 @@
   "alpha": 0.2,
   "loss_mask": "gt",
   "fill_empty": "nearest",
-  "bridge_oversample": 0.15
+  "bridge_oversample": 0.15,
+  "context_factor": 4
  },
  "model": {
   "kind": "groundiff"
