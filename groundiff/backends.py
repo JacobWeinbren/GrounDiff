@@ -136,7 +136,8 @@ class OnnxNet:
                 o = dict(DEVICE_OPTIONS.get(device) or PROVIDER_OPTIONS.get(p, {})) if p == ps[0] else \
                     dict(PROVIDER_OPTIONS.get(p, {}))
                 if p == "CoreMLExecutionProvider":
-                    o["ModelCacheDirectory"] = coreml_cache_dir(device or "coreml")
+                    # one compiled copy per setting and batch size (the batch is baked into it)
+                    o["ModelCacheDirectory"] = coreml_cache_dir(f"{device or 'coreml'}_b{self.fixed_batch}")
                 out.append((p, o) if o else p)
             return out
 
