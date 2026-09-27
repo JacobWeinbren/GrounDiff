@@ -1,0 +1,54 @@
+{
+ "notes": "Single-step end-to-end fine-tune of no_lastools (Garcia et al., WACV 2025: fix the timestep to T, replace the noise by its mean, train the one pass with the task losses). Start from the diffusion model: python -m groundiff.train configs/no_lastools_1step.json --init-from runs/no_lastools/best.pt. 10x fewer network passes at inference; deterministic.",
+ "data": {
+  "root": "data/scenes_1m",
+  "split_file": "data/split.json",
+  "cond_channels": [
+   "dsm_max",
+   "dsm_min",
+   "dsm_last",
+   "density",
+   "z_std",
+   "echoes"
+  ],
+  "gate_channel": "dsm_max",
+  "norm_channels": [
+   "dsm_max",
+   "dsm_min"
+  ],
+  "norm_quantile": 0.001,
+  "tile": 256,
+  "alpha": 0.2,
+  "loss_mask": "gt",
+  "fill_empty": "nearest"
+ },
+ "model": {
+  "kind": "groundiff"
+ },
+ "diffusion": {
+  "T": 10,
+  "schedule": "cosine",
+  "one_step": true
+ },
+ "loss": {
+  "lam_l1": 1.0,
+  "lam_l2": 1.0,
+  "lam_grad": 0.1,
+  "lam_conf": 0.1
+ },
+ "optim": {
+  "name": "adamw",
+  "lr": 3e-05,
+  "weight_decay": 0.01,
+  "warmup_steps": 100,
+  "total_steps": 3000
+ },
+ "train": {
+  "out_dir": "runs/no_lastools_1step",
+  "batch_size": 4,
+  "grad_accum": 4,
+  "val_init": "dsm_noise",
+  "val_every": 500,
+  "save_every": 500
+ }
+}

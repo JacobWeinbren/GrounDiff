@@ -54,6 +54,7 @@ class RuntimeSpec:
     norm_quantile: float = 0.0
     coverage_close_m: float = 30.0
     init: str | None = None               # sampler init used in validation (None: prior if any, else dsm_noise)
+    one_step: bool = False                # single-step end-to-end model (diffusion.DiffusionConfig.one_step)
     # how the training rasters were made (from the scenes' meta.json); batch and
     # the QGIS plugin use these as defaults so inference matches training
     gsd: float | None = None
@@ -84,6 +85,7 @@ class RuntimeSpec:
                    clip_x0=dc.clip_x0, fill_empty=d.fill_empty, norm_quantile=d.norm_quantile,
                    coverage_close_m=d.coverage_close_m,
                    init=getattr(cfg.train, "val_init", None) if cfg.model.kind == "groundiff" else None,
+                   one_step=bool(getattr(dc, "one_step", False)),
                    gsd=m.get("gsd"), ground_classes=m.get("ground_classes"),
                    before_ground_classes=m.get("before_ground_classes"), read_opts=m.get("read_opts"))
 
@@ -139,8 +141,21 @@ def _normal(rng, shape) -> np.ndarray:
 
 def sample(denoise: Callable, cond: np.ndarray, spec: RuntimeSpec, init: str = "dsm_noise",
            prior: np.ndarray | None = None, t_start: int | None = None,
-           rng=None, add_noise: bool = True):
-    """numpy mirror of GrounDiff.sample (diffusion.py). cond [B, C, T, T]."""
+           rng=None, add_noise: bool = True, one_step: bool | None = None):
+    """numpy mirror of GrounDiff.sample (diffusion.py). cond [B, C, T, T].
+    one_step (default spec.one_step): one deterministic pass at t = T from zeros."""
+    if spec.one_step if one_step is None else one_step:
+        gi = spec.cond_channels.index(spec.gate_channel)
+        s = cond[:, gi:gi + 1].astype(np.float64)
+        bsz = cond.shape[0]
+        x = np.concatenate([np.zeros_like(s), cond], axis=1).astype(np.float32)
+        out = np.asarray(denoise(x, np.full(bsz, spec.alphas_bar[spec.T - 1], np.float32)), np.float64)
+        r_hat, logit = out[:, 0:1], out[:, 1:2]
+        p = _sigmoid(logit)
+        g0 = p * s + (1 - p) * (s - r_hat)
+        if spec.clip_x0 is not None:
+            g0 = np.clip(g0, -spec.clip_x0, spec.clip_x0)
+        return g0, logit
     rng = rng if rng is not None else np.random.default_rng()
     if init not in INITS:
         raise ValueError(f"init must be one of {INITS}, got {init!r}")
@@ -294,7 +309,7 @@ def predict_scene(arrs: dict, spec: RuntimeSpec, net: Callable, *, stride: int |
                   t_start: int | None = None, n_samples: int = 1, tta: bool = False,
                   batch_size: int = 8, seed: int = 0, progress: Callable | None = None,
                   add_noise: bool = True, anchor: tuple | None = None, region: tuple | None = None,
-                  gsd: float | None = None) -> dict:
+                  gsd: float | None = None, one_step: bool | None = None) -> dict:
     """arrs: full-scene rasters in metres (NaN = no data), at least
     spec.needed_channels. Returns metre-space rasters:
         dtm, p_ground (GrounDiff: sigmoid(l), probability that the gate
@@ -327,6 +342,9 @@ def predict_scene(arrs: dict, spec: RuntimeSpec, net: Callable, *, stride: int |
         # prior barely reaches the network anyway)
         prior = "channel" if spec.prior_channel else ("none" if anchor is not None else "global")
     is_diff = spec.kind == "groundiff"
+    one_step = bool(spec.one_step if one_step is None else one_step) and is_diff
+    if one_step:
+        n_samples = 1                          # deterministic: more samples would be identical
 
     prior_full = None
     if is_diff and prior == "global":
@@ -372,7 +390,7 @@ def predict_scene(arrs: dict, spec: RuntimeSpec, net: Callable, *, stride: int |
 
     jobs = [(r, c) for r in rows for c in cols]
     # progress after every network call (a batch is views x samples x steps calls: minutes on a CPU)
-    steps = (spec.T if t_start is None else int(t_start)) if is_diff else 1
+    steps = 1 if one_step else ((spec.T if t_start is None else int(t_start)) if is_diff else 1)
     per_batch = len(views) * (n_samples if is_diff else 1) * steps
     n_batches = max(1, -(-len(jobs) // batch_size))
     calls = [0]
@@ -413,7 +431,7 @@ def predict_scene(arrs: dict, spec: RuntimeSpec, net: Callable, *, stride: int |
             for _ in range(n_samples if is_diff else 1):
                 if is_diff:
                     g0, logit = sample(net, c_v, spec, init=init, prior=p_v, t_start=t_start, rng=tile_rngs,
-                                       add_noise=add_noise)
+                                       add_noise=add_noise, one_step=one_step)
                     probs.append(_d4(_sigmoid(logit), k, f, inverse=True))
                 else:
                     keep = [i for i, n in enumerate(spec.cond_channels) if n != spec.prior_channel]

@@ -65,6 +65,11 @@ class DiffusionConfig:
     # Optional clamp of the predicted clean DTM during sampling, in normalised
     # units (Palette clamps to [-1, 1]). None disables it.
     clip_x0: float | None = None
+    # Single-step end-to-end model (Garcia et al., "Fine-Tuning Image-Conditional Diffusion
+    # Models is Easier than You Think", WACV 2025): the timestep is fixed to T and the noise
+    # replaced by its mean (zero), so the denoiser maps the conditioning straight to the DTM in
+    # one pass; fine-tuned from a diffusion checkpoint with the same task losses. Deterministic.
+    one_step: bool = False
 
 
 class GrounDiff(nn.Module):
@@ -123,6 +128,13 @@ class GrounDiff(nn.Module):
         return gamma.sqrt() * g0 + (1.0 - gamma).sqrt() * noise
 
     def training_forward(self, g0: torch.Tensor, cond: torch.Tensor):
+        if self.cfg.one_step:
+            b = g0.shape[0]
+            gamma = self.alphas_bar[self.T - 1].expand(b)
+            t = torch.full((b,), self.T, device=g0.device, dtype=torch.long)
+            g_t = torch.zeros_like(g0)                  # the mean of q(g_T | g0) for abar_T -> 0
+            g0_hat, r_hat, logit = self.denoise(g_t, cond, gamma)
+            return {"g0_hat": g0_hat, "r_hat": r_hat, "logit": logit, "gamma": gamma, "t": t}
         gamma, t = self.sample_gammas(g0.shape[0], g0.device)
         g_t = self.q_sample(g0, gamma)
         g0_hat, r_hat, logit = self.denoise(g_t, cond, gamma)
@@ -157,9 +169,16 @@ class GrounDiff(nn.Module):
     @torch.no_grad()
     def sample(self, cond: torch.Tensor, init: str = "dsm_noise", prior: torch.Tensor | None = None,
                t_start: int | None = None, generator: torch.Generator | None = None,
-               add_noise: bool = True):
+               add_noise: bool = True, one_step: bool | None = None):
         """Reverse process Eq. 6-10. Returns (g0, logit) of the final step.
-        add_noise=False gives the deterministic mean path (for tests/analysis)."""
+        add_noise=False gives the deterministic mean path (for tests/analysis).
+        one_step (default: the model's cfg.one_step): a single pass at t = T from zeros."""
+        if self.cfg.one_step if one_step is None else one_step:
+            s = self.gate_surface(cond).float()
+            g0_hat, _, logit = self.denoise(torch.zeros_like(s), cond, self.alphas_bar[self.T - 1].expand(s.shape[0]))
+            if self.cfg.clip_x0 is not None:
+                g0_hat = g0_hat.clamp(-self.cfg.clip_x0, self.cfg.clip_x0)
+            return g0_hat, logit
         t_start = self.T if t_start is None else int(t_start)
         if not 1 <= t_start <= self.T:
             raise ValueError(f"t_start must be in [1, {self.T}]")

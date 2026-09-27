@@ -132,6 +132,7 @@ def run_scene(scene_dir: Path, net, spec: RuntimeSpec, out_dir: Path, args) -> d
     res = predict_scene(arrs, spec, net, stride=args.stride, blend=args.blend, prior=args.prior,
                         init=args.init, t_start=args.t_start, n_samples=args.samples, tta=args.tta,
                         batch_size=args.batch_size, seed=args.seed, gsd=g["gsd"],
+                        one_step=True if getattr(args, "one_step", False) else None,
                         progress=_progress(scene_dir.name))
     out_dir.mkdir(parents=True, exist_ok=True)
     geo = (g["xmin"], g["ymax"], g["gsd"], meta.get("crs_wkt"))
@@ -194,6 +195,9 @@ def main(argv=None):
     ap.add_argument("--block-m", type=float, default=100.0)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--no-overlays", action="store_true", help="skip the coloured RGBA overlays")
+    ap.add_argument("--one-step", action="store_true",
+                    help="a single deterministic pass (zero-shot check of a diffusion model; models fine-tuned "
+                         "with diffusion.one_step do this anyway)")
     ap.add_argument("--max-scenes", type=int, help="evaluate only the first N scenes (quicker check)")
     ap.add_argument("--include-suspect", action="store_true", help="also evaluate scenes the quality gate flagged")
     a = ap.parse_args(argv)
@@ -212,14 +216,23 @@ def main(argv=None):
         scenes = scenes[:a.max_scenes]
     print(f"{len(scenes)} scenes, {a.samples} sample(s) each")
     all_rows = []
+    t_all = time.time()
     for sd in scenes:
+        t_scene = time.time()
         summ = run_scene(sd, net, spec, a.out / sd.name, a)
+        summ["seconds"] = round(time.time() - t_scene, 1)
         all_rows.append(summ)
         m = summ.get("model", {})
         b = summ.get("lasground_new", {})
         print(f"{sd.name}: model RMSE {m.get('rmse', float('nan')):.3f} m"
               + (f" | lasground_new {b.get('rmse', float('nan')):.3f} m" if b else ""))
     (a.out / "summary.json").write_text(json.dumps(all_rows, indent=1))
+    r = [s["model"]["rmse"] for s in all_rows if s.get("model", {}).get("rmse") is not None]
+    if r:
+        mae = [s["model"].get("mae") for s in all_rows if s.get("model", {}).get("mae") is not None]
+        print(f"{len(r)} scenes: mean model RMSE {np.mean(r):.3f} m"
+              + (f", mean MAE {np.mean(mae):.3f} m" if mae else "")
+              + f"; {time.time() - t_all:.0f} s in total")
     return 0
 
 

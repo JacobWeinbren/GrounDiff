@@ -132,3 +132,44 @@ def test_monitor_reads_a_run(scenes, tmp_path):
     assert "step 3/3" in s and "validation @ step 3" in s and "lasground_new RMSE" in s and "DONE" in s
     to_csv(out, tmp_path / "c.csv")
     assert (tmp_path / "c.csv").read_text().startswith("conf") or "loss" in (tmp_path / "c.csv").read_text()
+
+
+def test_one_step_finetune_from_diffusion(scenes, tmp_path):
+    """E2E single-step fine-tune: starts from a diffusion checkpoint, trains the t = T pass from
+    zeros, and every sampler (torch, numpy, exported ONNX) then makes one deterministic call."""
+    import numpy as np
+    from groundiff.export import export
+    from groundiff.runtime import RuntimeSpec, predict_scene
+    from groundiff.backends import OnnxNet
+    base = tmp_path / "diff"
+    train(base_cfg(scenes, base))
+    one = tmp_path / "one"
+    cfg = base_cfg(scenes, one, diffusion={"one_step": True})
+    train(cfg, init_from=str(base / "last.pt"))
+    model, cfg1, ck = load_model(one / "last.pt")
+    assert cfg1.diffusion.one_step
+    # deterministic: two torch samples agree whatever the generator
+    cond = torch.randn(2, len(cfg1.data.cond_channels), 32, 32)
+    with torch.no_grad():
+        a, _ = model.sample(cond, generator=torch.Generator().manual_seed(1))
+        b, _ = model.sample(cond, generator=torch.Generator().manual_seed(2))
+    assert torch.equal(a, b)
+    # numpy runtime on the exported model: one network call per batch, same values as torch
+    onnx_path, _ = export(one / "last.pt", tmp_path / "m1")
+    spec = RuntimeSpec.from_json(tmp_path / "m1.json")
+    assert spec.one_step
+    net = OnnxNet(onnx_path, "cpu")
+    calls = []
+    counted = lambda *x: (calls.append(1), net(*x))[1]
+    from groundiff.runtime import sample
+    g0, _ = sample(counted, cond.numpy(), spec)
+    assert len(calls) == 1 and np.abs(g0 - a.numpy()).max() < 1e-4
+    sd = scenes / "scenes" / "S2"
+    arrs = {n: np.load(sd / f"{n}.npy") for n in spec.needed_channels}
+    calls.clear()
+    res = predict_scene(arrs, spec, counted, batch_size=4, n_samples=4)
+    n_tiles = len(calls)
+    assert np.isfinite(res["dtm"]).any() and "std" not in res    # no spread without sampling
+    calls.clear()
+    predict_scene(arrs, spec, counted, batch_size=4, n_samples=1)
+    assert len(calls) == n_tiles              # samples are ignored: the model is deterministic
