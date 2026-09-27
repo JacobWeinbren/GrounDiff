@@ -28,7 +28,8 @@ def install(new_enums: bool = True):
 
     names = ["QgsProcessingParameterBoolean", "QgsProcessingParameterEnum", "QgsProcessingParameterFile",
              "QgsProcessingParameterFolderDestination", "QgsProcessingParameterMultipleLayers",
-             "QgsProcessingParameterRasterDestination", "QgsProcessingParameterRasterLayer"]
+             "QgsProcessingParameterRasterDestination", "QgsProcessingParameterRasterLayer",
+             "QgsProcessingParameterString"]
     for n in names:
         setattr(core, n, type(n, (_Param,), {}))
     core.QgsProcessingParameterNumber = QgsProcessingParameterNumber

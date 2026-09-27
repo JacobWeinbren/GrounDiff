@@ -46,7 +46,7 @@ def test_speedtest_remembers_best_device(tiny_onnx, tmp_path, monkeypatch):
     assert speedtest.best_device(tiny_onnx) == "cpu"
     state = json.loads((tmp_path / "cache" / "devices.json").read_text())
     assert list(state.values())[0]["best"] == "cpu"
-    assert auto_providers(["CPUExecutionProvider"], tiny_onnx) == ["CPUExecutionProvider"]
+    assert auto_providers(["CPUExecutionProvider"], tiny_onnx) == "cpu"            # the tested device
     assert any("Fastest" in m for m in logs)
 
 
@@ -66,3 +66,11 @@ def test_installer_picks_cuda_build_with_nvidia(monkeypatch, tmp_path):
     assert any("--no-deps" in c and "laspy" in c for c in cmds)
     monkeypatch.setattr(deps, "has_nvidia", lambda: False)
     assert deps.ort_package() in ("onnxruntime", "onnxruntime-directml")
+
+
+def test_speedtest_batches_and_best_setting(tiny_onnx, tmp_path, monkeypatch):
+    from groundiff import speedtest
+    monkeypatch.setenv("GROUNDIFF_CACHE", str(tmp_path / "cache"))
+    res = speedtest.run(str(tiny_onnx), devices=["cpu"], batch=[2, 4], reps=1, log=lambda m: None)
+    assert [r["batch"] for r in res] == [2]            # the CPU reference runs once
+    assert speedtest.best_setting(tiny_onnx) == ("cpu", 2)

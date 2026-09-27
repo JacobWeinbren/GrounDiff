@@ -7,7 +7,7 @@ from qgis.core import (QgsProcessing, QgsProcessingAlgorithm, QgsProcessingConte
                        QgsProcessingParameterEnum, QgsProcessingParameterFile,
                        QgsProcessingParameterFolderDestination, QgsProcessingParameterMultipleLayers,
                        QgsProcessingParameterNumber, QgsProcessingParameterRasterDestination,
-                       QgsProcessingParameterRasterLayer)
+                       QgsProcessingParameterRasterLayer, QgsProcessingParameterString)
 
 # QGIS 3.36+ / 4.x moved these enums to Qgis.*; the old names are gone in 4.x.
 try:
@@ -375,7 +375,7 @@ class TestDevicesAlgorithm(QgsProcessingAlgorithm):
     def shortHelpString(self):
         return ("Runs one batch of the model on every device available here (CPU, Apple GPU through CoreML, "
                 "NVIDIA CUDA, DirectML), each in its own process so a device that runs out of memory is "
-                "stopped safely. Reports the time per tile, the estimated time for a 5 km tile, peak memory "
+                "stopped safely. Tries batch sizes 8, 16 and 32 on GPUs. Reports the time per tile, the estimated time for a 5 km tile, peak memory "
                 "and the largest difference from the CPU's output. The fastest device with the same results "
                 "is remembered for this model and used by 'Auto'. The first CoreML run compiles the model "
                 "(a minute or two); later runs use the compiled copy.")
@@ -385,15 +385,16 @@ class TestDevicesAlgorithm(QgsProcessingAlgorithm):
 
     def initAlgorithm(self, config=None):
         _model_params(self)
-        self.addParameter(_advanced(QgsProcessingParameterNumber(
-            "BATCH", "Network tiles per batch", type=NUM_INT, defaultValue=8, minValue=1, maxValue=128)))
+        self.addParameter(_advanced(QgsProcessingParameterString(
+            "BATCH", "Batch sizes to try on GPUs", defaultValue="8 16 32")))
 
     def processAlgorithm(self, parameters, context, feedback):
         from .core.speedtest import run
         from .deps import python_exe
         model = _model_path(self, parameters, context)
         try:
-            res = run(model, batch=self.parameterAsInt(parameters, "BATCH", context), python=python_exe(),
+            sizes = [int(v) for v in str(self.parameterAsString(parameters, "BATCH", context) or "8").split()]
+            res = run(model, batch=sizes, python=python_exe(),
                       log=feedback.pushInfo, cancelled=feedback.isCanceled)
         except Exception as e:
             raise QgsProcessingException(str(e))

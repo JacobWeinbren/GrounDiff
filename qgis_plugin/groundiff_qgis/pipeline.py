@@ -156,8 +156,18 @@ def run_tiles(onnx_path: str, tiles: list, out_dir: str, providers: list | None 
     if status:
         status("Loading the model")
     spec = load_spec(onnx_path)
-    net = OnnxNet(onnx_path, providers, batch=int((predict_kwargs or {}).get("batch_size", 8)))
-    log(f"ONNX Runtime providers: {net.providers}" + (f" (fixed batch {net.fixed_batch})" if net.fixed_batch else ""))
+    predict_kwargs = dict(predict_kwargs or {})
+    if providers is None and int(predict_kwargs.get("batch_size", 8)) == 8:
+        try:                                    # Auto: the batch size the speed test found fastest
+            from .core.speedtest import best_setting
+            dev, bb = best_setting(onnx_path)
+            if bb:
+                predict_kwargs["batch_size"] = int(bb)
+        except Exception:
+            pass
+    net = OnnxNet(onnx_path, providers, batch=int(predict_kwargs.get("batch_size", 8)))
+    log(f"ONNX Runtime providers: {net.providers}" + (f" ({net.device})" if getattr(net, "device", None) else "")
+        + (f", batch {net.fixed_batch}" if net.fixed_batch else ""))
     if net.warning:
         log(f"[warn] {net.warning}")
     s = run_batch(tiles, out_dir, net, spec, gsd=gsd, buffer_m=buffer_m, workers=workers, read_opts=read_opts,

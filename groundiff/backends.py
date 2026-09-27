@@ -50,23 +50,30 @@ def cpu_threads() -> int:
 # Accelerator settings. CoreML: Apple's newer ML Program format on the GPU, with fixed input shapes
 # (the default NeuralNetwork format with a free batch size splits this network into many pieces
 # and used ~40 GB on an M3 Max) and a compile cache. CUDA: no TF32, so results match the CPU.
+_COREML = {"ModelFormat": "MLProgram", "MLComputeUnits": "CPUAndGPU", "RequireStaticInputShapes": "1",
+           "SpecializationStrategy": "FastPrediction", "AllowLowPrecisionAccumulationOnGPU": "0"}
 PROVIDER_OPTIONS = {
-    "CoreMLExecutionProvider": {"ModelFormat": "MLProgram", "MLComputeUnits": "CPUAndGPU",
-                                "RequireStaticInputShapes": "1", "SpecializationStrategy": "FastPrediction",
-                                "AllowLowPrecisionAccumulationOnGPU": "0"},
+    "CoreMLExecutionProvider": _COREML,
     "CUDAExecutionProvider": {"use_tf32": "0"},
 }
 DEVICE_PROVIDERS = {
     "cuda": ["CUDAExecutionProvider", "CPUExecutionProvider"],
     "directml": ["DmlExecutionProvider", "CPUExecutionProvider"],
     "coreml": ["CoreMLExecutionProvider", "CPUExecutionProvider"],
+    # variants the speed test also tries (kept only if the output still matches the CPU):
+    "coreml_ane": ["CoreMLExecutionProvider", "CPUExecutionProvider"],       # + Neural Engine (16-bit)
+    "coreml_fp16acc": ["CoreMLExecutionProvider", "CPUExecutionProvider"],   # GPU, 16-bit accumulation
     "cpu": ["CPUExecutionProvider"],
+}
+DEVICE_OPTIONS = {
+    "coreml_ane": {**_COREML, "MLComputeUnits": "ALL"},
+    "coreml_fp16acc": {**_COREML, "AllowLowPrecisionAccumulationOnGPU": "1"},
 }
 
 
-def coreml_cache_dir() -> str:
+def coreml_cache_dir(device: str = "coreml") -> str:
     import os
-    d = Path(os.environ.get("GROUNDIFF_CACHE", Path.home() / ".groundiff")) / "coreml_cache"
+    d = Path(os.environ.get("GROUNDIFF_CACHE", Path.home() / ".groundiff")) / "coreml_cache" / device
     d.mkdir(parents=True, exist_ok=True)
     return str(d)
 
@@ -81,7 +88,7 @@ def auto_providers(avail: list, model_path=None) -> list:
         from .speedtest import best_device
         dev = best_device(model_path) if model_path else None
         if dev and DEVICE_PROVIDERS[dev][0] in avail:
-            return DEVICE_PROVIDERS[dev]
+            return dev
     except Exception:
         pass
     return ["CPUExecutionProvider"]
@@ -99,10 +106,12 @@ class OnnxNet:
     def __init__(self, path: str | Path, providers: list | str | None = None, batch: int = 8):
         import onnxruntime as ort
         avail = ort.get_available_providers()
-        if isinstance(providers, str):
-            providers = DEVICE_PROVIDERS[providers]
         if providers is None:
             providers = auto_providers(avail, path)
+        device = providers if isinstance(providers, str) else None
+        self.device = device
+        if device:
+            providers = DEVICE_PROVIDERS[device]
         providers = [p for p in providers if p in avail or p == providers[0]]
         if "CUDAExecutionProvider" in providers and hasattr(ort, "preload_dlls"):
             try:        # load pip-installed CUDA/cuDNN DLLs (onnxruntime-gpu[cuda,cudnn]), e.g. inside QGIS
@@ -124,9 +133,10 @@ class OnnxNet:
         def with_opts(ps):
             out = []
             for p in ps:
-                o = dict(PROVIDER_OPTIONS.get(p, {}))
+                o = dict(DEVICE_OPTIONS.get(device) or PROVIDER_OPTIONS.get(p, {})) if p == ps[0] else \
+                    dict(PROVIDER_OPTIONS.get(p, {}))
                 if p == "CoreMLExecutionProvider":
-                    o["ModelCacheDirectory"] = coreml_cache_dir()
+                    o["ModelCacheDirectory"] = coreml_cache_dir(device or "coreml")
                 out.append((p, o) if o else p)
             return out
 

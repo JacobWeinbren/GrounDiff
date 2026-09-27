@@ -155,8 +155,8 @@ def test_algorithms_run_under_stub_qgis(trained, plugin, tmp_path, new_enums):  
     alg = alg_mod.TestDevicesAlgorithm().createInstance()
     alg.initAlgorithm()
     fb = qgis_stub.Feedback()
-    alg.processAlgorithm({"MODEL": str(onnx_path), "BATCH": 2}, ctx, fb)
-    assert any(m.startswith("cpu: ") and "per tile-step" in m for m in fb.info), fb.info
+    alg.processAlgorithm({"MODEL": str(onnx_path), "BATCH": "2 4"}, ctx, fb)
+    assert any(m.startswith("cpu, batch 2: ") and "per tile-step" in m for m in fb.info), fb.info
     assert (tmp_path / "cache" / "devices.json").exists()
     del os.environ["GROUNDIFF_CACHE"]
     for m in ("qgis", "qgis.core"):
