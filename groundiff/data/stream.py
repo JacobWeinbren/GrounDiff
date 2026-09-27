@@ -120,7 +120,7 @@ class Accumulator:
             self.gy = []
             gz = np.concatenate(self.gz) if self.gz else np.zeros(0, np.float32)
             self.gz = []
-            dtm_b, b_valid = tin_dtm_local(g, gx, gy, gz)
+            dtm_b, b_valid = tin_dtm_local(g, gx, gy, gz, need=survey)
             del gx, gy, gz
             b_valid &= survey
             out["dtm_before"] = np.where(b_valid, dtm_b, np.nan).astype(np.float32)

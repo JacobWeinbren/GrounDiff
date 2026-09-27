@@ -73,3 +73,35 @@ def test_tin_matches_scipy_linear_interpolator(monkeypatch, use_triangle):
     ref = LinearNDInterpolator(np.column_stack([x - g.xmin, y - g.ymax]), z, fill_value=np.nan)(XX, YY)
     assert np.array_equal(np.isfinite(ref), valid)
     assert np.nanmax(np.abs(ref.astype(np.float32) - got)) <= 4e-6        # float32 output, as before
+
+
+def test_tin_with_big_void_is_exact_and_bounded():
+    """A ring of points around a large empty square: every triangle inside spans the void.
+    The scanline lookup keeps the work to the cells covered (a bounding-box scan of these
+    slivers was what used tens of GB on real tiles), and blocks still equal one TIN."""
+    import time
+    from groundiff.data.rasterise import _locate
+    rng = np.random.default_rng(5)
+    S = 800.0
+    n = int(S * S * 1.5)
+    x, y = rng.random(n) * S, rng.random(n) * S
+    keep = ~((x > 60) & (x < 740) & (y > 60) & (y < 740))
+    x, y = np.round(x[keep], 2), np.round(y[keep], 2)                 # cm, as EA tiles
+    z = np.round(20 + x * 0.01 + rng.random(x.size) * 0.05, 2)
+    x, y, z = np.r_[x, x[:50]], np.r_[y, y[:50]], np.r_[z, z[:50] + 0.03]   # duplicate x, y with other z
+    g = Grid(0.0, S, 1.0, int(S), int(S))
+    lx, ly = x, y - S
+    ext = (lx.min(), ly.min(), lx.max(), ly.max())
+    t0 = time.time()
+    got, valid = tin_dtm_local(g, lx, ly, z, block_points=20_000, workers=2)
+    assert time.time() - t0 < 120
+    ref = np.full((g.height, g.width), np.nan, np.float32)
+    _tin_cells(ref, g, lx, ly, z, (0, g.height, 0, g.width), None, ext)
+    assert np.array_equal(np.isfinite(ref), valid)
+    assert np.nanmax(np.abs(ref - got)) == 0.0
+    # thin triangles: work stays near the number of cells
+    pts = np.array([[0.0, 0.0], [700.0, -1.0], [699.0, -700.0], [1.0, -699.0]])
+    tris = np.array([[0, 1, 2], [0, 2, 3]])
+    rr, cc = np.meshgrid(np.arange(700), np.arange(700), indexing="ij")
+    ci, ti, w = _locate(pts, tris, rr.ravel(), cc.ravel(), 1.0, max_items=1000)
+    assert ci.size > 480_000 and np.allclose(w.sum(1), 1.0)

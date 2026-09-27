@@ -139,15 +139,17 @@ def top_return_is(grid: Grid, x, y, z, flag) -> np.ndarray:
     return out.reshape(grid.height, grid.width).astype(np.float32)
 
 
-def tin_dtm(grid: Grid, x, y, z, block_points: int = 300_000, workers: int | None = None):
+def tin_dtm(grid: Grid, x, y, z, block_points: int = 300_000, workers: int | None = None, need=None):
     """Linear interpolation on a Delaunay triangulation (TIN) of all given
     points, evaluated at cell centres. Returns (dtm, valid) where valid is
-    False outside the convex hull. No thinning."""
+    False outside the convex hull (and where need, if given, is False).
+    No thinning."""
     # local coordinates: Delaunay on 6-7 digit BNG values loses precision
-    return tin_dtm_local(grid, np.asarray(x) - grid.xmin, np.asarray(y) - grid.ymax, z, block_points, workers)
+    return tin_dtm_local(grid, np.asarray(x) - grid.xmin, np.asarray(y) - grid.ymax, z, block_points, workers,
+                         need)
 
 
-def tin_dtm_local(grid: Grid, lx, ly, z, block_points: int = 300_000, workers: int | None = None):
+def tin_dtm_local(grid: Grid, lx, ly, z, block_points: int = 300_000, workers: int | None = None, need=None):
     """tin_dtm with coordinates relative to (grid.xmin, grid.ymax) (ly <= 0),
     in any float dtype (float32 keeps big tiles small).
 
@@ -158,7 +160,9 @@ def tin_dtm_local(grid: Grid, lx, ly, z, block_points: int = 300_000, workers: i
     triangle lies inside the points the block saw: such a triangle is then a
     triangle of the full Delaunay triangulation (empty-circle property), so
     the result equals one TIN of all points. Other cells (large voids:
-    water, buildings) are redone with a wider margin."""
+    water, buildings) are redone with a wider margin. need: bool [H, W] of
+    the cells wanted (e.g. the survey coverage; the rest stay NaN, which also
+    spares the huge triangles across open sea or beyond the survey edge)."""
     H, W, gsd = grid.height, grid.width, grid.gsd
     dtm = np.full((H, W), np.nan, np.float32)
     n = int(np.size(lx))
@@ -167,8 +171,16 @@ def tin_dtm_local(grid: Grid, lx, ly, z, block_points: int = 300_000, workers: i
     lx, ly = np.asarray(lx), np.asarray(ly)
     z = np.asarray(z)
     ext = (float(lx.min()), float(ly.min()), float(lx.max()), float(ly.max()))     # all points
+    need = np.ones((H, W), bool) if need is None else np.asarray(need, bool)
+
+    def wanted(r0, r1, c0, c1):
+        rr, cc = np.nonzero(need[r0:r1, c0:c1])
+        return rr + r0, cc + c0
+
     if n <= 2 * block_points:
-        _tin_cells(dtm, grid, lx, ly, z, (0, H, 0, W), None, ext)
+        cells = wanted(0, H, 0, W)
+        if cells[0].size:
+            _tin_cells(dtm, grid, lx, ly, z, (0, H, 0, W), cells, ext)
         return dtm, np.isfinite(dtm)
     density = n / max(W * H * gsd * gsd, 1e-9)
     side = int(np.clip(np.ceil(np.sqrt(block_points / density) / gsd), 32, max(H, W)))
@@ -185,8 +197,11 @@ def tin_dtm_local(grid: Grid, lx, ly, z, block_points: int = 300_000, workers: i
         c1 = min(c0 + side, W)
         for r0 in range(0, H, side):
             r1 = min(r0 + side, H)
+            cells = wanted(r0, r1, c0, c1)
+            if not cells[0].size:
+                continue
             reg = (c0 * gsd - margin, -r1 * gsd - margin, c1 * gsd + margin, -r0 * gsd + margin)
-            jobs.append(((r0, r1, c0, c1), None, reg))
+            jobs.append(((r0, r1, c0, c1), cells, reg))
     hull = None
     while jobs:
         def run(j):
@@ -213,6 +228,13 @@ def tin_dtm_local(grid: Grid, lx, ly, z, block_points: int = 300_000, workers: i
                 if not rows.size:
                     continue
             jobs.append(((0, H, 0, W), (rows, cols), (x0, y0, x1, y1)))
+        # retries that need every point: one triangulation for all of them, not one per block
+        covers = lambda r: r[0] <= ext[0] and r[2] >= ext[2] and r[1] <= ext[1] and r[3] >= ext[3]
+        whole = [j for j in jobs if covers(j[2])]
+        if len(whole) > 1:
+            jobs = [j for j in jobs if not covers(j[2])]
+            jobs.append(((0, H, 0, W), (np.concatenate([j[1][0] for j in whole]),
+                                        np.concatenate([j[1][1] for j in whole])), None))
     return dtm, np.isfinite(dtm)
 
 
@@ -276,49 +298,79 @@ def _triangulate(pts: np.ndarray) -> np.ndarray:
     return Delaunay(pts).simplices
 
 
-def _locate(pts, tris, rr, cc, gsd):
+def _locate(pts, tris, rr, cc, gsd, max_items: int = 4_000_000):
     """For cells (rr, cc): the triangle holding each cell centre and its
-    barycentric weights, found by scanning each triangle's bounding box
-    (like PDAL's faceraster) instead of walking the triangulation per cell.
+    barycentric weights. Each triangle is scanned row by row (the x span of
+    the triangle at each cell-centre row, like a scanline rasteriser), so
+    the work is the number of cells inside the triangles plus their rows,
+    also for the long thin triangles spanning a void (a bounding-box scan
+    would be quadratic there). Processed in chunks of at most max_items.
     Returns (index into rr/cc, triangle index, weights [k, 3])."""
     r0, r1, c0, c1 = int(rr.min()), int(rr.max()) + 1, int(cc.min()), int(cc.max()) + 1
     want = np.full((r1 - r0, c1 - c0), -1, np.int64)
     want[rr - r0, cc - c0] = np.arange(rr.size)
     V = pts[tris]                                               # [m, 3, 2]
-    # cell-centre index ranges covered by each triangle's bounding box, cut to the wanted cells
+    ry0 = np.maximum(np.ceil(-V[:, :, 1].max(1) / gsd - 0.5), r0).astype(np.int64)
+    ry1 = np.minimum(np.floor(-V[:, :, 1].min(1) / gsd - 0.5), r1 - 1).astype(np.int64)
     cx0 = np.maximum(np.ceil(V[:, :, 0].min(1) / gsd - 0.5), c0)
     cx1 = np.minimum(np.floor(V[:, :, 0].max(1) / gsd - 0.5), c1 - 1)
-    ry0 = np.maximum(np.ceil(-V[:, :, 1].max(1) / gsd - 0.5), r0)
-    ry1 = np.minimum(np.floor(-V[:, :, 1].min(1) / gsd - 0.5), r1 - 1)
-    nc, nr = cx1 - cx0 + 1, ry1 - ry0 + 1
-    keep = (nc > 0) & (nr > 0)
-    t = np.flatnonzero(keep)
-    nc, nr, cx0, ry0 = nc[keep].astype(np.int64), nr[keep].astype(np.int64), cx0[keep].astype(np.int64), \
-        ry0[keep].astype(np.int64)
-    cnt = nc * nr
-    if not cnt.size or cnt.sum() == 0:
+    t_all = np.flatnonzero((ry1 >= ry0) & (cx1 >= cx0))
+    out_c, out_t, out_w = [], [], []
+    chunk = np.cumsum(ry1[t_all] - ry0[t_all] + 1) // max_items
+    edges = np.flatnonzero(np.diff(chunk)) + 1
+    for t in np.split(t_all, edges):
+        if not t.size:
+            continue
+        # one item per (triangle, row): the triangle's x span on that row's centre line
+        nr = ry1[t] - ry0[t] + 1
+        ti = np.repeat(np.arange(t.size), nr)
+        row = ry0[t][ti] + (np.arange(nr.sum()) - np.repeat(np.cumsum(nr) - nr, nr))
+        yc = -(row + 0.5) * gsd
+        Vt = V[t][ti]                                           # [k, 3, 2]
+        xl = np.full(yc.size, np.inf)
+        xr = np.full(yc.size, -np.inf)
+        for a, b in ((0, 1), (1, 2), (2, 0)):
+            xa, ya, xb, yb = Vt[:, a, 0], Vt[:, a, 1], Vt[:, b, 0], Vt[:, b, 1]
+            cross = (np.minimum(ya, yb) <= yc) & (yc <= np.maximum(ya, yb)) & (ya != yb)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                xi = xa + (yc - ya) * (xb - xa) / (yb - ya)
+            xl = np.where(cross, np.minimum(xl, xi), xl)
+            xr = np.where(cross, np.maximum(xr, xi), xr)
+            flat = (ya == yb) & (ya == yc)                      # an edge lying on the line
+            xl = np.where(flat, np.minimum(xl, np.minimum(xa, xb)), xl)
+            xr = np.where(flat, np.maximum(xr, np.maximum(xa, xb)), xr)
+        ca = np.maximum(np.ceil(xl / gsd - 0.5 - 1e-9), c0)
+        cb = np.minimum(np.floor(xr / gsd - 0.5 + 1e-9), c1 - 1)
+        ok = np.isfinite(ca) & np.isfinite(cb) & (cb >= ca)
+        ti, row, ca, cb = ti[ok], row[ok], ca[ok].astype(np.int64), cb[ok].astype(np.int64)
+        ncol = cb - ca + 1
+        k = np.repeat(np.arange(ti.size), ncol)
+        col = ca[k] + (np.arange(ncol.sum()) - np.repeat(np.cumsum(ncol) - ncol, ncol))
+        row, ti = row[k], ti[k]
+        cell = want[row - r0, col - c0]
+        m = cell >= 0
+        cell, row, col, tri = cell[m], row[m], col[m], t[ti[m]]
+        a, b, c = V[tri, 0], V[tri, 1], V[tri, 2]
+        px, py = (col + 0.5) * gsd, -(row + 0.5) * gsd
+        den = (b[:, 1] - c[:, 1]) * (a[:, 0] - c[:, 0]) + (c[:, 0] - b[:, 0]) * (a[:, 1] - c[:, 1])
+        with np.errstate(divide="ignore", invalid="ignore"):
+            l1 = ((b[:, 1] - c[:, 1]) * (px - c[:, 0]) + (c[:, 0] - b[:, 0]) * (py - c[:, 1])) / den
+            l2 = ((c[:, 1] - a[:, 1]) * (px - c[:, 0]) + (a[:, 0] - c[:, 0]) * (py - c[:, 1])) / den
+        l3 = 1.0 - l1 - l2
+        eps = -1e-9
+        inside = np.isfinite(l1) & np.isfinite(l2) & (l1 >= eps) & (l2 >= eps) & (l3 >= eps)
+        out_c.append(cell[inside])
+        out_t.append(tri[inside])
+        out_w.append(np.column_stack([l1[inside], l2[inside], l3[inside]]))
+    if not out_c:
         return np.zeros(0, np.int64), np.zeros(0, np.int64), np.zeros((0, 3))
-    ti = np.repeat(np.arange(t.size), cnt)
-    k = np.arange(cnt.sum()) - np.repeat(np.cumsum(cnt) - cnt, cnt)       # position inside the box
-    col = cx0[ti] + k % nc[ti]
-    row = ry0[ti] + k // nc[ti]
-    cell = want[row - r0, col - c0]
-    ok = cell >= 0
-    ti, col, row, cell = ti[ok], col[ok], row[ok], cell[ok]
-    tri = t[ti]
-    a, b, c = V[tri, 0], V[tri, 1], V[tri, 2]
-    px, py = (col + 0.5) * gsd, -(row + 0.5) * gsd
-    den = (b[:, 1] - c[:, 1]) * (a[:, 0] - c[:, 0]) + (c[:, 0] - b[:, 0]) * (a[:, 1] - c[:, 1])
-    with np.errstate(divide="ignore", invalid="ignore"):
-        l1 = ((b[:, 1] - c[:, 1]) * (px - c[:, 0]) + (c[:, 0] - b[:, 0]) * (py - c[:, 1])) / den
-        l2 = ((c[:, 1] - a[:, 1]) * (px - c[:, 0]) + (a[:, 0] - c[:, 0]) * (py - c[:, 1])) / den
-    l3 = 1.0 - l1 - l2
-    eps = -1e-12
-    inside = np.isfinite(l1) & np.isfinite(l2) & (l1 >= eps) & (l2 >= eps) & (l3 >= eps)
-    cell, tri = cell[inside], tri[inside]
-    w = np.column_stack([l1[inside], l2[inside], l3[inside]])
-    cell, first = np.unique(cell, return_index=True)            # a centre on a shared edge: either triangle
-    return cell, tri[first], w[first]
+    cell, tri, w = np.concatenate(out_c), np.concatenate(out_t), np.concatenate(out_w)
+    # a centre on a shared edge: either triangle (same value); prefer the one it is most inside
+    order = np.lexsort((-w.min(1), cell))
+    cell, tri, w = cell[order], tri[order], w[order]
+    first = np.ones(cell.size, bool)
+    first[1:] = cell[1:] != cell[:-1]
+    return cell[first], tri[first], w[first]
 
 
 def _tin_cells(dtm, grid, px, py, pz, blk, cells, ext, region=None):
@@ -336,6 +388,13 @@ def _tin_cells(dtm, grid, px, py, pz, blk, cells, ext, region=None):
         rr, cc = cells
     tris = None
     if px.size >= 3:
+        # points sharing x, y (different z): keep the lowest, so every block makes the same choice
+        o = np.lexsort((pz, py, px))
+        px, py, pz = px[o], py[o], pz[o]
+        first = np.ones(px.size, bool)
+        first[1:] = (px[1:] != px[:-1]) | (py[1:] != py[:-1])
+        if not first.all():
+            px, py, pz = px[first], py[first], pz[first]
         pts = np.column_stack([px, py]).astype(np.float64)
         try:
             tris = _triangulate(pts)
@@ -415,7 +474,7 @@ def input_rasters(grid: Grid, pts, lasground: bool = True, before_ground_classes
     out["in_survey"] = survey.astype(np.float32)
     if lasground:
         bg = np.isin(pts.cls, np.asarray(before_ground_classes, np.uint8))
-        dtm_b, b_valid = tin_dtm(grid, pts.x[bg], pts.y[bg], pts.z[bg])
+        dtm_b, b_valid = tin_dtm(grid, pts.x[bg], pts.y[bg], pts.z[bg], need=survey)
         b_valid &= survey
         out["dtm_before"] = np.where(b_valid, dtm_b, np.nan).astype(np.float32)
         out["before_valid"] = b_valid.astype(np.float32)
@@ -429,7 +488,7 @@ def target_from_points(grid: Grid, after, survey: np.ndarray, ground_classes=(2,
     TIN of the ground class. EA production uses 1 unclassified, 2 ground,
     bridge and low noise, and builds the DTM from ground only."""
     g = np.isin(after.cls, np.asarray(ground_classes, np.uint8))
-    gt, gt_valid = tin_dtm(grid, after.x[g], after.y[g], after.z[g])
+    gt, gt_valid = tin_dtm(grid, after.x[g], after.y[g], after.z[g], need=np.asarray(survey, bool))
     gt_valid &= survey
     return {"gt_dtm": np.where(gt_valid, gt, np.nan).astype(np.float32),
             "gt_valid": gt_valid.astype(np.float32),

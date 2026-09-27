@@ -224,7 +224,7 @@ def process_scene(before: Path, out_root: Path, *, dtm_paths: list | None = None
         from .rasterise import tin_dtm
         g2 = pts.cls == 2
         if g2.sum() >= 3:
-            ground_tin, ok_tin = tin_dtm(grid, pts.x[g2], pts.y[g2], pts.z[g2])
+            ground_tin, ok_tin = tin_dtm(grid, pts.x[g2], pts.y[g2], pts.z[g2], need=survey)
             ground_tin = np.where(ok_tin & survey, ground_tin, np.nan)
     meta = {"schema": SCHEMA, "scene": name, "gsd": gsd, "grid": grid.to_dict(),
             "crs_wkt": pts.crs_wkt or _default_crs(), "before_file": str(before), "n_points": len(pts),
