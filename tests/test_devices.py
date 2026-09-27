@@ -101,3 +101,20 @@ def test_fp16_export_close_to_fp32(tmp_path):
                                                                                        "gamma": g.numpy()})[0]
     assert out.dtype == np.float32 and out.shape == ref.shape
     assert 0 < np.abs(out - ref).max() < 1e-2
+
+
+def test_speedtest_reference_is_the_main_model(tiny_onnx, tmp_path, monkeypatch):
+    """--also files are compared with the main model on the CPU, not with their own CPU run."""
+    import onnx
+    from groundiff import speedtest
+    monkeypatch.setenv("GROUNDIFF_CACHE", str(tmp_path / "cache"))
+    m = onnx.load(str(tiny_onnx))
+    for t in m.graph.initializer:                    # a copy with different weights
+        if t.name.endswith("weight"):
+            arr = onnx.numpy_helper.to_array(t) * 1.5
+            t.CopyFrom(onnx.numpy_helper.from_array(arr.astype(np.float32), t.name))
+    other = tmp_path / "other.onnx"
+    onnx.save(m, str(other))
+    res = speedtest.run(str(tiny_onnx), devices=["cpu"], batch=2, reps=1, log=lambda s: None, also=[str(other)])
+    o = [r for r in res if r["model"] == str(other.resolve())][0]
+    assert o["max_diff"] > speedtest.TOLERANCE and not o["ok"]

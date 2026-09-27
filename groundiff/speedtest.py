@@ -190,14 +190,14 @@ def run(model: str, devices: list | None = None, batch: int | list = 8, reps: in
         else:
             r.update(json.loads(so.strip().splitlines()[-1]))
             y = np.load(out)
-            if dev == "cpu":
+            if dev == "cpu" and mdl == model:         # the reference: this model, float32, on the CPU
                 ref = y
             if ref is not None:
                 k = min(len(y), len(ref))                   # same seeded input: the first k tiles agree
                 d = float(np.abs(y[:k] - ref[:k]).max())
                 r["max_diff"] = d
                 r["mean_diff"] = float(np.abs(y[:k] - ref[:k]).mean())
-                r["ok"] = d <= tolerance * max(1.0, float(np.abs(ref).max()))
+                r["ok"] = d <= tolerance                  # absolute: outputs can exceed 1 (logits)
                 if not r["ok"]:
                     r["error"] = f"output differs from the CPU by up to {d:.2e} (limit {tolerance:g})"
             else:
