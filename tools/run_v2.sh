@@ -7,7 +7,9 @@
 #
 # Resumable: run the same command again after a stop; finished steps are skipped (markers in
 # data/v2/done/), downloads and scenes are cached, training continues from last.pt.
-# Settings (environment): TARGET=700 tiles, WORKERS=4 preprocess processes, MIN_FREE_GB=120.
+# Settings (environment): TARGET=700 tiles, WORKERS=4 preprocess processes, MIN_FREE_GB=120,
+# FROM_SCRATCH=1 to train the diffusion model from scratch (SCRATCH_STEPS=20000) instead of
+# fine-tuning runs/no_lastools/best.pt.
 set -euo pipefail
 export PYTHONUNBUFFERED=1                # progress lines reach the log as they happen
 cd "$(dirname "$0")/.."
@@ -15,6 +17,8 @@ cd "$(dirname "$0")/.."
 TARGET=${TARGET:-700}
 WORKERS=${WORKERS:-4}
 MIN_FREE_GB=${MIN_FREE_GB:-120}
+FROM_SCRATCH=${FROM_SCRATCH:-0}
+SCRATCH_STEPS=${SCRATCH_STEPS:-20000}
 D=data/v2
 mkdir -p "$D/done" runs results models
 
@@ -68,13 +72,19 @@ fi
 
 if ! done_ train; then
   say "6/10 training the diffusion model (runs/v2; watch: python -m groundiff.monitor runs/v2 --follow)"
-  if [ -f runs/no_lastools/best.pt ] && [ ! -f runs/v2/last.pt ]; then
-    python -m groundiff.train configs/v2.json --init-from runs/no_lastools/best.pt --set train.num_workers=6
-  elif [ -f runs/v2/last.pt ] || [ -f runs/no_lastools/best.pt ]; then
-    python -m groundiff.train configs/v2.json --set train.num_workers=6
-  else                                   # no earlier model: from scratch, the full schedule
+  mkdir -p runs/v2
+  # from scratch (FROM_SCRATCH=1, or no earlier model) or fine-tuned from runs/no_lastools; the choice is
+  # remembered so a resumed run keeps the same schedule
+  if [ ! -f runs/v2/last.pt ] && { [ "$FROM_SCRATCH" = 1 ] || [ ! -f runs/no_lastools/best.pt ]; }; then
+    touch runs/v2/FROM_SCRATCH
+  fi
+  if [ -f runs/v2/FROM_SCRATCH ]; then
     python -m groundiff.train configs/v2.json --set train.num_workers=6 optim.lr=0.0001 \
-      optim.warmup_steps=500 optim.total_steps=20000
+      optim.warmup_steps=500 optim.total_steps="$SCRATCH_STEPS"
+  elif [ ! -f runs/v2/last.pt ]; then
+    python -m groundiff.train configs/v2.json --init-from runs/no_lastools/best.pt --set train.num_workers=6
+  else
+    python -m groundiff.train configs/v2.json --set train.num_workers=6
   fi
   mark train
 fi

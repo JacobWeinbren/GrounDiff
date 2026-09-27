@@ -8,7 +8,8 @@
 # 2. trains configs/v2_rdbm_range.json from scratch (20000 steps), or resumes runs/v2_rdbm_range/last.pt.
 #    best.pt is written at every validation (every 1000 steps), so stopping early keeps a model;
 #    run this script again to continue;
-# 3. once training is done, evaluates it and the previous model on the same v2 test scenes.
+# 3. once training is done, evaluates it, the Palette-style v2 models (if trained) and the previous
+#    model on the same v2 test scenes (results/cmp_*).
 # Settings (environment): STEPS=20000, EVAL_SCENES=10, WORKERS=4.
 set -euo pipefail
 export PYTHONUNBUFFERED=1
@@ -52,16 +53,12 @@ fi
 say "training runs/v2_rdbm_range from scratch ($STEPS steps; watch: python -m groundiff.monitor runs/v2_rdbm_range --follow)"
 python -m groundiff.train configs/v2_rdbm_range.json --set optim.total_steps="$STEPS" train.num_workers=6
 
-say "test: $EVAL_SCENES v2 test scenes, new model then the previous one (same scenes)"
-python -m groundiff.infer --checkpoint runs/v2_rdbm_range/best.pt --scenes "$D/scenes" \
-  --split-file "$D/split.json" --split test --out results/v2_rdbm_range --no-overlays \
-  --max-scenes "$EVAL_SCENES" --stride 256
-for old in runs/no_lastools_1step/best.pt runs/no_lastools/best.pt; do
-  if [ -f "$old" ]; then
-    python -m groundiff.infer --checkpoint "$old" --scenes "$D/scenes" --split-file "$D/split.json" \
-      --split test --out "results/v2_old_$(basename "$(dirname "$old")")" --no-overlays \
-      --max-scenes "$EVAL_SCENES" --stride 256
-    break
+say "test on the same $EVAL_SCENES v2 test scenes: RDBM, then Palette-style v2 (10-step and single-step), then the old model"
+for m in runs/v2_rdbm_range runs/v2 runs/v2_1step runs/no_lastools_1step; do
+  if [ -f "$m/best.pt" ]; then
+    say "   $m"
+    python -m groundiff.infer --checkpoint "$m/best.pt" --scenes "$D/scenes" --split-file "$D/split.json" \
+      --split test --out "results/cmp_$(basename "$m")" --no-overlays --max-scenes "$EVAL_SCENES" --stride 256
   fi
 done
 say "finished"
