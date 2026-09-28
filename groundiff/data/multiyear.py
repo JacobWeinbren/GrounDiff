@@ -24,13 +24,11 @@ build      fetch + rasterise square by square, deleting each square-year's
 rasterise  per location and year: the usual input rasters and the EA DTM target
            on one 1 m grid shared by all years, with preprocess's quality gate.
            data/mt/scenes/<location>_<year>/.
-pairs      per location, for every two years: the cells whose surface changed, by
-           Wheaton et al. 2010's DEM of difference (lowest returns, level of
-           detection 1.96 x sqrt(2) x 0.15 m from EA's stated accuracy, 5 x 5
-           spatial coherence); those cells are never used as cross-year targets.
-           With 3 or more years also the consensus DTM (per-cell median of all
-           years' DTMs where unchanged; evaluation only) and each year's
-           disagreement with it.
+pairs      per place: its survey years (SAR2SAR pairs); with 3 or more years also
+           the consensus DTM (per-cell median of all years' EA DTMs), for
+           evaluation only.
+compensate SAR2SAR pre-estimates: a trained network's DTM for every scene
+           (<name>.npy), used to compensate other years' labels for change.
 
 Every step is resumable (results are cached; rerun after an interruption).
 The catalogue and downloads are the EA survey service that ea_dtm uses.
@@ -508,39 +506,10 @@ def build(out: Path, fetch_workers: int = 2, workers: int = 2, gate: dict | None
 
 # ----------------------------------------------------------------------------- pairs, consensus
 
-# EA lidar vertical accuracy: +-15 cm RMSE per point
-EA_SIGMA_Z = 0.15
-
-
-def level_of_detection(sigma_a: float = EA_SIGMA_Z, sigma_b: float = EA_SIGMA_Z, t: float = 1.96) -> float:
-    """Minimum detectable change between two surveys (Wheaton et al. 2010, ESPL 35(2), after
-    Brasington et al. 2003): t x sqrt(sigma_a^2 + sigma_b^2), with each survey's stated vertical
-    accuracy; 0.42 m for two EA surveys at 95 %."""
-    return float(t * np.hypot(sigma_a, sigma_b))
-
-
-def unchanged_mask(A: dict, B: dict, lod: float | None = None, window: int = 5) -> np.ndarray:
-    """True where the surface did not change between the surveys, by Wheaton et al. 2010's DEM of
-    difference: B's lowest returns minus A's, thresholded at the level of detection, keeping only
-    spatially coherent change (their 5 x 5 spatial-coherence filter, here in its simplest form: most
-    cells of the window changed in the same direction). Cells surveyed in only one of the two years
-    count as changed (nothing to compare)."""
-    from scipy.ndimage import uniform_filter
-    lod = level_of_detection() if lod is None else lod
-    a, b = A["dsm_min"], B["dsm_min"]
-    both = np.isfinite(a) & np.isfinite(b)
-    d = np.where(both, b - a, 0.0)
-    need = (window * window) // 2 + 1
-    changed = np.zeros(a.shape, bool)
-    for side in (both & (d > lod), both & (d < -lod)):
-        n = np.rint(uniform_filter(side.astype(np.float32), window, mode="constant") * window * window)
-        changed |= side & (n >= need)
-    changed |= np.isfinite(a) ^ np.isfinite(b)
-    return ~changed
-
-
-def pairs(out: Path, change_m: float | None = None, min_consensus: int = 3, log=print) -> dict:
-    """Change masks, consensus DTMs and label-disagreement maps for every location."""
+def pairs(out: Path, min_consensus: int = 3, log=print) -> dict:
+    """For every place: which survey years it has (the SAR2SAR pairs) and, with min_consensus or more
+    years, the consensus DTM: the per-cell median of all years' EA DTMs, for evaluation only (the value
+    an L1 Noise2Noise model converges to where the ground did not change)."""
     from .preprocess import _save
     root = out / "scenes"
     locs: dict[str, list] = {}
@@ -549,56 +518,35 @@ def pairs(out: Path, change_m: float | None = None, min_consensus: int = 3, log=
         if meta.get("quality", {}).get("suspect") or "location" not in meta:
             continue
         locs.setdefault(meta["location"], []).append(meta)
-    names = ("dsm_min", "gt_dtm", "gt_valid")
     stats = {"locations": len(locs), "pairs": 0, "consensus": 0}
-    lod = level_of_detection() if change_m is None else change_m
     for loc, metas in sorted(locs.items()):
         metas.sort(key=lambda m: m["year"])
-        arr = {m["year"]: {n: np.load(root / m["scene"] / f"{n}.npy").astype(np.float32) for n in names}
-               for m in metas}
         years = [m["year"] for m in metas]
-        info = {y: {} for y in years}
-        masks = {}
-        for i, a in enumerate(years):
-            for b in years[i + 1:]:
-                um = unchanged_mask(arr[a], arr[b], lod)
-                masks[(a, b)] = masks[(b, a)] = um
-                both = np.isfinite(arr[a]["dsm_min"]) & np.isfinite(arr[b]["dsm_min"])
-                rec = {"lod": lod, "shared": float(both.mean()),
-                       "unchanged": float(um[both].mean()) if both.any() else 0.0}
-                info[a][b] = info[b][a] = rec
-                stats["pairs"] += 1
+        labels = {}
+        for m in metas:
+            sd = root / m["scene"]
+            gt = np.load(sd / "gt_dtm.npy").astype(np.float32)
+            labels[m["year"]] = np.where(np.load(sd / "gt_valid.npy") > 0.5, gt, np.nan)
+        stats["pairs"] += len(years) * (len(years) - 1) // 2
+        cons = None
+        if len(years) >= min_consensus:
+            S = np.stack([labels[y] for y in years])
+            n = np.isfinite(S).sum(0)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)          # cells no year covers
+                cons = np.nanmedian(np.where(n >= min_consensus, S, np.nan), axis=0)
+            cons = np.where(n >= min_consensus, cons, np.nan).astype(np.float32)
         for m in metas:
             a = m["year"]
             sd = root / m["scene"]
-            prs = {}
-            for b in years:
-                if b == a:
-                    continue
-                _save(sd, f"unchanged_{b}", masks[(a, b)].astype(np.float32))
-                prs[b] = {"scene": f"{loc}_{b}", **info[a][b]}
-            m["pairs"] = prs
-            # consensus (evaluation only): per-cell median of every year's DTM where unchanged w.r.t. a;
-            # the median is what an L1 Noise2Noise model converges to
-            stack = []
-            for b in years:
-                g = np.where(arr[b]["gt_valid"] > 0.5, arr[b]["gt_dtm"], np.nan)
-                if b != a:
-                    g = np.where(masks[(a, b)], g, np.nan)
-                stack.append(g)
-            S = np.stack(stack)
-            n = np.isfinite(S).sum(0)
-            for k in ("gt_consensus", "label_error", "label_above_lidar"):
-                (sd / f"{k}.npy").unlink(missing_ok=True)
-            m.pop("label_noise", None)
-            m.pop("label_above_lidar_frac", None)
-            if len(years) >= min_consensus:
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore", RuntimeWarning)          # cells with no year left
-                    cons = np.nanmedian(np.where(n >= min_consensus, S, np.nan), axis=0)
-                cons = np.where(n >= min_consensus, cons, np.nan).astype(np.float32)
-                own = np.where(arr[a]["gt_valid"] > 0.5, arr[a]["gt_dtm"], np.nan)
-                err = (own - cons).astype(np.float32)
+            for f in list(sd.glob("unchanged_*.npy")) + [sd / "label_above_lidar.npy", sd / "gt_consensus.npy",
+                                                         sd / "label_error.npy"]:
+                f.unlink(missing_ok=True)                  # from earlier versions of this step
+            for k in ("label_noise", "label_above_lidar_frac"):
+                m.pop(k, None)
+            m["pairs"] = {b: {"scene": f"{loc}_{b}"} for b in years if b != a}
+            if cons is not None:
+                err = (labels[a] - cons).astype(np.float32)
                 _save(sd, "gt_consensus", cons)
                 _save(sd, "label_error", err)
                 ok = np.isfinite(err)
@@ -608,18 +556,46 @@ def pairs(out: Path, change_m: float | None = None, min_consensus: int = 3, log=
                                         "frac_over_0.2m": float((e > 0.2).mean()), "frac_over_0.5m": float((e > 0.5).mean())}
                 stats["consensus"] += 1
             _write_json(sd / "meta.json", m)
-        log(f"  {loc}: years {years}"
-            + "".join(f"; {a}-{b} both surveyed {info[a][b]['shared']:.0%}, unchanged {info[a][b]['unchanged']:.0%} of that"
-                      for i, a in enumerate(years) for b in years[i + 1:]))
-    log(f"{stats['locations']} locations, {stats['pairs']} year pairs (change threshold {lod:.2f} m), "
-        f"{stats['consensus']} scenes with a consensus DTM")
+        log(f"  {loc}: years {years}")
+    log(f"{stats['locations']} places, {stats['pairs']} year pairs, {stats['consensus']} scenes with a consensus DTM")
     return stats
+
+
+def compensate(out: Path, checkpoint: str, name: str, device: str = "auto", batch_size: int = 8,
+               log=print) -> int:
+    """SAR2SAR's pre-estimates (Dalsasso et al. 2021, Sec. IV-B and V-B): the given network's DTM for
+    every non-suspect scene of a place with two or more years, saved as <name>.npy (metres), used to
+    compensate the other years' labels for change (dataset.PairScene)."""
+    from ..infer import load_net
+    from ..runtime import predict_scene
+    net, spec = load_net(checkpoint, None, device)
+    root = out / "scenes"
+    todo = []
+    for m in sorted(root.glob("*/meta.json")):
+        meta = json.loads(m.read_text())
+        if meta.get("pairs") and not meta.get("quality", {}).get("suspect"):
+            todo.append(m.parent)
+    log(f"{len(todo)} scenes: pre-estimates '{name}' from {checkpoint}")
+    for i, sd in enumerate(todo, 1):
+        meta = json.loads((sd / "meta.json").read_text())
+        if meta.get("compensation", {}).get(name) == str(checkpoint) and (sd / f"{name}.npy").exists():
+            continue                                        # resumable
+        arrs = {n: np.load(sd / f"{n}.npy").astype(np.float32) for n in spec.needed_channels}
+        for n in ("in_survey", "has_return"):
+            if (sd / f"{n}.npy").exists():
+                arrs[n] = np.load(sd / f"{n}.npy").astype(np.float32)
+        res = predict_scene(arrs, spec, net, batch_size=batch_size, gsd=meta["grid"]["gsd"])
+        np.save(sd / f"{name}.npy", res["dtm"].astype(np.float32))
+        meta.setdefault("compensation", {})[name] = str(checkpoint)
+        _write_json(sd / "meta.json", meta)
+        log(f"  [{i}/{len(todo)}] {sd.name}")
+    return len(todo)
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for c in ("plan", "fetch", "rasterise", "build", "pairs"):
+    for c in ("plan", "fetch", "rasterise", "build", "pairs", "compensate"):
         s = sub.add_parser(c)
         s.add_argument("--out", type=Path, required=True)
         if c == "plan":
@@ -633,9 +609,11 @@ def main(argv=None):
                            help="download threads (fetch) or rasterising processes")
         if c == "build":
             s.add_argument("--fetch-workers", type=int, default=2, help="squares downloaded at once")
-        if c == "pairs":
-            s.add_argument("--change-m", type=float, default=None,
-                           help="change threshold (default: 95%% level of detection for EA's +-15 cm)")
+        if c == "compensate":
+            s.add_argument("--checkpoint", required=True)
+            s.add_argument("--name", required=True, help="e.g. xhat_a (from step A) or xhat_b (from step B)")
+            s.add_argument("--device", default="auto")
+            s.add_argument("--batch-size", type=int, default=8)
     a = ap.parse_args(argv)
     a.out.mkdir(parents=True, exist_ok=True)
     if a.cmd == "plan":
@@ -649,8 +627,10 @@ def main(argv=None):
     elif a.cmd == "build":
         r = build(a.out, a.fetch_workers, a.workers)
         return 1 if r["failed"] else 0
+    elif a.cmd == "compensate":
+        compensate(a.out, a.checkpoint, a.name, a.device, a.batch_size)
     else:
-        pairs(a.out, a.change_m)
+        pairs(a.out)
     return 0
 
 

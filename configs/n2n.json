@@ -1,5 +1,5 @@
 {
- "notes": "GrounDiff (gated Palette UNet, DSM -> DTM) + tile_range on multi-year EA data (2017-2022). Noise2Noise (Lehtinen et al., ICML 2018): half the training tiles take their target from another survey year of the same place (vertical offset removed, changed cells masked), so no year's label is treated as clean; L1 only (median-seeking under N2N). Validated against the multi-year consensus DTM. Trained from scratch.",
+ "notes": "SAR2SAR step A, part 1 (Dalsasso et al. 2021): GrounDiff (gated Palette UNet, DSM -> DTM) + tile_range, trained from scratch on each survey year's own EA DTM with GrounDiff's loss, on multi-year EA data.",
  "data": {
   "root": "data/mt/scenes",
   "split_file": "data/mt/split.json",
@@ -22,8 +22,8 @@
   "alpha": 0.2,
   "loss_mask": "gt",
   "fill_empty": "nearest",
-  "cross_year": true,
-  "eval_target": "consensus"
+  "cross_year": false,
+  "eval_target": "own"
  },
  "model": {
   "kind": "groundiff"
@@ -34,7 +34,7 @@
  },
  "loss": {
   "lam_l1": 1.0,
-  "lam_l2": 0.0,
+  "lam_l2": 1.0,
   "lam_grad": 0.1,
   "lam_conf": 0.1
  },

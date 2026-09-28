@@ -1,5 +1,5 @@
 {
- "notes": "SAR2SAR step A, part 2: single-step end-to-end fine-tune (E2E-FT, Garcia et al. 2025) of runs/mt/best.pt, own-year labels. Its DTMs are the pre-estimates x_hat_a that step B compensates changes with.",
+ "notes": "SAR2SAR steps B and C (Dalsasso et al. 2021): the single-step model fine-tuned on pairs of survey years, input from year a, target year b's EA DTM compensated for change: label_b - x_hat_b + x_hat_a (x_hat from step A for B, from step B for C: --set data.compensation=xhat_b). Noise2Noise's L1 loss (Lehtinen et al. 2018) in place of GrounDiff's L1 + L2. Learning rate 1/100 of step A's initial one, as in SAR2SAR; run_n2n.sh sets the length (a third of step A each, as SAR2SAR's 10 vs 30 epochs).",
  "data": {
   "root": "data/mt/scenes",
   "split_file": "data/mt/split.json",
@@ -22,8 +22,9 @@
   "alpha": 0.2,
   "loss_mask": "gt",
   "fill_empty": "nearest",
-  "cross_year": false,
-  "eval_target": "own"
+  "cross_year": true,
+  "eval_target": "own",
+  "compensation": "xhat_a"
  },
  "model": {
   "kind": "groundiff"
@@ -35,19 +36,19 @@
  },
  "loss": {
   "lam_l1": 1.0,
-  "lam_l2": 1.0,
+  "lam_l2": 0.0,
   "lam_grad": 0.1,
   "lam_conf": 0.1
  },
  "optim": {
   "name": "adamw",
-  "lr": 3e-05,
+  "lr": 1e-06,
   "weight_decay": 0.01,
   "warmup_steps": 100,
-  "total_steps": 3000
+  "total_steps": 7700
  },
  "train": {
-  "out_dir": "runs/mt_1step",
+  "out_dir": "runs/mt_b",
   "batch_size": 4,
   "grad_accum": 4,
   "val_init": "dsm_noise",

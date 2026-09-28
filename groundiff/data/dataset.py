@@ -87,10 +87,12 @@ class DataConfig:
     include_suspect: bool = False            # also use scenes the preprocess quality gate flagged
     bridge_oversample: float = 0.0           # share of training tiles centred on a bridge (preprocess --osm)
     context_factor: int = 4                  # ctx_* channels: window this many times wider than the tile
-    # Noise2Noise across surveys (data.multiyear): the target of a training tile is the EA DTM of a
-    # random year of the same location (aligned by the survey offset, only where the ground did not
-    # change), so editing mistakes of single years are outvoted instead of learned
+    # SAR2SAR (Dalsasso et al. 2021, Noise2Noise across acquisition dates): every training tile takes
+    # its input from one survey year and its target from another year b of the same place, compensated
+    # for change with pre-estimates x_hat of each year's DTM (data.multiyear compensate):
+    # label_b - x_hat_b + x_hat_a. compensation: the name of those pre-estimates (xhat_a, xhat_b).
     cross_year: bool = False
+    compensation: str = "xhat_a"
     eval_target: str = "own"                 # "consensus": validate against the multi-year median DTM where it exists
 
 
@@ -131,27 +133,36 @@ class Scene:
 
 
 class PairScene:
-    """Inputs from scene a, target from scene b (another survey of the same place; Noise2Noise):
-    b's DTM, valid only where b's label is and the surface did not change (data.multiyear.pairs)."""
+    """SAR2SAR pair (Dalsasso et al. 2021, eq. in Sec. IV-B): inputs from scene a, target from scene
+    b (another survey year of the same place) compensated for change: y_b - x_hat_b + x_hat_a, where
+    x_hat are pre-estimates of each year's DTM (the `compensation` rasters). Valid where b's label and
+    both pre-estimates are."""
 
     TARGETS = ("gt_dtm", "gt_valid")
 
-    def __init__(self, a: Scene, b: Scene, year_b: str):
-        self.a, self.b = a, b
+    def __init__(self, a: Scene, b: Scene, compensation: str):
+        self.a, self.b, self.comp = a, b, compensation
         self.path, self.meta = a.path, a.meta
         self.height, self.width, self.gsd = a.height, a.width, a.gsd
-        self.mask = a.array(f"unchanged_{year_b}")
 
     def array(self, name: str) -> np.ndarray:
         if name in self.TARGETS:
             raise KeyError(f"{name}: read windows of a PairScene")
         return self.a.array(name)
 
+    def _target(self, r0, c0, h, w):
+        gb = self.b.window("gt_dtm", r0, c0, h, w)
+        xb = self.b.window(self.comp, r0, c0, h, w)
+        xa = self.a.window(self.comp, r0, c0, h, w)
+        ok = (np.nan_to_num(self.b.window("gt_valid", r0, c0, h, w)) > 0.5) & np.isfinite(gb) \
+            & np.isfinite(xb) & np.isfinite(xa)
+        return np.where(ok, gb - xb + xa, np.nan), ok
+
     def window(self, name: str, r0: int, c0: int, h: int, w: int) -> np.ndarray:
         if name == "gt_dtm":
-            return self.b.window("gt_dtm", r0, c0, h, w)
+            return self._target(r0, c0, h, w)[0]
         if name == "gt_valid":
-            return self.b.window("gt_valid", r0, c0, h, w) * _window(self.mask, r0, c0, h, w, fill=0.0)
+            return self._target(r0, c0, h, w)[1].astype(np.float32)
         return self.a.window(name, r0, c0, h, w)
 
 
@@ -249,23 +260,29 @@ class TileDataset(Dataset):
                 pick = np.unique(np.linspace(0, len(self.index) - 1, max_tiles).round().astype(int))
                 self.index = [self.index[k] for k in pick]
         else:
+            self.partners = self._partners() if cfg.cross_year else {}
+            if cfg.cross_year:
+                # SAR2SAR trains on pairs of dates only: places surveyed once take no part
+                self.scenes = [sc for sc in self.scenes if sc.path.name in self.partners]
+                if not self.scenes:
+                    raise ValueError(f"cross_year: no scene has another year with '{cfg.compensation}' "
+                                     "pre-estimates (run data.multiyear compensate first)")
             areas = np.array([s.height * s.width for s in self.scenes], np.float64)
             self.scene_p = areas / areas.sum()
-            self.partners = self._partners() if cfg.cross_year else {}
             self.bridges = self._bridge_cells() if cfg.bridge_oversample > 0 else []
 
     def _partners(self) -> dict:
-        """{scene: [(scene of another year, that year)]} among the loaded scenes (same split)."""
-        by = {sc.path.name: sc for sc in self.scenes}
+        """{scene: [scenes of the other years]} among the loaded scenes (same split) that have the
+        compensation pre-estimates."""
+        comp = self.cfg.compensation
+        by = {sc.path.name: sc for sc in self.scenes if (sc.path / f"{comp}.npy").exists()}
         out = {}
-        for sc in self.scenes:
-            lst = [(by[p["scene"]], y) for y, p in (sc.meta.get("pairs") or {}).items()
-                   if p["scene"] in by and (sc.path / f"unchanged_{y}.npy").exists()]
+        for name, sc in by.items():
+            lst = [by[p["scene"]] for y, p in sorted((sc.meta.get("pairs") or {}).items()) if p["scene"] in by]
             if lst:
-                out[sc.path.name] = lst
-        if out:
-            n = sum(len(v) for v in out.values())
-            print(f"[info] cross-year targets: {len(out)} scenes with {n} other-year labels")
+                out[name] = lst
+        n = sum(len(v) for v in out.values())
+        print(f"[info] SAR2SAR pairs ({comp}): {len(out)} scenes with {n} other-year targets")
         return out
 
     def _bridge_cells(self, per_scene: int = 4000) -> list:
@@ -381,10 +398,8 @@ class TileDataset(Dataset):
         else:
             sc = self.scenes[int(rng.choice(len(self.scenes), p=self.scene_p))]
         other = self.partners.get(sc.path.name)
-        if other:                                        # the target year: this one or any other survey
-            j = int(rng.integers(len(other) + 1))
-            if j:
-                sc = PairScene(sc, *other[j - 1])
+        if other:                                        # SAR2SAR: the target is another date
+            sc = PairScene(sc, other[int(rng.integers(len(other)))], cfg.compensation)
         k = int(rng.integers(0, 4)) if aug and rng.random() < cfg.p_rot90 else 0
         jitter = float(rng.uniform(-cfg.jitter_deg, cfg.jitter_deg)) if aug and rng.random() < cfg.p_jitter else 0.0
         size = int(rng.choice(cfg.multiscale_sizes)) if aug and rng.random() < cfg.p_multiscale else t
