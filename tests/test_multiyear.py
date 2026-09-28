@@ -50,10 +50,10 @@ def test_survey_offset_and_change_mask():
     assert off == pytest.approx(0.07, abs=1e-4)
     rng = np.random.default_rng(0)
     Bn = {**B, "dsm_min": gb + rng.normal(0, 0.1, g.shape).astype(np.float32)}
-    off_n, sig = my.survey_error(A, Bn, min_cells=100)
+    off_n, sig, _ = my.survey_error(A, Bn, min_cells=100)
     assert off_n == pytest.approx(0.07, abs=0.01) and sig == pytest.approx(0.1, rel=0.1)
     assert my.level_of_detection(sig) == pytest.approx(0.196, rel=0.1)
-    assert my.survey_error(A, B, min_cells=10 ** 6) == (0.0, pytest.approx(np.sqrt(2) * 0.15))
+    assert my.survey_error(A, B, min_cells=10 ** 6) == (0.0, pytest.approx(np.sqrt(2) * 0.15), 0)
     um = my.unchanged_mask(A, B, off)
     assert not um[22:28, 22:28].any()                       # the building's footprint is masked
     assert um[:10, :10].all() and um[50:, 50:].all()        # open ground away from it is kept
@@ -285,3 +285,28 @@ def test_dtm_coverage_reads_rasters(tmp_path):
     sq = {"tile": "SU0000", "bounds": [400000, 200000, 405000, 205000]}
     cov = my.dtm_coverage(tmp_path, sq, "2019", [[400000, 200000, 402000, 202000], [402500, 200000, 404500, 202000]])
     assert cov[0] == pytest.approx(0.5, abs=0.02) and cov[1] == 0.0
+
+
+
+def test_offsets_are_adjusted_to_agree():
+    years = ["2017", "2019", "2020"]
+    # true survey heights 0, -0.09, 0.00; the 2019-2020 pair measured badly (+0.32) on few cells
+    meas = {("2017", "2019"): (-0.09, 5000), ("2017", "2020"): (0.0, 5000), ("2019", "2020"): (0.32, 200)}
+    o = my.adjust_offsets(years, meas)
+    assert o["2017"] == 0.0
+    assert o["2019"] == pytest.approx(-0.09, abs=0.03) and o["2020"] == pytest.approx(0.0, abs=0.03)
+    # any chain of adjusted offsets agrees: a -> b -> c equals a -> c
+    assert (o["2019"] - o["2017"]) + (o["2020"] - o["2019"]) == pytest.approx(o["2020"] - o["2017"])
+
+
+def test_stable_ground_ignores_water_and_crops():
+    g = _ground()
+    A = {"dsm_min": g.copy(), "z_std": np.full_like(g, 0.02), "echoes": np.ones_like(g),
+         "gt_dtm": g.copy(), "gt_valid": np.ones_like(g)}
+    B = {k: v.copy() for k, v in A.items()}
+    B["dsm_min"] = g + 0.05
+    B["dsm_min"][:, :20] += 0.8            # crop grown by the 2nd survey: single returns, flat, 0.85 m up
+    B["gt_valid"][40:, :] = 0              # water: hydro-flattened in the DTM
+    B["dsm_min"][40:, :] += 0.6            # different tide
+    off, sig, n = my.survey_error(A, B, min_cells=100)
+    assert n == 40 * 44 and off == pytest.approx(0.05, abs=1e-4) and sig < 0.01

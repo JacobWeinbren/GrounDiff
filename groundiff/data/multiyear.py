@@ -520,25 +520,62 @@ def _lower_envelope(a: np.ndarray, size: int) -> np.ndarray:
 EA_SIGMA_Z = 0.15
 
 
-def survey_error(A: dict, B: dict, min_cells: int = 1000) -> tuple[float, float]:
-    """(offset, sigma) of B's lowest returns minus A's on open ground in both (single returns, < 5 cm
-    spread in the cell). offset: the median difference, the vertical shift between the surveys (added
-    to A's frame to get B's). sigma: the NMAD of the differences (1.4826 x median absolute deviation),
-    the robust spread used for DEM accuracy (Hoehle & Hoehle 2009, ISPRS J. 64(4)). With fewer than
-    min_cells shared open cells: no offset and the EA accuracy spec for both surveys."""
+def stable_ground(A: dict, B: dict, alpha: float = 0.2) -> np.ndarray:
+    """Cells where both surveys' lasers hit bare, stable ground: in both, one return per pulse with
+    < 5 cm spread in the cell, and (when the scenes carry their EA DTM) the lowest return within
+    alpha of that survey's own DTM, which is valid there. The DTM condition drops what else is flat
+    and single-return but moves between surveys: water and tidal flats (hydro-flattened, so invalid
+    in the target) and crops or long grass (standing above the DTM). alpha is GrounDiff's own
+    "the surface is already ground" tolerance (data.alpha)."""
     ok = np.ones(A["dsm_min"].shape, bool)
     for s in (A, B):
         ok &= (np.isfinite(s["dsm_min"]) & (np.nan_to_num(s["z_std"], nan=9.0) < 0.05)
                & (np.nan_to_num(s["echoes"], nan=9.0) <= 1.05))
-    d = (B["dsm_min"] - A["dsm_min"])[ok].astype(np.float64)
+        if "gt_dtm" in s:
+            ok &= (np.nan_to_num(s.get("gt_valid", 1.0)) > 0.5) & \
+                  (np.abs(np.nan_to_num(s["dsm_min"] - s["gt_dtm"], nan=9.0)) < alpha)
+    return ok
+
+
+def survey_error(A: dict, B: dict, min_cells: int = 1000) -> tuple[float, float, int]:
+    """(offset, sigma, cells) of B's lowest returns minus A's on stable ground (stable_ground).
+    offset: the median difference, the vertical shift between the surveys (added to A's frame to
+    get B's). sigma: the NMAD of the differences (1.4826 x median absolute deviation), the robust
+    spread used for DEM accuracy (Hoehle & Hoehle 2009, ISPRS J. 64(4)). With fewer than min_cells
+    stable cells: no offset (cells = 0) and the EA accuracy spec for both surveys."""
+    d = (B["dsm_min"] - A["dsm_min"])[stable_ground(A, B)].astype(np.float64)
     if d.size < min_cells:
-        return 0.0, float(np.sqrt(2.0) * EA_SIGMA_Z)
+        return 0.0, float(np.sqrt(2.0) * EA_SIGMA_Z), 0
     med = float(np.median(d))
-    return med, float(1.4826 * np.median(np.abs(d - med)))
+    return med, float(1.4826 * np.median(np.abs(d - med))), int(d.size)
 
 
 def survey_offset(A: dict, B: dict, min_cells: int = 1000) -> float:
     return survey_error(A, B, min_cells)[0]
+
+
+def adjust_offsets(years: list, measured: dict) -> dict:
+    """One vertical offset per survey from all the pairwise ones, by weighted least squares
+    (o_b - o_a = d_ab, weight = stable cells, first year fixed at 0): the block adjustment used to
+    tie overlapping lidar strips and surveys together. Pairwise medians need not be consistent
+    (a -> b -> c may not equal a -> c); the adjusted ones are, and each pair's residual shows how
+    far its own measurement was off. measured: {(a, b): (d_ab, cells)}. Years with no measured
+    pair keep offset 0."""
+    idx = {y: i for i, y in enumerate(years)}
+    rows, rhs, w = [], [], []
+    for (a, b), (d, n) in measured.items():
+        if n <= 0:
+            continue
+        r = np.zeros(len(years))
+        r[idx[b]], r[idx[a]] = 1.0, -1.0
+        rows.append(r)
+        rhs.append(d)
+        w.append(np.sqrt(n))
+    o = np.zeros(len(years))
+    if rows:
+        M, v, sw = np.array(rows)[:, 1:], np.array(rhs), np.array(w)
+        o[1:] = np.linalg.lstsq(M * sw[:, None], v * sw, rcond=None)[0]
+    return {y: float(o[idx[y]]) for y in years}
 
 
 def level_of_detection(sigma: float, t: float = 1.96) -> float:
@@ -586,15 +623,23 @@ def pairs(out: Path, change_m: float | None = None, min_consensus: int = 3, log=
         years = [m["year"] for m in metas]
         info = {y: {} for y in years}
         masks = {}
+        measured = {}
         for i, a in enumerate(years):
             for b in years[i + 1:]:
-                off, sig = survey_error(arr[a], arr[b])
-                lod = level_of_detection(sig) if change_m is None else change_m
-                um = unchanged_mask(arr[a], arr[b], off, lod)
-                masks[(a, b)] = masks[(b, a)] = um
-                info[a][b] = {"offset": off, "sigma": sig, "lod": lod, "unchanged": float(um.mean())}
-                info[b][a] = {"offset": -off, "sigma": sig, "lod": lod, "unchanged": float(um.mean())}
-                stats["pairs"] += 1
+                measured[(a, b)] = survey_error(arr[a], arr[b])
+        adj = adjust_offsets(years, {k: (v[0], v[2]) for k, v in measured.items()})
+        for (a, b), (d, sig, n) in measured.items():
+            off = adj[b] - adj[a]
+            lod = level_of_detection(sig) if change_m is None else change_m
+            um = unchanged_mask(arr[a], arr[b], off, lod)
+            masks[(a, b)] = masks[(b, a)] = um
+            both = np.isfinite(arr[a]["dsm_last"]) & np.isfinite(arr[b]["dsm_last"])
+            rec = {"sigma": sig, "lod": lod, "stable_cells": n, "measured": d if n else None,
+                   "residual": (d - off) if n else None, "shared": float(both.mean()),
+                   "unchanged": float(um[both].mean()) if both.any() else 0.0}
+            info[a][b] = {"offset": off, **rec}
+            info[b][a] = {"offset": -off, **rec, "measured": -d if n else None, "residual": -(d - off) if n else None}
+            stats["pairs"] += 1
         for m in metas:
             a = m["year"]
             sd = root / m["scene"]
@@ -637,8 +682,11 @@ def pairs(out: Path, change_m: float | None = None, min_consensus: int = 3, log=
             m["label_above_lidar_frac"] = float(above.mean())
             _write_json(sd / "meta.json", m)
         log(f"  {loc}: years {years}"
-            + "".join(f"; {a}-{b} offset {info[a][b]['offset']:+.3f} m, change threshold {info[a][b]['lod']:.2f} m, "
-                      f"unchanged {info[a][b]['unchanged']:.0%}"
+            + "".join(f"\n    {a}-{b}: offset {info[a][b]['offset']:+.3f} m"
+                      + (f" (measured {info[a][b]['measured']:+.3f})" if info[a][b]["measured"] is not None
+                         else " (too little stable ground; not measured)")
+                      + f", change threshold {info[a][b]['lod']:.2f} m, both surveyed {info[a][b]['shared']:.0%},"
+                        f" unchanged {info[a][b]['unchanged']:.0%} of that"
                       for i, a in enumerate(years) for b in years[i + 1:]))
     log(f"{stats['locations']} locations, {stats['pairs']} year pairs, {stats['consensus']} scenes with a consensus DTM")
     return stats
