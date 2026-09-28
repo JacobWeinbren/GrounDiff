@@ -1,5 +1,5 @@
 {
- "notes": "v2: no_lastools on a stratified sample of England (groundiff.data.select: quarries, embankments and flood defences, marsh, coast, urban / suburban / village, woodland, upland, farmland, 25% of tiles with OpenStreetMap bridges). 15% of training tiles are centred on a bridge, and the flattened water under and next to bridges is kept in the target so the model learns to take decks out. Fine-tuned from runs/no_lastools/best.pt when it exists (lower learning rate, 12000 steps); tools/run_v2.sh runs the whole pipeline. v2 inputs also include tile_range (the tile's height range in metres) and wide-area context (ctx_*: 1 km around each tile at 4 m/px, read by the network's context branch; 'PrioStitch as an input'). run_v2.sh with FROM_SCRATCH=1 trains it from scratch (20000 steps).",
+ "notes": "GrounDiff (DSM -> DTM, gated Palette UNet) on the v2 EA data, plus the tile_range input. No bridge oversampling and no wide-area context input. Diffusion model; run_v2.sh FROM_SCRATCH=1 trains it from scratch (20000 steps).",
  "data": {
   "root": "data/v2/scenes",
   "split_file": "data/v2/split.json",
@@ -10,10 +10,7 @@
    "density",
    "z_std",
    "echoes",
-   "tile_range",
-   "ctx_dsm_min",
-   "ctx_dsm_max",
-   "ctx_has_return"
+   "tile_range"
   ],
   "gate_channel": "dsm_max",
   "norm_channels": [
@@ -25,8 +22,7 @@
   "alpha": 0.2,
   "loss_mask": "gt",
   "fill_empty": "nearest",
-  "bridge_oversample": 0.15,
-  "context_factor": 4
+  "bridge_oversample": 0.0
  },
  "model": {
   "kind": "groundiff"

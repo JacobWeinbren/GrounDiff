@@ -1,5 +1,5 @@
 {
- "notes": "Single-step end-to-end fine-tune (Garcia et al., WACV 2025) of the v2 model: python -m groundiff.train configs/v2_1step.json --init-from runs/v2/best.pt Inputs as configs/v2.json (tile_range and ctx_* context).",
+ "notes": "GrounDiff (DSM -> DTM, gated Palette UNet) on the v2 EA data, plus the tile_range input. No bridge oversampling and no wide-area context input. Single-step end-to-end fine-tune (Garcia et al., WACV 2025) of runs/v2/best.pt.",
  "data": {
   "root": "data/v2/scenes",
   "split_file": "data/v2/split.json",
@@ -10,10 +10,7 @@
    "density",
    "z_std",
    "echoes",
-   "tile_range",
-   "ctx_dsm_min",
-   "ctx_dsm_max",
-   "ctx_has_return"
+   "tile_range"
   ],
   "gate_channel": "dsm_max",
   "norm_channels": [
@@ -25,8 +22,7 @@
   "alpha": 0.2,
   "loss_mask": "gt",
   "fill_empty": "nearest",
-  "bridge_oversample": 0.15,
-  "context_factor": 4
+  "bridge_oversample": 0.0
  },
  "model": {
   "kind": "groundiff"
