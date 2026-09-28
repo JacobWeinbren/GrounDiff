@@ -261,7 +261,7 @@ class TileDataset(Dataset):
         out = {}
         for sc in self.scenes:
             lst = [(by[p["scene"]], y) for y, p in (sc.meta.get("pairs") or {}).items()
-                   if p["scene"] in by and (sc.path / f"unchanged_{y}.npy").exists()]
+                   if p["scene"] in by and p.get("usable", True) and (sc.path / f"unchanged_{y}.npy").exists()]
             if lst:
                 out[sc.path.name] = lst
         if out:

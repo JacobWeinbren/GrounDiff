@@ -554,6 +554,21 @@ def survey_offset(A: dict, B: dict, min_cells: int = 1000) -> float:
     return survey_error(A, B, min_cells)[0]
 
 
+def offset_limit() -> float:
+    """Largest vertical offset two surveys meeting EA's accuracy can have. The +-15 cm is each point's
+    RMSE against control, which bounds a survey's constant bias (RMSE^2 = bias^2 + scatter^2), so two
+    surveys' biases differ by at most 2 x 0.15 m. A larger "offset" is not survey bias: the ground
+    under the stable cells moved (beaches, dunes) or a survey is out of specification."""
+    return float(2.0 * EA_SIGMA_Z)
+
+
+def threshold_limit(t: float = 1.96) -> float:
+    """Largest change threshold two in-specification surveys can need: the 95 % level of detection
+    (Wheaton et al. 2010) for a per-cell difference whose error is at most sqrt(2) x 0.15 m. A larger
+    measured one means the cells taken as stable were not, so change there cannot be judged."""
+    return float(t * np.sqrt(2.0) * EA_SIGMA_Z)
+
+
 def adjust_offsets(years: list, measured: dict) -> dict:
     """One vertical offset per survey from all the pairwise ones, by weighted least squares
     (o_b - o_a = d_ab, weight = stable cells, first year fixed at 0): the block adjustment used to
@@ -615,7 +630,7 @@ def pairs(out: Path, change_m: float | None = None, min_consensus: int = 3, log=
             continue
         locs.setdefault(meta["location"], []).append(meta)
     names = ("dsm_min", "dsm_last", "z_std", "echoes", "gt_dtm", "gt_valid")
-    stats = {"locations": len(locs), "pairs": 0, "consensus": 0}
+    stats = {"locations": len(locs), "pairs": 0, "usable": 0, "consensus": 0}
     for loc, metas in sorted(locs.items()):
         metas.sort(key=lambda m: m["year"])
         arr = {m["year"]: {n: np.load(root / m["scene"] / f"{n}.npy").astype(np.float32) for n in names}
@@ -631,10 +646,18 @@ def pairs(out: Path, change_m: float | None = None, min_consensus: int = 3, log=
         for (a, b), (d, sig, n) in measured.items():
             off = adj[b] - adj[a]
             lod = level_of_detection(sig) if change_m is None else change_m
-            um = unchanged_mask(arr[a], arr[b], off, lod)
+            why = []
+            if abs(off) > offset_limit():
+                why.append(f"offset beyond {offset_limit():.2f} m")
+            if lod > threshold_limit():
+                why.append(f"threshold beyond {threshold_limit():.2f} m")
+            usable = not why
+            um = unchanged_mask(arr[a], arr[b], off, lod) if usable else np.zeros(arr[a]["dsm_last"].shape, bool)
             masks[(a, b)] = masks[(b, a)] = um
             both = np.isfinite(arr[a]["dsm_last"]) & np.isfinite(arr[b]["dsm_last"])
-            rec = {"sigma": sig, "lod": lod, "stable_cells": n, "measured": d if n else None,
+            stats["usable"] += usable
+            rec = {"sigma": sig, "lod": lod, "usable": usable, "not_used_because": why, "stable_cells": n,
+                   "measured": d if n else None,
                    "residual": (d - off) if n else None, "shared": float(both.mean()),
                    "unchanged": float(um[both].mean()) if both.any() else 0.0}
             info[a][b] = {"offset": off, **rec}
@@ -685,10 +708,13 @@ def pairs(out: Path, change_m: float | None = None, min_consensus: int = 3, log=
             + "".join(f"\n    {a}-{b}: offset {info[a][b]['offset']:+.3f} m"
                       + (f" (measured {info[a][b]['measured']:+.3f})" if info[a][b]["measured"] is not None
                          else " (too little stable ground; not measured)")
-                      + f", change threshold {info[a][b]['lod']:.2f} m, both surveyed {info[a][b]['shared']:.0%},"
-                        f" unchanged {info[a][b]['unchanged']:.0%} of that"
+                      + f", change threshold {info[a][b]['lod']:.2f} m, both surveyed {info[a][b]['shared']:.0%}"
+                      + (f", unchanged {info[a][b]['unchanged']:.0%} of that" if info[a][b]["usable"] else
+                         f"; NOT USED ({', '.join(info[a][b]['not_used_because'])}: more than two surveys"
+                         " within EA's accuracy can differ)")
                       for i, a in enumerate(years) for b in years[i + 1:]))
-    log(f"{stats['locations']} locations, {stats['pairs']} year pairs, {stats['consensus']} scenes with a consensus DTM")
+    log(f"{stats['locations']} locations, {stats['pairs']} year pairs ({stats['usable']} used across years), "
+        f"{stats['consensus']} scenes with a consensus DTM")
     return stats
 
 

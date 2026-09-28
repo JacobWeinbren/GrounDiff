@@ -69,7 +69,7 @@ def test_pairs_consensus_removes_one_years_mistake(tmp_path):
     _write(tmp_path, "L", "2019", g + 0.05, bad + 0.05)     # this survey sits 5 cm higher
     _write(tmp_path, "L", "2021", g, g, building=(5, 15, 45, 55))   # built on after 2019
     stats = my.pairs(tmp_path, log=lambda *a: None)
-    assert stats == {"locations": 1, "pairs": 3, "consensus": 3}
+    assert stats == {"locations": 1, "pairs": 3, "usable": 3, "consensus": 3}
 
     s19 = Scene(tmp_path / "scenes" / "L_2019")
     assert s19.meta["pairs"]["2017"]["offset"] == pytest.approx(-0.05, abs=0.01)
@@ -310,3 +310,27 @@ def test_stable_ground_ignores_water_and_crops():
     B["dsm_min"][40:, :] += 0.6            # different tide
     off, sig, n = my.survey_error(A, B, min_cells=100)
     assert n == 40 * 44 and off == pytest.approx(0.05, abs=1e-4) and sig < 0.01
+
+
+
+def test_pair_beyond_ea_accuracy_is_not_used(tmp_path):
+    g = _ground()
+    _write(tmp_path, "L", "2017", g, g)
+    _write(tmp_path, "L", "2020", g - 0.46, g - 0.46)       # more than two in-spec surveys can differ
+    _write(tmp_path, "L", "2021", g + 0.2, g + 0.2)         # within it
+    stats = my.pairs(tmp_path, log=lambda *a: None)
+    s = Scene(tmp_path / "scenes" / "L_2017")
+    assert s.meta["pairs"]["2020"]["usable"] is False and s.meta["pairs"]["2021"]["usable"] is True
+    assert np.load(s.path / "unchanged_2020.npy").max() == 0    # no cross-year targets from that pair
+    assert stats["usable"] == 1                                 # 2017-2021 only (2020-2021 is 0.66 m)
+    assert my.offset_limit() == pytest.approx(0.30) and my.threshold_limit() == pytest.approx(0.416, abs=1e-3)
+    import groundiff.data.dataset as dsm
+    for sd in (tmp_path / "scenes").iterdir():
+        np.save(sd / "dsm_max.npy", np.load(sd / "dsm_min.npy"))
+        np.save(sd / "density.npy", np.full_like(g, 8.0))
+    cfg = _cfg("configs/n2n.json").data
+    cfg.tile = 32
+    ds = dsm.TileDataset(cfg, None, mode="train",
+                         scenes=[Scene(q.parent) for q in sorted((tmp_path / "scenes").glob("*/meta.json"))])
+    assert sorted((k, sorted(y for _, y in v)) for k, v in ds.partners.items()) == \
+        [("L_2017", ["2021"]), ("L_2021", ["2017"])]              # the unused pairs are never sampled
