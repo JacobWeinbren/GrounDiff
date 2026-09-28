@@ -233,3 +233,55 @@ def test_prune_only_after_every_scene(tmp_path):
     assert my._prune(tmp_path, sq, "2019")
     for d in ("laz", "dtm"):
         assert [p.name for p in (tmp_path / d / "SU0000" / "2019").iterdir()] == ["DONE"]
+
+
+def test_clip_coverage_and_crop_choice(tmp_path, monkeypatch):
+    from tests.synthetic import make_points, write_las
+    x, y, z, cls, rn, nr = make_points(size=300.0, density=0.5, x0=400000.0, y0=200000.0)
+    src = tmp_path / "in.laz"
+    write_las(src, x, y, z, cls, rn, nr)
+    boxes = [[400000, 200000, 400200, 200200], [400200, 200000, 400400, 200200], [401000, 201000, 401200, 201200]]
+    cover = [np.zeros((2, 2), bool) for _ in boxes]
+    my.clip_laz(src, tmp_path / "out.laz", boxes, pad=0.0, cover=cover)
+    assert cover[0].all()                          # fully inside the 300 m of points
+    assert cover[1][:, 0].all() and not cover[1][:, 1].any()   # half covered
+    assert not cover[2].any()
+
+    sq = {"tile": "SU0000", "bounds": [400000, 200000, 405000, 205000], "surveys": {"2017": {}, "2019": {}, "2021": {}},
+          "crops": [[0, 0, 1, 1]] * 2}
+    cov = {"2017": [1.0, 0.2, 0.0, 0.9], "2019": [1.0, 0.0, 0.0, 0.8], "2021": [0.5, 0.0, 0.0, 1.0]}
+    for yr, c in cov.items():
+        d = tmp_path / "laz" / "SU0000" / yr
+        d.mkdir(parents=True)
+        (d / "coverage.json").write_text(json.dumps({"cover": c}))
+    dtm = {"2017": [1.0, 1.0, 1.0, 0.0], "2019": [1.0, 1.0, 1.0, 1.0], "2021": [1.0, 1.0, 1.0, 1.0]}
+    monkeypatch.setattr(my, "dtm_coverage", lambda out, s, yr, b: dtm[yr])
+    crops, scores = my.choose_crops(tmp_path, sq, 2)
+    cand = my.candidate_boxes(sq)
+    # crop 0: 1 + 1 + 0.5; crop 3: 0 (no DTM in 2017) + 0.8 + 1; crop 1: 0.2; crop 2: none
+    assert crops == [cand[0], cand[3]] and scores == pytest.approx([2.5, 1.8])
+    assert my.choose_crops(tmp_path, sq, 4)[0] == [cand[0], cand[3], cand[1]]
+
+
+def test_rasterise_failure_is_isolated_and_remembered(tmp_path):
+    sq = {"tile": "SU0000", "crops": [[400000, 200000, 402000, 202000]], "surveys": {"2019": {}}}
+    loc, year, m, err = my._isolated((tmp_path, sq, sq["crops"][0], "2019", None))
+    assert m is None and "no point files" in err
+    name = f"{my.location_id('SU0000', sq['crops'][0])}_2019"
+    assert my._scene_settled(tmp_path, name)                  # a deterministic failure is not retried
+    d = tmp_path / "laz" / "SU0000" / "2019"
+    d.mkdir(parents=True)
+    (d / "a.laz").write_text("x")
+    assert my._prune(tmp_path, sq, "2019") and not (d / "a.laz").exists()
+
+
+def test_dtm_coverage_reads_rasters(tmp_path):
+    from groundiff.io_raster import write_geotiff
+    d = tmp_path / "dtm" / "SU0000" / "2019"
+    d.mkdir(parents=True)
+    a = 30.0 + 0.01 * np.add.outer(np.arange(2000), np.arange(2000)).astype(np.float32)   # sloping, not "water"
+    a[:, 1000:] = np.nan                                     # the survey covers the west half
+    write_geotiff(d / "dtm.tif", a, 400000.0, 202000.0, 1.0, None)
+    sq = {"tile": "SU0000", "bounds": [400000, 200000, 405000, 205000]}
+    cov = my.dtm_coverage(tmp_path, sq, "2019", [[400000, 200000, 402000, 202000], [402500, 200000, 404500, 202000]])
+    assert cov[0] == pytest.approx(0.5, abs=0.02) and cov[1] == 0.0

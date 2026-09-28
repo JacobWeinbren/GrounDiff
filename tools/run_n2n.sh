@@ -11,7 +11,7 @@
 # data/mt/done/), finished scenes are kept (a square's points are deleted once its scenes exist), training continues from last.pt.
 # Settings (environment): TARGET=60 squares of 5 km, CROPS=2 places (2 km) per square, MIN_YEARS=3
 # surveys per square (3+ gives every place a consensus DTM), YEARS="2017 2022", FETCH_WORKERS=2,
-# WORKERS=3 rasterising processes, STEPS=20000 diffusion steps, MIN_FREE_GB (default: estimated),
+# WORKERS=2 rasterising processes, STEPS=20000 diffusion steps, MIN_FREE_GB (default: estimated),
 # STOP_AFTER=split for the data steps only.
 set -euo pipefail
 export PYTHONUNBUFFERED=1
@@ -22,7 +22,7 @@ CROPS=${CROPS:-2}
 MIN_YEARS=${MIN_YEARS:-3}
 YEARS=${YEARS:-"2017 2022"}
 FETCH_WORKERS=${FETCH_WORKERS:-2}
-WORKERS=${WORKERS:-3}
+WORKERS=${WORKERS:-2}
 STEPS=${STEPS:-20000}
 D=data/mt
 mkdir -p "$D/done" runs results models
@@ -32,11 +32,11 @@ done_() { [ -f "$D/done/$1" ]; }
 mark() { touch "$D/done/$1"; }
 
 # free space for the steps left: ~110 MB of rasters per place and year (at most 6 years), plus per
-# square in flight a point-cloud zip (up to ~3 GB) and the clipped points and DTMs of its years (~6 GB)
+# square in flight a point-cloud zip (up to ~3 GB) and its years' points clipped to 4 candidate crops (~12 GB)
 free_gb=$(df -Pk . | awk 'NR==2 {print int($4 / 1048576)}')
 need_gb=10
 if ! done_ build; then
-  need_gb=$((need_gb + TARGET * CROPS * 6 * 110 / 1024 + FETCH_WORKERS * 9))
+  need_gb=$((need_gb + TARGET * CROPS * 6 * 110 / 1024 + FETCH_WORKERS * 15))
 fi
 if [ -n "${MIN_FREE_GB:-}" ]; then need_gb=$MIN_FREE_GB; fi
 say "GrounDiff N2N: ${TARGET} squares x ${CROPS} places, >= ${MIN_YEARS} surveys in ${YEARS}," \

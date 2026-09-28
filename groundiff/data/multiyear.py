@@ -159,8 +159,12 @@ def _inside(b, boxes, pad: float) -> bool:
                for x0, y0, x1, y1 in boxes)
 
 
-def clip_laz(src: Path, dst: Path, boxes, pad: float, chunk: int = 2_000_000) -> int:
-    """Write the points of src inside any box (+ pad) to dst; returns the number kept."""
+COVER_CELL = 100.0          # m: coverage of a crop is the share of its 100 m cells with any point
+
+
+def clip_laz(src: Path, dst: Path, boxes, pad: float, chunk: int = 2_000_000, cover: list | None = None) -> int:
+    """Write the points of src inside any box (+ pad) to dst; returns the number kept.
+    cover: one bool array per box ((box size / COVER_CELL)^2), set where a 100 m cell has a point."""
     import laspy
     kept = 0
     with laspy.open(str(src)) as r:
@@ -175,8 +179,15 @@ def clip_laz(src: Path, dst: Path, boxes, pad: float, chunk: int = 2_000_000) ->
             for pts in r.chunk_iterator(chunk):
                 x, y = np.asarray(pts.x), np.asarray(pts.y)
                 m = np.zeros(x.size, bool)
-                for x0, y0, x1, y1 in boxes:
+                for bi, (x0, y0, x1, y1) in enumerate(boxes):
                     m |= (x >= x0 - pad) & (x < x1 + pad) & (y >= y0 - pad) & (y < y1 + pad)
+                    if cover is not None:
+                        inb = (x >= x0) & (x < x1) & (y >= y0) & (y < y1)
+                        if inb.any():
+                            c = cover[bi]
+                            ci = np.minimum(((x[inb] - x0) // COVER_CELL).astype(int), c.shape[1] - 1)
+                            ri = np.minimum(((y1 - y[inb]) // COVER_CELL).astype(int), c.shape[0] - 1)
+                            c[ri, ci] = True
                 if m.any():
                     w.write_points(pts[m])
                     kept += int(m.sum())
@@ -187,20 +198,38 @@ def clip_laz(src: Path, dst: Path, boxes, pad: float, chunk: int = 2_000_000) ->
     return kept
 
 
-def fetch_one(out: Path, sq: dict, year: str, pad: float = 30.0, keep_zip: bool = False) -> dict:
-    """Point cloud (clipped to the crops) and DTM of one square and year."""
+def candidate_boxes(sq: dict) -> list:
+    """The four disjoint 2 km crops of a 5 km square."""
+    x0, y0 = sq["bounds"][:2]
+    return [[x0 + dx, y0 + dy, x0 + dx + 2000, y0 + dy + 2000] for dx, dy in CROP_OFFSETS]
+
+
+def is_empty(out: Path, tile: str, year: str) -> bool:
+    return (out / "laz" / tile / year / "EMPTY").exists()
+
+
+def fetch_one(out: Path, sq: dict, year: str, pad: float = 30.0, keep_zip: bool = False,
+              boxes: list | None = None) -> dict:
+    """Point cloud (clipped to boxes, default the square's crops) and DTM of one square and year.
+    Writes coverage.json (each box's share of 100 m cells with points). A survey with no points in
+    any box is marked EMPTY (its DTM is not downloaded) so it is not downloaded again."""
+    boxes = boxes if boxes is not None else sq["crops"]
     from .ea_dtm import KEY, TILE_URL, extract, fetch_zip
     s = sq["surveys"][year]
     tile = sq["tile"]
     laz_dir = out / "laz" / tile / year
     dtm_dir = out / "dtm" / tile / year
     rec = {"tile": tile, "year": year}
+    if is_empty(out, tile, year):
+        return {**rec, "empty": True}
     if not (laz_dir / "DONE").exists():
         pc = s["pc"]
         url = TILE_URL.format(product=pc["product"], year=year, res=pc["res"], tile=tile) + f"?subscription-key={KEY}"
         z = fetch_zip(url, out / "zips" / f"pc-{pc['product']}-{year}-{tile}.zip")
         laz_dir.mkdir(parents=True, exist_ok=True)
         n = 0
+        side = int(round((boxes[0][2] - boxes[0][0]) / COVER_CELL))
+        cover = [np.zeros((side, side), bool) for _ in boxes]
         with zipfile.ZipFile(z) as zf, tempfile.TemporaryDirectory(dir=out) as td:
             for info in zf.infolist():
                 name = Path(info.filename).name
@@ -211,12 +240,14 @@ def fetch_one(out: Path, sq: dict, year: str, pad: float = 30.0, keep_zip: bool 
                     while chunk := a.read(1 << 20):
                         b.write(chunk)
                 dst = laz_dir / (Path(name).stem.replace(".copc", "") + ".laz")
-                n += clip_laz(tmp, dst, sq["crops"], pad)
+                n += clip_laz(tmp, dst, boxes, pad, cover=cover)
                 tmp.unlink(missing_ok=True)
         if not keep_zip:
             z.unlink(missing_ok=True)
         if n == 0:
-            raise RuntimeError(f"{tile} {year}: no points inside the crops in the point-cloud zip")
+            (laz_dir / "EMPTY").write_text("no points inside the crops in the point-cloud zip")
+            return {**rec, "empty": True}
+        _write_json(laz_dir / "coverage.json", {"boxes": boxes, "cover": [float(c.mean()) for c in cover]})
         (laz_dir / "DONE").write_text(str(n))
         rec["points"] = n
     if not (dtm_dir / "DONE").exists():
@@ -235,8 +266,8 @@ def fetch_one(out: Path, sq: dict, year: str, pad: float = 30.0, keep_zip: bool 
 def fetch(out: Path, workers: int = 2, log=print) -> dict:
     p = json.loads((out / "plan.json").read_text())
     jobs = [(sq, y) for sq in p["squares"] for y in sorted(sq["surveys"])]
-    todo = [(sq, y) for sq, y in jobs
-            if not ((out / "laz" / sq["tile"] / y / "DONE").exists() and (out / "dtm" / sq["tile"] / y / "DONE").exists())]
+    todo = [(sq, y) for sq, y in jobs if not is_empty(out, sq["tile"], y)
+            and not ((out / "laz" / sq["tile"] / y / "DONE").exists() and (out / "dtm" / sq["tile"] / y / "DONE").exists())]
     log(f"{len(jobs)} square-years, {len(jobs) - len(todo)} done, {len(todo)} to download")
     failed = []
     with ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
@@ -308,8 +339,67 @@ def _rasterise_job(args):
     try:
         m = rasterise_one(out, sq, crop, year, gate=gate)
         return location_id(sq["tile"], crop), year, m, None
+    except RuntimeError as e:                             # no points / no DTM here: will not change
+        _skip(out, f"{location_id(sq['tile'], crop)}_{year}", str(e))
+        return location_id(sq["tile"], crop), year, None, repr(e)
     except Exception as e:
         return location_id(sq["tile"], crop), year, None, repr(e)
+
+
+def _skip(out: Path, scene: str, why: str) -> None:
+    d = out / "skipped"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / f"{scene}.txt").write_text(why)
+
+
+def _scene_settled(out: Path, scene: str) -> bool:
+    """Rasterised, or known not to be possible (skipped/<scene>.txt)."""
+    return (out / "scenes" / scene / "meta.json").exists() or (out / "skipped" / f"{scene}.txt").exists()
+
+
+def _isolated(job):
+    """_rasterise_job in a process of its own: a worker killed for memory loses only its scene."""
+    from concurrent.futures.process import BrokenProcessPool
+    try:
+        with ProcessPoolExecutor(max_workers=1) as px:
+            return px.submit(_rasterise_job, job).result()
+    except BrokenProcessPool:
+        _, sq, crop, year, _ = job
+        return (location_id(sq["tile"], crop), year, None,
+                "the rasterising process was killed (probably out of memory; retried on the next run)")
+
+
+def dtm_coverage(out: Path, sq: dict, year: str, boxes: list) -> list:
+    """Each box's share of cells with an EA DTM value (sampled on a 10 m grid)."""
+    from .preprocess import index_rasters, rasters_for
+    from .rasterise import Grid, target_from_rasters
+    index = index_rasters(out / "dtm" / sq["tile"] / year)
+    res = []
+    for x0, y0, x1, y1 in boxes:
+        g = Grid(float(x0), float(y1), 10.0, int((x1 - x0) // 10), int((y1 - y0) // 10))
+        paths = rasters_for(g.bounds, index, year)
+        if not paths:
+            res.append(0.0)
+            continue
+        t = target_from_rasters(g, paths, np.ones((g.height, g.width), bool))
+        res.append(float(np.mean(np.isfinite(t["gt_dtm"]) & (t["gt_valid"] > 0.5))))
+    return res
+
+
+def choose_crops(out: Path, sq: dict, n: int) -> tuple[list, list]:
+    """The n candidate crops with the most coverage summed over the years: per year min(share of
+    100 m cells with points, share of cells with a DTM value). Crops with no coverage are dropped."""
+    boxes = candidate_boxes(sq)
+    score = np.zeros(len(boxes))
+    for y in sorted(sq["surveys"]):
+        cf = out / "laz" / sq["tile"] / y / "coverage.json"
+        if is_empty(out, sq["tile"], y) or not cf.exists():
+            continue
+        pc = json.loads(cf.read_text())["cover"]
+        dt = dtm_coverage(out, sq, y, boxes)
+        score += np.minimum(pc, dt)
+    order = [int(i) for i in np.argsort(-score, kind="stable") if score[i] > 0][:n]
+    return [boxes[i] for i in order], [float(score[i]) for i in order]
 
 
 def rasterise(out: Path, workers: int = 3, gate: dict | None = None, log=print) -> dict:
@@ -335,49 +425,86 @@ def rasterise(out: Path, workers: int = 3, gate: dict | None = None, log=print) 
 def _prune(out: Path, sq: dict, year: str) -> bool:
     """Delete one square-year's clipped points and DTM once every crop's scene exists (DONE markers
     stay, so nothing is downloaded again); returns whether it did."""
-    if not all((out / "scenes" / f"{location_id(sq['tile'], c)}_{year}" / "meta.json").exists() for c in sq["crops"]):
+    if not all(_scene_settled(out, f"{location_id(sq['tile'], c)}_{year}") for c in sq["crops"]):
         return False
     for d in (out / "laz" / sq["tile"] / year, out / "dtm" / sq["tile"] / year):
         if d.is_dir():
             for f in d.rglob("*"):
-                if f.is_file() and f.name != "DONE":
+                if f.is_file() and f.name not in ("DONE", "EMPTY", "coverage.json"):
                     f.unlink()
     return True
 
 
-def build(out: Path, fetch_workers: int = 2, workers: int = 3, gate: dict | None = None, log=print) -> dict:
+def build(out: Path, fetch_workers: int = 2, workers: int = 2, gate: dict | None = None, log=print) -> dict:
     """fetch + rasterise square by square, deleting each square-year's points and DTM once its scenes
-    are written: the disk holds the scenes plus the squares in flight, not every point cloud."""
-    p = json.loads((out / "plan.json").read_text())
+    are settled: the disk holds the scenes plus the squares in flight, not every point cloud.
+    A square not started yet is clipped to all four candidate crops for every year first; then the
+    crops the surveys actually cover (choose_crops) replace the plan's random ones. Squares already
+    started keep their crops. Each scene is rasterised in its own process, at most `workers` at once."""
+    import threading
+    path = out / "plan.json"
+    p = json.loads(path.read_text())
     squares = p["squares"]
+    lock, slots = threading.Lock(), threading.Semaphore(max(1, workers))
     failed, done = [], [0]
     n_years = sum(len(sq["surveys"]) for sq in squares)
-    with ProcessPoolExecutor(max_workers=max(1, workers)) as px:
-        def one_square(sq):
-            errs = []
-            for y in sorted(sq["surveys"]):
-                before = len(errs)
+
+    def rasterise_job(job):
+        with slots:
+            return _isolated(job)
+
+    def one_square(sq):
+        errs = []
+        tile, years = sq["tile"], sorted(sq["surveys"])
+        legacy = any((out / "laz" / tile / y / "DONE").exists() and not (out / "laz" / tile / y / "coverage.json").exists()
+                     for y in years) or any((out / "scenes").glob(f"{tile}_*"))
+        if not sq.get("crops_chosen") and not legacy:
+            n = len(sq["crops"])
+            for y in years:
                 try:
-                    if not all((out / "scenes" / f"{location_id(sq['tile'], c)}_{y}" / "meta.json").exists()
-                               for c in sq["crops"]):
-                        fetch_one(out, sq, y)
-                        for loc, _, m, err in px.map(_rasterise_job, [(out, sq, c, y, gate) for c in sq["crops"]]):
-                            if err:
-                                errs.append(f"{loc} {y}: {err}")
-                            elif m is not None and m["quality"]["suspect"]:
-                                log(f"    {loc} {y} SUSPECT: {'; '.join(m['quality']['reasons'])}")
-                    _prune(out, sq, y)
+                    fetch_one(out, sq, y, boxes=candidate_boxes(sq))
                 except Exception as e:
-                    errs.append(f"{sq['tile']} {y}: {e}")
+                    errs.append(f"{tile} {y}: {e}")
+            crops, scores = choose_crops(out, sq, n)
+            with lock:
+                sq["crops"], sq["crop_scores"], sq["crops_chosen"] = crops, scores, True
+                _write_json(path, p)
+            log(f"  {tile}: crops " + (", ".join(f"{location_id(tile, c)} (coverage {sc:.1f} survey-years)"
+                                                for c, sc in zip(crops, scores)) or "none covered"))
+        for y in years:
+            before = len(errs)
+            names = [f"{location_id(tile, c)}_{y}" for c in sq["crops"]]
+            try:
+                if not all(_scene_settled(out, nm) for nm in names):
+                    r = fetch_one(out, sq, y)
+                    if r.get("empty"):
+                        for nm in names:
+                            _skip(out, nm, "no points in the survey's point cloud here")
+                    else:
+                        jobs = [(out, sq, c, y, gate) for c, nm in zip(sq["crops"], names)
+                                if not _scene_settled(out, nm)]
+                        with ThreadPoolExecutor(max_workers=len(jobs) or 1) as tx:
+                            for loc, _, m, err in tx.map(rasterise_job, jobs):
+                                if err:
+                                    errs.append(f"{loc} {y}: {err}")
+                                elif m is not None and m["quality"]["suspect"]:
+                                    log(f"    {loc} {y} SUSPECT: {'; '.join(m['quality']['reasons'])}")
+                if all(_scene_settled(out, nm) for nm in names):
+                    _prune(out, sq, y)
+            except Exception as e:
+                errs.append(f"{tile} {y}: {e}")
+            with lock:
                 done[0] += 1
-                log(f"  [{done[0]}/{n_years}] {sq['tile']} {y}"
-                    + ("".join(f"  FAILED: {e}" for e in errs[before:])))
-            return errs
-        with ThreadPoolExecutor(max_workers=max(1, fetch_workers)) as tx:
-            for errs in tx.map(one_square, squares):
-                failed += errs
+                log(f"  [{done[0]}/{n_years}] {tile} {y}" + "".join(f"\n      failed: {e}" for e in errs[before:]))
+        return errs
+
+    with ThreadPoolExecutor(max_workers=max(1, fetch_workers)) as tx:
+        for errs in tx.map(one_square, squares):
+            failed += errs
     n = sum(1 for _ in (out / "scenes").glob("*/meta.json")) if (out / "scenes").exists() else 0
-    log(f"done: {n} scenes, {len(failed)} failures")
+    n_skip = sum(1 for _ in (out / "skipped").glob("*.txt")) if (out / "skipped").exists() else 0
+    log(f"done: {n} scenes; {n_skip} place-years not covered by their survey (data/mt/skipped/); "
+        f"{len(failed)} failures this run")
     return {"failed": failed}
 
 
@@ -530,7 +657,7 @@ def main(argv=None):
             s.add_argument("--crops", type=int, default=2, help="2 km crops (locations) per square, at most 4")
             s.add_argument("--seed", type=int, default=42)
         if c in ("fetch", "rasterise", "build"):
-            s.add_argument("--workers", type=int, default=2 if c == "fetch" else 3,
+            s.add_argument("--workers", type=int, default=2,
                            help="download threads (fetch) or rasterising processes")
         if c == "build":
             s.add_argument("--fetch-workers", type=int, default=2, help="squares downloaded at once")
