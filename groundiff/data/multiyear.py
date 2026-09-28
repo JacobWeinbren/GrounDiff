@@ -18,6 +18,9 @@ plan       random 5 km OS squares in England (uniformly drawn; the only filter i
            2 km crops of each (one location each). data/mt/plan.json.
 fetch      per square and year: the point cloud zip (only the points inside the
            crops, plus a margin, are kept) and the DTM zip; zips are deleted.
+build      fetch + rasterise square by square, deleting each square-year's
+           points and DTM once its scenes exist (what run_n2n.sh uses: the
+           disk then holds the scenes, not every point cloud).
 rasterise  per location and year: the usual input rasters and the EA DTM target
            on one 1 m grid shared by all years, with preprocess's quality gate.
            data/mt/scenes/<location>_<year>/.
@@ -329,6 +332,55 @@ def rasterise(out: Path, workers: int = 3, gate: dict | None = None, log=print) 
     return {"failed": failed}
 
 
+def _prune(out: Path, sq: dict, year: str) -> bool:
+    """Delete one square-year's clipped points and DTM once every crop's scene exists (DONE markers
+    stay, so nothing is downloaded again); returns whether it did."""
+    if not all((out / "scenes" / f"{location_id(sq['tile'], c)}_{year}" / "meta.json").exists() for c in sq["crops"]):
+        return False
+    for d in (out / "laz" / sq["tile"] / year, out / "dtm" / sq["tile"] / year):
+        if d.is_dir():
+            for f in d.rglob("*"):
+                if f.is_file() and f.name != "DONE":
+                    f.unlink()
+    return True
+
+
+def build(out: Path, fetch_workers: int = 2, workers: int = 3, gate: dict | None = None, log=print) -> dict:
+    """fetch + rasterise square by square, deleting each square-year's points and DTM once its scenes
+    are written: the disk holds the scenes plus the squares in flight, not every point cloud."""
+    p = json.loads((out / "plan.json").read_text())
+    squares = p["squares"]
+    failed, done = [], [0]
+    n_years = sum(len(sq["surveys"]) for sq in squares)
+    with ProcessPoolExecutor(max_workers=max(1, workers)) as px:
+        def one_square(sq):
+            errs = []
+            for y in sorted(sq["surveys"]):
+                before = len(errs)
+                try:
+                    if not all((out / "scenes" / f"{location_id(sq['tile'], c)}_{y}" / "meta.json").exists()
+                               for c in sq["crops"]):
+                        fetch_one(out, sq, y)
+                        for loc, _, m, err in px.map(_rasterise_job, [(out, sq, c, y, gate) for c in sq["crops"]]):
+                            if err:
+                                errs.append(f"{loc} {y}: {err}")
+                            elif m is not None and m["quality"]["suspect"]:
+                                log(f"    {loc} {y} SUSPECT: {'; '.join(m['quality']['reasons'])}")
+                    _prune(out, sq, y)
+                except Exception as e:
+                    errs.append(f"{sq['tile']} {y}: {e}")
+                done[0] += 1
+                log(f"  [{done[0]}/{n_years}] {sq['tile']} {y}"
+                    + ("".join(f"  FAILED: {e}" for e in errs[before:])))
+            return errs
+        with ThreadPoolExecutor(max_workers=max(1, fetch_workers)) as tx:
+            for errs in tx.map(one_square, squares):
+                failed += errs
+    n = sum(1 for _ in (out / "scenes").glob("*/meta.json")) if (out / "scenes").exists() else 0
+    log(f"done: {n} scenes, {len(failed)} failures")
+    return {"failed": failed}
+
+
 # ----------------------------------------------------------------------------- pairs, consensus
 
 def _lower_envelope(a: np.ndarray, size: int) -> np.ndarray:
@@ -468,7 +520,7 @@ def pairs(out: Path, change_m: float | None = None, min_consensus: int = 3, log=
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for c in ("plan", "fetch", "rasterise", "pairs"):
+    for c in ("plan", "fetch", "rasterise", "build", "pairs"):
         s = sub.add_parser(c)
         s.add_argument("--out", type=Path, required=True)
         if c == "plan":
@@ -477,8 +529,11 @@ def main(argv=None):
             s.add_argument("--min-years", type=int, default=2)
             s.add_argument("--crops", type=int, default=2, help="2 km crops (locations) per square, at most 4")
             s.add_argument("--seed", type=int, default=42)
-        if c in ("fetch", "rasterise"):
-            s.add_argument("--workers", type=int, default=2 if c == "fetch" else 3)
+        if c in ("fetch", "rasterise", "build"):
+            s.add_argument("--workers", type=int, default=2 if c == "fetch" else 3,
+                           help="download threads (fetch) or rasterising processes")
+        if c == "build":
+            s.add_argument("--fetch-workers", type=int, default=2, help="squares downloaded at once")
         if c == "pairs":
             s.add_argument("--change-m", type=float, default=None,
                            help="fixed change threshold (default: each pair's 95%% level of detection)")
@@ -491,6 +546,9 @@ def main(argv=None):
         return 1 if r["failed"] else 0
     elif a.cmd == "rasterise":
         r = rasterise(a.out, a.workers)
+        return 1 if r["failed"] else 0
+    elif a.cmd == "build":
+        r = build(a.out, a.fetch_workers, a.workers)
         return 1 if r["failed"] else 0
     else:
         pairs(a.out, a.change_m)

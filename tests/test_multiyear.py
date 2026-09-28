@@ -214,3 +214,22 @@ def test_cross_year_sampling(tmp_path, monkeypatch):
     assert 25 < len(made) < 55                              # about 2/3 of draws use another year's label
     ev = dsm.TileDataset(cfg, None, mode="eval", scenes=scenes)
     assert all(isinstance(s, dsm.ConsensusScene) for s in ev.scenes)
+
+
+def test_prune_only_after_every_scene(tmp_path):
+    sq = {"tile": "SU0000", "crops": [[0, 0, 2000, 2000], [2500, 0, 4500, 2000]]}
+    for d in ("laz", "dtm"):
+        f = tmp_path / d / "SU0000" / "2019"
+        f.mkdir(parents=True)
+        (f / "a.bin").write_text("x")
+        (f / "DONE").write_text("1")
+    first = tmp_path / "scenes" / f"{my.location_id('SU0000', sq['crops'][0])}_2019"
+    first.mkdir(parents=True)
+    (first / "meta.json").write_text("{}")
+    assert not my._prune(tmp_path, sq, "2019") and (tmp_path / "laz/SU0000/2019/a.bin").exists()
+    second = tmp_path / "scenes" / f"{my.location_id('SU0000', sq['crops'][1])}_2019"
+    second.mkdir(parents=True)
+    (second / "meta.json").write_text("{}")
+    assert my._prune(tmp_path, sq, "2019")
+    for d in ("laz", "dtm"):
+        assert [p.name for p in (tmp_path / d / "SU0000" / "2019").iterdir()] == ["DONE"]
