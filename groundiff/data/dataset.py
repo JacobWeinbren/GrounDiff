@@ -131,8 +131,8 @@ class Scene:
 
 
 class PairScene:
-    """Inputs from scene a, target from scene b (another survey of the same place): b's DTM moved
-    into a's vertical frame, valid only where b's label is and the ground did not change."""
+    """Inputs from scene a, target from scene b (another survey of the same place; Noise2Noise):
+    b's DTM, valid only where b's label is and the surface did not change (data.multiyear.pairs)."""
 
     TARGETS = ("gt_dtm", "gt_valid")
 
@@ -140,7 +140,6 @@ class PairScene:
         self.a, self.b = a, b
         self.path, self.meta = a.path, a.meta
         self.height, self.width, self.gsd = a.height, a.width, a.gsd
-        self.offset = float(a.meta["pairs"][year_b]["offset"])
         self.mask = a.array(f"unchanged_{year_b}")
 
     def array(self, name: str) -> np.ndarray:
@@ -150,7 +149,7 @@ class PairScene:
 
     def window(self, name: str, r0: int, c0: int, h: int, w: int) -> np.ndarray:
         if name == "gt_dtm":
-            return self.b.window("gt_dtm", r0, c0, h, w) - self.offset
+            return self.b.window("gt_dtm", r0, c0, h, w)
         if name == "gt_valid":
             return self.b.window("gt_valid", r0, c0, h, w) * _window(self.mask, r0, c0, h, w, fill=0.0)
         return self.a.window(name, r0, c0, h, w)
@@ -261,7 +260,7 @@ class TileDataset(Dataset):
         out = {}
         for sc in self.scenes:
             lst = [(by[p["scene"]], y) for y, p in (sc.meta.get("pairs") or {}).items()
-                   if p["scene"] in by and p.get("usable", True) and (sc.path / f"unchanged_{y}.npy").exists()]
+                   if p["scene"] in by and (sc.path / f"unchanged_{y}.npy").exists()]
             if lst:
                 out[sc.path.name] = lst
         if out:

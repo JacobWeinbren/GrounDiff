@@ -24,15 +24,13 @@ build      fetch + rasterise square by square, deleting each square-year's
 rasterise  per location and year: the usual input rasters and the EA DTM target
            on one 1 m grid shared by all years, with preprocess's quality gate.
            data/mt/scenes/<location>_<year>/.
-pairs      per location, for every two years a, b: the vertical offset between
-           the surveys (median lowest-return difference on open ground) and the
-           cells where the ground itself changed: the 5 m lower envelopes of the
-           last returns differ by more than the pair's level of detection (1.96 x
-           the NMAD of the open-ground differences, Wheaton et al. 2010; or
-           --change-m), grown back by the envelope's radius + 1 m. Those cells are
-           never used as cross-year targets. With 3 or more years also the consensus
-           DTM (per-cell median of all years' DTMs, aligned, where unchanged) and
-           each year's disagreement with it: a map of likely editing errors.
+pairs      per location, for every two years: the cells whose surface changed, by
+           Wheaton et al. 2010's DEM of difference (lowest returns, level of
+           detection 1.96 x sqrt(2) x 0.15 m from EA's stated accuracy, 5 x 5
+           spatial coherence); those cells are never used as cross-year targets.
+           With 3 or more years also the consensus DTM (per-cell median of all
+           years' DTMs where unchanged; evaluation only) and each year's
+           disagreement with it.
 
 Every step is resumable (results are cached; rerun after an interruption).
 The catalogue and downloads are the EA survey service that ea_dtm uses.
@@ -510,117 +508,39 @@ def build(out: Path, fetch_workers: int = 2, workers: int = 2, gate: dict | None
 
 # ----------------------------------------------------------------------------- pairs, consensus
 
-def _lower_envelope(a: np.ndarray, size: int) -> np.ndarray:
-    from scipy.ndimage import minimum_filter
-    f = minimum_filter(np.where(np.isfinite(a), a, np.inf), size=size)
-    return np.where(np.isfinite(f), f, np.nan)
-
-
-# EA lidar vertical accuracy (+-15 cm RMSE), used for a pair's error when too little open ground is shared
+# EA lidar vertical accuracy: +-15 cm RMSE per point
 EA_SIGMA_Z = 0.15
 
 
-def stable_ground(A: dict, B: dict, alpha: float = 0.2) -> np.ndarray:
-    """Cells where both surveys' lasers hit bare, stable ground: in both, one return per pulse with
-    < 5 cm spread in the cell, and (when the scenes carry their EA DTM) the lowest return within
-    alpha of that survey's own DTM, which is valid there. The DTM condition drops what else is flat
-    and single-return but moves between surveys: water and tidal flats (hydro-flattened, so invalid
-    in the target) and crops or long grass (standing above the DTM). alpha is GrounDiff's own
-    "the surface is already ground" tolerance (data.alpha)."""
-    ok = np.ones(A["dsm_min"].shape, bool)
-    for s in (A, B):
-        ok &= (np.isfinite(s["dsm_min"]) & (np.nan_to_num(s["z_std"], nan=9.0) < 0.05)
-               & (np.nan_to_num(s["echoes"], nan=9.0) <= 1.05))
-        if "gt_dtm" in s:
-            ok &= (np.nan_to_num(s.get("gt_valid", 1.0)) > 0.5) & \
-                  (np.abs(np.nan_to_num(s["dsm_min"] - s["gt_dtm"], nan=9.0)) < alpha)
-    return ok
+def level_of_detection(sigma_a: float = EA_SIGMA_Z, sigma_b: float = EA_SIGMA_Z, t: float = 1.96) -> float:
+    """Minimum detectable change between two surveys (Wheaton et al. 2010, ESPL 35(2), after
+    Brasington et al. 2003): t x sqrt(sigma_a^2 + sigma_b^2), with each survey's stated vertical
+    accuracy; 0.42 m for two EA surveys at 95 %."""
+    return float(t * np.hypot(sigma_a, sigma_b))
 
 
-def survey_error(A: dict, B: dict, min_cells: int = 1000) -> tuple[float, float, int]:
-    """(offset, sigma, cells) of B's lowest returns minus A's on stable ground (stable_ground).
-    offset: the median difference, the vertical shift between the surveys (added to A's frame to
-    get B's). sigma: the NMAD of the differences (1.4826 x median absolute deviation), the robust
-    spread used for DEM accuracy (Hoehle & Hoehle 2009, ISPRS J. 64(4)). With fewer than min_cells
-    stable cells: no offset (cells = 0) and the EA accuracy spec for both surveys."""
-    d = (B["dsm_min"] - A["dsm_min"])[stable_ground(A, B)].astype(np.float64)
-    if d.size < min_cells:
-        return 0.0, float(np.sqrt(2.0) * EA_SIGMA_Z), 0
-    med = float(np.median(d))
-    return med, float(1.4826 * np.median(np.abs(d - med))), int(d.size)
-
-
-def survey_offset(A: dict, B: dict, min_cells: int = 1000) -> float:
-    return survey_error(A, B, min_cells)[0]
-
-
-def offset_limit() -> float:
-    """Largest vertical offset two surveys meeting EA's accuracy can have. The +-15 cm is each point's
-    RMSE against control, which bounds a survey's constant bias (RMSE^2 = bias^2 + scatter^2), so two
-    surveys' biases differ by at most 2 x 0.15 m. A larger "offset" is not survey bias: the ground
-    under the stable cells moved (beaches, dunes) or a survey is out of specification."""
-    return float(2.0 * EA_SIGMA_Z)
-
-
-def threshold_limit(t: float = 1.96) -> float:
-    """Largest change threshold two in-specification surveys can need: the 95 % level of detection
-    (Wheaton et al. 2010) for a per-cell difference whose error is at most sqrt(2) x 0.15 m. A larger
-    measured one means the cells taken as stable were not, so change there cannot be judged."""
-    return float(t * np.sqrt(2.0) * EA_SIGMA_Z)
-
-
-def adjust_offsets(years: list, measured: dict) -> dict:
-    """One vertical offset per survey from all the pairwise ones, by weighted least squares
-    (o_b - o_a = d_ab, weight = stable cells, first year fixed at 0): the block adjustment used to
-    tie overlapping lidar strips and surveys together. Pairwise medians need not be consistent
-    (a -> b -> c may not equal a -> c); the adjusted ones are, and each pair's residual shows how
-    far its own measurement was off. measured: {(a, b): (d_ab, cells)}. Years with no measured
-    pair keep offset 0."""
-    idx = {y: i for i, y in enumerate(years)}
-    rows, rhs, w = [], [], []
-    for (a, b), (d, n) in measured.items():
-        if n <= 0:
-            continue
-        r = np.zeros(len(years))
-        r[idx[b]], r[idx[a]] = 1.0, -1.0
-        rows.append(r)
-        rhs.append(d)
-        w.append(np.sqrt(n))
-    o = np.zeros(len(years))
-    if rows:
-        M, v, sw = np.array(rows)[:, 1:], np.array(rhs), np.array(w)
-        o[1:] = np.linalg.lstsq(M * sw[:, None], v * sw, rcond=None)[0]
-    return {y: float(o[idx[y]]) for y in years}
-
-
-def level_of_detection(sigma: float, t: float = 1.96) -> float:
-    """Smallest elevation change distinguishable from survey error at 95 % confidence: the DEM of
-    difference threshold of Brasington et al. 2003 and Wheaton et al. 2010 (ESPL 35(2)), t x sigma_diff,
-    with sigma_diff measured on the pair's shared open ground (survey_error)."""
-    return float(t * sigma)
-
-
-def unchanged_mask(A: dict, B: dict, offset: float, change_m: float = 0.5, env_m: int = 5,
-                   grow_m: int | None = None) -> np.ndarray:
-    """True where the ground did not change between the surveys: the env_m lower envelopes of the
-    last returns agree within change_m (after the offset). The envelope (a morphological opening's
-    erosion, as in Zhang et al. 2003's progressive morphological filter) ignores year-to-year changes
-    in how far the laser got through vegetation, but shrinks a changed object by the window's radius,
-    so changes are grown back by that radius + 1 cell (grow_m default). Cells without returns in
-    either year count as unchanged only if both years have none there."""
-    grow_m = env_m // 2 + 1 if grow_m is None else grow_m
-    from scipy.ndimage import binary_dilation
-    la, lb = _lower_envelope(A["dsm_last"], env_m), _lower_envelope(B["dsm_last"], env_m)
-    both = np.isfinite(la) & np.isfinite(lb)
-    changed = both & (np.abs(lb - la - offset) > change_m)
-    changed |= np.isfinite(la) ^ np.isfinite(lb)
-    if grow_m > 0:
-        changed = binary_dilation(changed, np.ones((3, 3), bool), iterations=grow_m)   # grow_m in every direction
+def unchanged_mask(A: dict, B: dict, lod: float | None = None, window: int = 5) -> np.ndarray:
+    """True where the surface did not change between the surveys, by Wheaton et al. 2010's DEM of
+    difference: B's lowest returns minus A's, thresholded at the level of detection, keeping only
+    spatially coherent change (their 5 x 5 spatial-coherence filter, here in its simplest form: most
+    cells of the window changed in the same direction). Cells surveyed in only one of the two years
+    count as changed (nothing to compare)."""
+    from scipy.ndimage import uniform_filter
+    lod = level_of_detection() if lod is None else lod
+    a, b = A["dsm_min"], B["dsm_min"]
+    both = np.isfinite(a) & np.isfinite(b)
+    d = np.where(both, b - a, 0.0)
+    need = (window * window) // 2 + 1
+    changed = np.zeros(a.shape, bool)
+    for side in (both & (d > lod), both & (d < -lod)):
+        n = np.rint(uniform_filter(side.astype(np.float32), window, mode="constant") * window * window)
+        changed |= side & (n >= need)
+    changed |= np.isfinite(a) ^ np.isfinite(b)
     return ~changed
 
 
 def pairs(out: Path, change_m: float | None = None, min_consensus: int = 3, log=print) -> dict:
-    """Offsets, change masks, consensus DTMs and label-disagreement maps for every location."""
+    """Change masks, consensus DTMs and label-disagreement maps for every location."""
     from .preprocess import _save
     root = out / "scenes"
     locs: dict[str, list] = {}
@@ -629,8 +549,9 @@ def pairs(out: Path, change_m: float | None = None, min_consensus: int = 3, log=
         if meta.get("quality", {}).get("suspect") or "location" not in meta:
             continue
         locs.setdefault(meta["location"], []).append(meta)
-    names = ("dsm_min", "dsm_last", "z_std", "echoes", "gt_dtm", "gt_valid")
-    stats = {"locations": len(locs), "pairs": 0, "usable": 0, "consensus": 0}
+    names = ("dsm_min", "gt_dtm", "gt_valid")
+    stats = {"locations": len(locs), "pairs": 0, "consensus": 0}
+    lod = level_of_detection() if change_m is None else change_m
     for loc, metas in sorted(locs.items()):
         metas.sort(key=lambda m: m["year"])
         arr = {m["year"]: {n: np.load(root / m["scene"] / f"{n}.npy").astype(np.float32) for n in names}
@@ -638,31 +559,15 @@ def pairs(out: Path, change_m: float | None = None, min_consensus: int = 3, log=
         years = [m["year"] for m in metas]
         info = {y: {} for y in years}
         masks = {}
-        measured = {}
         for i, a in enumerate(years):
             for b in years[i + 1:]:
-                measured[(a, b)] = survey_error(arr[a], arr[b])
-        adj = adjust_offsets(years, {k: (v[0], v[2]) for k, v in measured.items()})
-        for (a, b), (d, sig, n) in measured.items():
-            off = adj[b] - adj[a]
-            lod = level_of_detection(sig) if change_m is None else change_m
-            why = []
-            if abs(off) > offset_limit():
-                why.append(f"offset beyond {offset_limit():.2f} m")
-            if lod > threshold_limit():
-                why.append(f"threshold beyond {threshold_limit():.2f} m")
-            usable = not why
-            um = unchanged_mask(arr[a], arr[b], off, lod) if usable else np.zeros(arr[a]["dsm_last"].shape, bool)
-            masks[(a, b)] = masks[(b, a)] = um
-            both = np.isfinite(arr[a]["dsm_last"]) & np.isfinite(arr[b]["dsm_last"])
-            stats["usable"] += usable
-            rec = {"sigma": sig, "lod": lod, "usable": usable, "not_used_because": why, "stable_cells": n,
-                   "measured": d if n else None,
-                   "residual": (d - off) if n else None, "shared": float(both.mean()),
-                   "unchanged": float(um[both].mean()) if both.any() else 0.0}
-            info[a][b] = {"offset": off, **rec}
-            info[b][a] = {"offset": -off, **rec, "measured": -d if n else None, "residual": -(d - off) if n else None}
-            stats["pairs"] += 1
+                um = unchanged_mask(arr[a], arr[b], lod)
+                masks[(a, b)] = masks[(b, a)] = um
+                both = np.isfinite(arr[a]["dsm_min"]) & np.isfinite(arr[b]["dsm_min"])
+                rec = {"lod": lod, "shared": float(both.mean()),
+                       "unchanged": float(um[both].mean()) if both.any() else 0.0}
+                info[a][b] = info[b][a] = rec
+                stats["pairs"] += 1
         for m in metas:
             a = m["year"]
             sd = root / m["scene"]
@@ -673,15 +578,20 @@ def pairs(out: Path, change_m: float | None = None, min_consensus: int = 3, log=
                 _save(sd, f"unchanged_{b}", masks[(a, b)].astype(np.float32))
                 prs[b] = {"scene": f"{loc}_{b}", **info[a][b]}
             m["pairs"] = prs
-            # consensus: per-cell median of every year's DTM in a's frame, where unchanged w.r.t. a
+            # consensus (evaluation only): per-cell median of every year's DTM where unchanged w.r.t. a;
+            # the median is what an L1 Noise2Noise model converges to
             stack = []
             for b in years:
                 g = np.where(arr[b]["gt_valid"] > 0.5, arr[b]["gt_dtm"], np.nan)
                 if b != a:
-                    g = np.where(masks[(a, b)], g - info[a][b]["offset"], np.nan)
+                    g = np.where(masks[(a, b)], g, np.nan)
                 stack.append(g)
             S = np.stack(stack)
             n = np.isfinite(S).sum(0)
+            for k in ("gt_consensus", "label_error", "label_above_lidar"):
+                (sd / f"{k}.npy").unlink(missing_ok=True)
+            m.pop("label_noise", None)
+            m.pop("label_above_lidar_frac", None)
             if len(years) >= min_consensus:
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore", RuntimeWarning)          # cells with no year left
@@ -697,23 +607,11 @@ def pairs(out: Path, change_m: float | None = None, min_consensus: int = 3, log=
                     m["label_noise"] = {"cells": int(ok.sum()), "rmse_vs_consensus": float(np.sqrt(np.mean(e ** 2))),
                                         "frac_over_0.2m": float((e > 0.2).mean()), "frac_over_0.5m": float((e > 0.5).mean())}
                 stats["consensus"] += 1
-            # lidar check (no model): the label more than 0.5 m above the lowest return in a cell with
-            # returns is above something the laser measured (an object left in), unless it is noise
-            above = (arr[a]["gt_valid"] > 0.5) & np.isfinite(arr[a]["dsm_min"]) & \
-                    (np.nan_to_num(arr[a]["gt_dtm"] - arr[a]["dsm_min"], nan=0.0) > 0.5)
-            _save(sd, "label_above_lidar", above.astype(np.float32))
-            m["label_above_lidar_frac"] = float(above.mean())
             _write_json(sd / "meta.json", m)
         log(f"  {loc}: years {years}"
-            + "".join(f"\n    {a}-{b}: offset {info[a][b]['offset']:+.3f} m"
-                      + (f" (measured {info[a][b]['measured']:+.3f})" if info[a][b]["measured"] is not None
-                         else " (too little stable ground; not measured)")
-                      + f", change threshold {info[a][b]['lod']:.2f} m, both surveyed {info[a][b]['shared']:.0%}"
-                      + (f", unchanged {info[a][b]['unchanged']:.0%} of that" if info[a][b]["usable"] else
-                         f"; NOT USED ({', '.join(info[a][b]['not_used_because'])}: more than two surveys"
-                         " within EA's accuracy can differ)")
+            + "".join(f"; {a}-{b} both surveyed {info[a][b]['shared']:.0%}, unchanged {info[a][b]['unchanged']:.0%} of that"
                       for i, a in enumerate(years) for b in years[i + 1:]))
-    log(f"{stats['locations']} locations, {stats['pairs']} year pairs ({stats['usable']} used across years), "
+    log(f"{stats['locations']} locations, {stats['pairs']} year pairs (change threshold {lod:.2f} m), "
         f"{stats['consensus']} scenes with a consensus DTM")
     return stats
 
@@ -737,7 +635,7 @@ def main(argv=None):
             s.add_argument("--fetch-workers", type=int, default=2, help="squares downloaded at once")
         if c == "pairs":
             s.add_argument("--change-m", type=float, default=None,
-                           help="fixed change threshold (default: each pair's 95%% level of detection)")
+                           help="change threshold (default: 95%% level of detection for EA's +-15 cm)")
     a = ap.parse_args(argv)
     a.out.mkdir(parents=True, exist_ok=True)
     if a.cmd == "plan":

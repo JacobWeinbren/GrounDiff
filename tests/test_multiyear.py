@@ -39,26 +39,22 @@ def _write(root: Path, loc: str, year: str, ground: np.ndarray, label: np.ndarra
     return sd
 
 
-def test_survey_offset_and_change_mask():
+def test_change_mask_dod():
+    rng = np.random.default_rng(1)
     g = _ground()
-    A = {"dsm_min": g, "dsm_last": g, "z_std": np.full_like(g, 0.02), "echoes": np.ones_like(g)}
-    gb = g + 0.07
-    gb_last = gb.copy()
-    gb_last[20:30, 20:30] += 3.0                            # new building in year B
-    B = {"dsm_min": gb, "dsm_last": gb_last, "z_std": np.full_like(g, 0.02), "echoes": np.ones_like(g)}
-    off = my.survey_offset(A, B, min_cells=100)
-    assert off == pytest.approx(0.07, abs=1e-4)
-    rng = np.random.default_rng(0)
-    Bn = {**B, "dsm_min": gb + rng.normal(0, 0.1, g.shape).astype(np.float32)}
-    off_n, sig, _ = my.survey_error(A, Bn, min_cells=100)
-    assert off_n == pytest.approx(0.07, abs=0.01) and sig == pytest.approx(0.1, rel=0.1)
-    assert my.level_of_detection(sig) == pytest.approx(0.196, rel=0.1)
-    assert my.survey_error(A, B, min_cells=10 ** 6) == (0.0, pytest.approx(np.sqrt(2) * 0.15), 0)
-    um = my.unchanged_mask(A, B, off)
-    assert not um[22:28, 22:28].any()                       # the building's footprint is masked
-    assert um[:10, :10].all() and um[50:, 50:].all()        # open ground away from it is kept
-    # without removing the survey offset nothing would be flagged here, but a 1 m shift would be
-    assert my.unchanged_mask(A, {**B, "dsm_last": g + 1.0}, 0.0)[:10, :10].sum() == 0
+    A = {"dsm_min": g + rng.normal(0, 0.06, g.shape).astype(np.float32)}
+    b = g + 0.2 + rng.normal(0, 0.06, g.shape).astype(np.float32)    # 20 cm apart: below the LoD
+    b[rng.random(g.shape) < 0.05] += 0.6                              # scattered outliers
+    b[20:35, 20:35] += 3.0                                            # new ground (earthworks) in year B
+    B = {"dsm_min": b}
+    assert my.level_of_detection() == pytest.approx(0.416, abs=1e-3)
+    um = my.unchanged_mask(A, B)
+    assert not um[21:34, 21:34].any()                                 # the earthworks are masked
+    far = np.ones_like(um)
+    far[15:40, 15:40] = False
+    assert um[far].mean() > 0.99                                      # scattered outliers are not
+    B2 = {"dsm_min": np.where(np.arange(N)[None, :] < 32, b, np.nan)}
+    assert not my.unchanged_mask(A, B2)[:, 40:].any()                 # surveyed in one year only
 
 
 def test_pairs_consensus_removes_one_years_mistake(tmp_path):
@@ -69,15 +65,15 @@ def test_pairs_consensus_removes_one_years_mistake(tmp_path):
     _write(tmp_path, "L", "2019", g + 0.05, bad + 0.05)     # this survey sits 5 cm higher
     _write(tmp_path, "L", "2021", g, g, building=(5, 15, 45, 55))   # built on after 2019
     stats = my.pairs(tmp_path, log=lambda *a: None)
-    assert stats == {"locations": 1, "pairs": 3, "usable": 3, "consensus": 3}
+    assert stats == {"locations": 1, "pairs": 3, "consensus": 3}
 
     s19 = Scene(tmp_path / "scenes" / "L_2019")
-    assert s19.meta["pairs"]["2017"]["offset"] == pytest.approx(-0.05, abs=0.01)
+    assert s19.meta["pairs"]["2017"]["lod"] == pytest.approx(0.416, abs=1e-3)
     cons = np.load(s19.path / "gt_consensus.npy")
     err = np.load(s19.path / "label_error.npy")
-    # consensus in 2019's frame is the true ground there, mistake outvoted by the other two years
+    # consensus is the true ground (within the surveys' few cm), the mistake outvoted by the other two years
     ok = np.isfinite(cons)
-    assert np.nanmax(np.abs(cons - (g + 0.05))[ok]) < 0.02
+    assert np.nanmax(np.abs(cons - g)[ok]) < 0.06
     assert np.nanmin(err[42:48, 12:18]) > 1.9               # the mistake shows up as label error
     assert s19.meta["label_noise"]["frac_over_0.5m"] > 0
     # the 2021 building: those cells are masked out of pairs with 2021, so fewer than 3 years remain there
@@ -93,9 +89,9 @@ def test_pair_scene_target_in_own_frame(tmp_path):
     a, b = Scene(tmp_path / "scenes" / "L_2017"), Scene(tmp_path / "scenes" / "L_2019")
     ps = PairScene(a, b, "2019")
     t = ps.window("gt_dtm", 0, 0, N, N)
-    np.testing.assert_allclose(t[30:, 30:], g[30:, 30:], atol=0.02)   # 2019's label moved into 2017's frame
+    np.testing.assert_allclose(t[30:, 30:], g[30:, 30:] + 0.3, atol=1e-4)   # 2019's label as it is
     v = ps.window("gt_valid", 0, 0, N, N)
-    assert v[:10, :10].max() == 0 and v[40:, 40:].min() == 1           # changed cells carry no target
+    assert v[2:8, 2:8].max() == 0 and v[40:, 40:].min() == 1           # changed cells carry no target
     np.testing.assert_array_equal(ps.window("dsm_min", 0, 0, N, N), a.window("dsm_min", 0, 0, N, N))
     with pytest.raises(KeyError):
         ps.array("gt_dtm")
@@ -209,8 +205,8 @@ def test_cross_year_sampling(tmp_path, monkeypatch):
     for _ in range(60):
         arrs = ds._sample_train(rng)
         ok = np.isfinite(arrs["gt_dtm"]) & (arrs["gt_valid"] > 0.5)
-        # every target, own year or another, is in the input's vertical frame
-        assert np.abs(arrs["gt_dtm"][ok] - arrs["dsm_max"][ok]).max() < 0.02
+        # own-year targets match the input; another year's differ by that survey's 0.2 m at most
+        assert np.abs(arrs["gt_dtm"][ok] - arrs["dsm_max"][ok]).max() < 0.25
     assert 25 < len(made) < 55                              # about 2/3 of draws use another year's label
     ev = dsm.TileDataset(cfg, None, mode="eval", scenes=scenes)
     assert all(isinstance(s, dsm.ConsensusScene) for s in ev.scenes)
@@ -285,52 +281,3 @@ def test_dtm_coverage_reads_rasters(tmp_path):
     sq = {"tile": "SU0000", "bounds": [400000, 200000, 405000, 205000]}
     cov = my.dtm_coverage(tmp_path, sq, "2019", [[400000, 200000, 402000, 202000], [402500, 200000, 404500, 202000]])
     assert cov[0] == pytest.approx(0.5, abs=0.02) and cov[1] == 0.0
-
-
-
-def test_offsets_are_adjusted_to_agree():
-    years = ["2017", "2019", "2020"]
-    # true survey heights 0, -0.09, 0.00; the 2019-2020 pair measured badly (+0.32) on few cells
-    meas = {("2017", "2019"): (-0.09, 5000), ("2017", "2020"): (0.0, 5000), ("2019", "2020"): (0.32, 200)}
-    o = my.adjust_offsets(years, meas)
-    assert o["2017"] == 0.0
-    assert o["2019"] == pytest.approx(-0.09, abs=0.03) and o["2020"] == pytest.approx(0.0, abs=0.03)
-    # any chain of adjusted offsets agrees: a -> b -> c equals a -> c
-    assert (o["2019"] - o["2017"]) + (o["2020"] - o["2019"]) == pytest.approx(o["2020"] - o["2017"])
-
-
-def test_stable_ground_ignores_water_and_crops():
-    g = _ground()
-    A = {"dsm_min": g.copy(), "z_std": np.full_like(g, 0.02), "echoes": np.ones_like(g),
-         "gt_dtm": g.copy(), "gt_valid": np.ones_like(g)}
-    B = {k: v.copy() for k, v in A.items()}
-    B["dsm_min"] = g + 0.05
-    B["dsm_min"][:, :20] += 0.8            # crop grown by the 2nd survey: single returns, flat, 0.85 m up
-    B["gt_valid"][40:, :] = 0              # water: hydro-flattened in the DTM
-    B["dsm_min"][40:, :] += 0.6            # different tide
-    off, sig, n = my.survey_error(A, B, min_cells=100)
-    assert n == 40 * 44 and off == pytest.approx(0.05, abs=1e-4) and sig < 0.01
-
-
-
-def test_pair_beyond_ea_accuracy_is_not_used(tmp_path):
-    g = _ground()
-    _write(tmp_path, "L", "2017", g, g)
-    _write(tmp_path, "L", "2020", g - 0.46, g - 0.46)       # more than two in-spec surveys can differ
-    _write(tmp_path, "L", "2021", g + 0.2, g + 0.2)         # within it
-    stats = my.pairs(tmp_path, log=lambda *a: None)
-    s = Scene(tmp_path / "scenes" / "L_2017")
-    assert s.meta["pairs"]["2020"]["usable"] is False and s.meta["pairs"]["2021"]["usable"] is True
-    assert np.load(s.path / "unchanged_2020.npy").max() == 0    # no cross-year targets from that pair
-    assert stats["usable"] == 1                                 # 2017-2021 only (2020-2021 is 0.66 m)
-    assert my.offset_limit() == pytest.approx(0.30) and my.threshold_limit() == pytest.approx(0.416, abs=1e-3)
-    import groundiff.data.dataset as dsm
-    for sd in (tmp_path / "scenes").iterdir():
-        np.save(sd / "dsm_max.npy", np.load(sd / "dsm_min.npy"))
-        np.save(sd / "density.npy", np.full_like(g, 8.0))
-    cfg = _cfg("configs/n2n.json").data
-    cfg.tile = 32
-    ds = dsm.TileDataset(cfg, None, mode="train",
-                         scenes=[Scene(q.parent) for q in sorted((tmp_path / "scenes").glob("*/meta.json"))])
-    assert sorted((k, sorted(y for _, y in v)) for k, v in ds.partners.items()) == \
-        [("L_2017", ["2021"]), ("L_2021", ["2017"])]              # the unused pairs are never sampled
