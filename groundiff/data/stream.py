@@ -23,7 +23,9 @@ from .rasterise import Grid, _flat_index, tin_dtm_local
 
 
 class Accumulator:
-    def __init__(self, grid: Grid, keep_ground: bool = False, ground_classes=(2,)):
+    def __init__(self, grid: Grid, keep_ground: bool = False, ground_classes=(2,), ground_per_cell: bool = False):
+        """ground_per_cell: keep only the lowest ground point of each cell for the ground TIN (memory
+        bounded by the grid, not the point count; dense surveys otherwise hold tens of millions)."""
         n = grid.width * grid.height
         self.grid, self.n = grid, n
         self.count = np.zeros(n, np.int32)
@@ -36,9 +38,14 @@ class Accumulator:
         self.hist = np.zeros(256, np.int64)
         self.keep_ground = keep_ground
         self.ground_classes = np.asarray(ground_classes, np.uint8)
+        self.ground_per_cell = ground_per_cell
         if keep_ground:
             self.ng = np.zeros(n, np.int32)
             self.gx, self.gy, self.gz = [], [], []
+            if ground_per_cell:
+                self.cgz = np.full(n, np.inf, np.float32)
+                self.cgx = np.zeros(n, np.float32)
+                self.cgy = np.zeros(n, np.float32)
         self.n_points = 0
         self.crs_wkt = None
 
@@ -84,7 +91,18 @@ class Accumulator:
         if self.keep_ground:
             g = np.isin(pts.cls, self.ground_classes)
             self.ng[u] += np.bincount(inv, weights=g.astype(np.float64), minlength=k).astype(np.int32)
-            if g.any():
+            if g.any() and self.ground_per_cell:
+                gi, gz = u[inv[g]], pts.z[g]
+                o = np.lexsort((gz, gi))                           # by cell, lowest first
+                gi, first = np.unique(gi[o], return_index=True)
+                sel = np.flatnonzero(g)[o][first]
+                z0 = pts.z[sel].astype(np.float32)
+                low = z0 < self.cgz[gi]
+                gi, sel = gi[low], sel[low]
+                self.cgz[gi] = z0[low]
+                self.cgx[gi] = (pts.x[sel] - self.grid.xmin).astype(np.float32)
+                self.cgy[gi] = (pts.y[sel] - self.grid.ymax).astype(np.float32)
+            elif g.any():
                 self.gx.append((pts.x[g] - self.grid.xmin).astype(np.float32))
                 self.gy.append((pts.y[g] - self.grid.ymax).astype(np.float32))
                 self.gz.append(pts.z[g].astype(np.float32))
@@ -113,6 +131,10 @@ class Accumulator:
         del self.zmax, self.zmin, self.zlast, self.mean, self.m2, self.echo
         survey = coverage_mask(has.reshape(shp), g.gsd, coverage_close_m)
         out["in_survey"] = survey.astype(np.float32)
+        if lasground and self.keep_ground and self.ground_per_cell:
+            k = np.isfinite(self.cgz)
+            self.gx, self.gy, self.gz = [self.cgx[k]], [self.cgy[k]], [self.cgz[k]]
+            del self.cgx, self.cgy, self.cgz
         if lasground and self.keep_ground:
             gx = np.concatenate(self.gx) if self.gx else np.zeros(0, np.float32)
             self.gx = []

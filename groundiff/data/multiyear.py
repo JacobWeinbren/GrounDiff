@@ -304,7 +304,7 @@ def rasterise_one(out: Path, sq: dict, crop, year: str, gsd: float = 1.0, gate: 
         raise RuntimeError(f"{name}: no point files")
     x0, y0, x1, y1 = crop
     grid = Grid(float(x0), float(y1), gsd, int(round((x1 - x0) / gsd)), int(round((y1 - y0) / gsd)))
-    acc = Accumulator(grid, keep_ground=True, ground_classes=(2,))
+    acc = Accumulator(grid, keep_ground=True, ground_classes=(2,), ground_per_cell=True)
     for f in files:
         stream_file(f, grid.bounds, acc, {"drop_withheld": True})
     if acc.n_points == 0:
