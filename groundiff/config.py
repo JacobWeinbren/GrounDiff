@@ -22,6 +22,9 @@ class ModelConfig:
     num_head_channels: int = 32
     dropout: float = 0.2
     use_checkpoint: bool = False     # gradient checkpointing: less memory, ~25% slower
+    # third output: log of a per-pixel Laplace scale b (heteroscedastic label noise, Kendall & Gal 2017;
+    # Kondylatos et al. 2025 for Earth observation); trained with loss.nll = "laplace"
+    aleatoric: bool = False
     # ResDepth (published defaults)
     resdepth_depth: int = 5
     resdepth_start_kernel: int = 64

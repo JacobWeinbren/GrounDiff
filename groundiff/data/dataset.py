@@ -87,6 +87,11 @@ class DataConfig:
     include_suspect: bool = False            # also use scenes the preprocess quality gate flagged
     bridge_oversample: float = 0.0           # share of training tiles centred on a bridge (preprocess --osm)
     context_factor: int = 4                  # ctx_* channels: window this many times wider than the tile
+    # Noise2Noise across surveys (data.multiyear): the target of a training tile is the EA DTM of a
+    # random year of the same location (aligned by the survey offset, only where the ground did not
+    # change), so editing mistakes of single years are outvoted instead of learned
+    cross_year: bool = False
+    eval_target: str = "own"                 # "consensus": validate against the multi-year median DTM where it exists
 
 
 def check_context_order(cond_channels) -> None:
@@ -95,6 +100,16 @@ def check_context_order(cond_channels) -> None:
     first = next((i for i, n in enumerate(names) if is_context(n)), len(names))
     if any(not is_context(n) for n in names[first:]):
         raise ValueError(f"ctx_* channels must come last in cond_channels, got {names}")
+
+
+def _window(a: np.ndarray, r0: int, c0: int, h: int, w: int, fill=np.nan) -> np.ndarray:
+    out = np.full((h, w), fill, np.float32)
+    H, W = a.shape
+    rs, cs = max(r0, 0), max(c0, 0)
+    re, ce = min(r0 + h, H), min(c0 + w, W)
+    if re > rs and ce > cs:
+        out[rs - r0:re - r0, cs - c0:ce - c0] = a[rs:re, cs:ce]
+    return out
 
 
 class Scene:
@@ -112,13 +127,50 @@ class Scene:
 
     def window(self, name: str, r0: int, c0: int, h: int, w: int) -> np.ndarray:
         """Read [r0:r0+h, c0:c0+w], NaN outside the scene."""
-        out = np.full((h, w), np.nan, np.float32)
-        a = self.array(name)
-        rs, cs = max(r0, 0), max(c0, 0)
-        re, ce = min(r0 + h, self.height), min(c0 + w, self.width)
-        if re > rs and ce > cs:
-            out[rs - r0:re - r0, cs - c0:ce - c0] = a[rs:re, cs:ce]
-        return out
+        return _window(self.array(name), r0, c0, h, w)
+
+
+class PairScene:
+    """Inputs from scene a, target from scene b (another survey of the same place): b's DTM moved
+    into a's vertical frame, valid only where b's label is and the ground did not change."""
+
+    TARGETS = ("gt_dtm", "gt_valid")
+
+    def __init__(self, a: Scene, b: Scene, year_b: str):
+        self.a, self.b = a, b
+        self.path, self.meta = a.path, a.meta
+        self.height, self.width, self.gsd = a.height, a.width, a.gsd
+        self.offset = float(a.meta["pairs"][year_b]["offset"])
+        self.mask = a.array(f"unchanged_{year_b}")
+
+    def array(self, name: str) -> np.ndarray:
+        if name in self.TARGETS:
+            raise KeyError(f"{name}: read windows of a PairScene")
+        return self.a.array(name)
+
+    def window(self, name: str, r0: int, c0: int, h: int, w: int) -> np.ndarray:
+        if name == "gt_dtm":
+            return self.b.window("gt_dtm", r0, c0, h, w) - self.offset
+        if name == "gt_valid":
+            return self.b.window("gt_valid", r0, c0, h, w) * _window(self.mask, r0, c0, h, w, fill=0.0)
+        return self.a.window(name, r0, c0, h, w)
+
+
+class ConsensusScene(Scene):
+    """A scene whose target is the multi-year median DTM (data.multiyear.pairs), for validation."""
+
+    def __init__(self, sc: Scene):
+        self.__dict__.update(sc.__dict__)
+        self._cons = None
+
+    def array(self, name: str) -> np.ndarray:
+        if name == "gt_dtm":
+            return super().array("gt_consensus")
+        if name == "gt_valid":
+            if self._cons is None:
+                self._cons = np.isfinite(np.asarray(super().array("gt_consensus"))).astype(np.float32)
+            return self._cons
+        return super().array(name)
 
 
 def load_scenes(cfg: DataConfig, split: str | None) -> list[Scene]:
@@ -178,6 +230,8 @@ class TileDataset(Dataset):
                                     | ({"top_ground"} if cfg.m_alpha_mode == "top_class" else set()))
         self.context = [n for n in cfg.cond_channels if is_context(n)]
         check_context_order(cfg.cond_channels)
+        if mode == "eval" and cfg.eval_target == "consensus":
+            self.scenes = [ConsensusScene(sc) if (sc.path / "gt_consensus.npy").exists() else sc for sc in self.scenes]
         if mode == "eval":
             t, stride = cfg.tile, cfg.val_stride or cfg.tile
             self.index = []
@@ -198,7 +252,22 @@ class TileDataset(Dataset):
         else:
             areas = np.array([s.height * s.width for s in self.scenes], np.float64)
             self.scene_p = areas / areas.sum()
+            self.partners = self._partners() if cfg.cross_year else {}
             self.bridges = self._bridge_cells() if cfg.bridge_oversample > 0 else []
+
+    def _partners(self) -> dict:
+        """{scene: [(scene of another year, that year)]} among the loaded scenes (same split)."""
+        by = {sc.path.name: sc for sc in self.scenes}
+        out = {}
+        for sc in self.scenes:
+            lst = [(by[p["scene"]], y) for y, p in (sc.meta.get("pairs") or {}).items()
+                   if p["scene"] in by and (sc.path / f"unchanged_{y}.npy").exists()]
+            if lst:
+                out[sc.path.name] = lst
+        if out:
+            n = sum(len(v) for v in out.values())
+            print(f"[info] cross-year targets: {len(out)} scenes with {n} other-year labels")
+        return out
 
     def _bridge_cells(self, per_scene: int = 4000) -> list:
         """[(scene index, cell rows, cell cols)] for scenes with bridge cells (a subsample of each)."""
@@ -312,6 +381,11 @@ class TileDataset(Dataset):
             centre = (int(br[j] + off[0]), int(bc[j] + off[1]))
         else:
             sc = self.scenes[int(rng.choice(len(self.scenes), p=self.scene_p))]
+        other = self.partners.get(sc.path.name)
+        if other:                                        # the target year: this one or any other survey
+            j = int(rng.integers(len(other) + 1))
+            if j:
+                sc = PairScene(sc, *other[j - 1])
         k = int(rng.integers(0, 4)) if aug and rng.random() < cfg.p_rot90 else 0
         jitter = float(rng.uniform(-cfg.jitter_deg, cfg.jitter_deg)) if aug and rng.random() < cfg.p_jitter else 0.0
         size = int(rng.choice(cfg.multiscale_sizes)) if aug and rng.random() < cfg.p_multiscale else t

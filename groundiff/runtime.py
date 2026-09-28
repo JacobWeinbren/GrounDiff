@@ -61,6 +61,7 @@ class RuntimeSpec:
     bridge_sigma: list = field(default_factory=list)
     bridge_steps: int = 10
     context_factor: int = 4               # ctx_* channels: window this many times wider than the tile
+    aleatoric: bool = False               # third network output: log Laplace scale of the label noise
     # how the training rasters were made (from the scenes' meta.json); batch and
     # the QGIS plugin use these as defaults so inference matches training
     gsd: float | None = None
@@ -98,6 +99,7 @@ class RuntimeSpec:
                    coverage_close_m=d.coverage_close_m,
                    init=getattr(cfg.train, "val_init", None) if cfg.model.kind == "groundiff" else None,
                    one_step=bool(getattr(dc, "one_step", False)),
+                   aleatoric=bool(getattr(cfg.model, "aleatoric", False)),
                    context_factor=int(getattr(d, "context_factor", 4)),
                    gsd=m.get("gsd"), ground_classes=m.get("ground_classes"),
                    before_ground_classes=m.get("before_ground_classes"), read_opts=m.get("read_opts"))
@@ -183,8 +185,10 @@ def _normal(rng, shape) -> np.ndarray:
 
 def sample(denoise: Callable, cond: np.ndarray, spec: RuntimeSpec, init: str = "dsm_noise",
            prior: np.ndarray | None = None, t_start: int | None = None,
-           rng=None, add_noise: bool = True, one_step: bool | None = None):
+           rng=None, add_noise: bool = True, one_step: bool | None = None, extras: dict | None = None):
     """numpy mirror of GrounDiff.sample (diffusion.py). cond [B, C, T, T].
+    extras: if given, receives "log_b" (last step's log Laplace noise scale, normalised units) from
+    aleatoric models.
     one_step (default spec.one_step): one deterministic pass at t = T from zeros.
     Bridge models (spec.process == "rdbm"): RDBM's deterministic sampler from the gate surface."""
     if spec.process == "rdbm":
@@ -196,6 +200,8 @@ def sample(denoise: Callable, cond: np.ndarray, spec: RuntimeSpec, init: str = "
         x = np.concatenate([np.zeros_like(s), cond], axis=1).astype(np.float32)
         out = np.asarray(denoise(x, np.full(bsz, spec.alphas_bar[spec.T - 1], np.float32)), np.float64)
         r_hat, logit = out[:, 0:1], out[:, 1:2]
+        if extras is not None and out.shape[1] > 2:
+            extras["log_b"] = out[:, 2:3]
         p = _sigmoid(logit)
         g0 = p * s + (1 - p) * (s - r_hat)
         if spec.clip_x0 is not None:
@@ -232,6 +238,8 @@ def sample(denoise: Callable, cond: np.ndarray, spec: RuntimeSpec, init: str = "
         x = np.concatenate([g, cond], axis=1).astype(np.float32)
         out = np.asarray(denoise(x, np.full(bsz, ab[t - 1], np.float32)), np.float64)
         r_hat, logit = out[:, 0:1], out[:, 1:2]
+        if extras is not None and out.shape[1] > 2:
+            extras["log_b"] = out[:, 2:3]
         p = _sigmoid(logit)
         g0 = p * s + (1 - p) * (s - r_hat)                          # Eq. 5
         if spec.clip_x0 is not None:
@@ -379,7 +387,9 @@ def predict_scene(arrs: dict, spec: RuntimeSpec, net: Callable, *, stride: int |
     spec.needed_channels. Returns metre-space rasters:
         dtm, p_ground (GrounDiff: sigmoid(l), probability that the gate
         surface is already right), p_edit (1 - p_ground, when the gate is the
-        lasground_new DTM), std (if n_samples > 1 or tta), dz_before
+        lasground_new DTM), std (if n_samples > 1 or tta), noise_scale (aleatoric
+        models: predicted Laplace scale b of the label noise in metres; the labels' expected
+        absolute error there), dz_before
         (dtm - prior channel, if present), coverage.
     anchor=(row, col): global pixel index of arrs[0, 0]; tiles then lie on a
     global lattice and each tile's noise is seeded by its global position, so
@@ -448,6 +458,7 @@ def predict_scene(arrs: dict, spec: RuntimeSpec, net: Callable, *, stride: int |
     acc = np.full((H, W), np.inf) if blend == "min" else np.zeros((H, W))
     wsum = np.zeros((H, W))
     pg_acc, sd_acc, cnt = np.zeros((H, W)), np.zeros((H, W)), np.zeros((H, W))
+    nb_acc = np.zeros((H, W)) if (is_diff and spec.aleatoric) else None
     wt = _ramp_weights(t, stride) if blend == "linear" else np.ones((t, t))
     views = [(k, f) for k in range(4) for f in (False, True)] if tta else [(0, False)]
 
@@ -494,15 +505,18 @@ def predict_scene(arrs: dict, spec: RuntimeSpec, net: Callable, *, stride: int |
             tile_rngs = [np.random.default_rng([seed, r + ar + 2 ** 30, c + ac + 2 ** 30]) for r, c in chunk]
         else:
             tile_rngs = rng
-        preds, probs = [], []
+        preds, probs, scales = [], [], []
         for k, f in views:
             c_v = np.ascontiguousarray(_d4(cond, k, f))
             p_v = np.ascontiguousarray(_d4(pri, k, f)) if pri is not None else None
             for _ in range(n_samples if is_diff else 1):
                 if is_diff:
+                    ex = {}
                     g0, logit = sample(net, c_v, spec, init=init, prior=p_v, t_start=t_start, rng=tile_rngs,
-                                       add_noise=add_noise, one_step=one_step)
+                                       add_noise=add_noise, one_step=one_step, extras=ex)
                     probs.append(_d4(_sigmoid(logit), k, f, inverse=True))
+                    if "log_b" in ex:
+                        scales.append(_d4(np.exp(np.clip(ex["log_b"], -9.0, 3.0)), k, f, inverse=True))
                 else:
                     keep = [i for i, n in enumerate(spec.cond_channels) if n != spec.prior_channel]
                     g0 = np.asarray(net(np.concatenate([p_v, c_v[:, keep]], axis=1).astype(np.float32)))
@@ -510,6 +524,7 @@ def predict_scene(arrs: dict, spec: RuntimeSpec, net: Callable, *, stride: int |
         P = np.stack(preds)                                   # [S, B, 1, t, t]
         mean, std = P.mean(0), (P.std(0) if P.shape[0] > 1 else np.zeros_like(P[0]))
         pg = np.stack(probs).mean(0) if probs else None
+        nb = np.stack(scales).mean(0) if scales else None
         for i, (r, c) in enumerate(chunk):
             if pe_acc is not None:
                 ra_, ca_, rb_, cb_ = max(r, 0), max(c, 0), min(r + t, H), min(c + t, W)
@@ -535,6 +550,8 @@ def predict_scene(arrs: dict, spec: RuntimeSpec, net: Callable, *, stride: int |
             cnt[sl] += 1
             if pg is not None:
                 pg_acc[sl] += pg[i, 0][tl]
+            if nb_acc is not None and nb is not None:
+                nb_acc[sl] += (nb[i, 0].astype(np.float64) * 0.5 * scs[i])[tl]
         if progress:
             progress(min(j0 // batch_size + 1, n_batches) / n_batches)
 
@@ -547,6 +564,8 @@ def predict_scene(arrs: dict, spec: RuntimeSpec, net: Callable, *, stride: int |
         if spec.prior_channel and spec.gate_channel == spec.prior_channel:
             # gate on the lasground_new DTM: sigmoid(l) = "keep lasground_new here"
             out["p_edit"] = (1.0 - out["p_ground"]).astype(np.float32)
+    if nb_acc is not None:
+        out["noise_scale"] = np.where(has_data, nb_acc / np.maximum(cnt, 1), np.nan).astype(np.float32)
     if n_samples > 1 or tta:
         out["std"] = np.where(has_data, sd_acc / np.maximum(cnt, 1), np.nan).astype(np.float32)
     if pe_acc is not None:

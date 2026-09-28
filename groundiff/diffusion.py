@@ -126,6 +126,8 @@ class GrounDiff(nn.Module):
         """Eq. 3-5. Returns (g0_hat, r_hat, logit)."""
         out = self.denoiser(torch.cat([g_t, cond], dim=1), gamma)
         r_hat, logit = out[:, 0:1].float(), out[:, 1:2].float()
+        # log Laplace scale of the label noise (model.aleatoric), in normalised units
+        self.last_log_b = out[:, 2:3].float() if out.shape[1] > 2 else None
         return gating(r_hat, logit, self.gate_surface(cond).float()), r_hat, logit
 
     # ------------------------------------------------------------------ training
@@ -155,11 +157,11 @@ class GrounDiff(nn.Module):
             t = torch.full((b,), self.T, device=g0.device, dtype=torch.long)
             g_t = torch.zeros_like(g0)                  # the mean of q(g_T | g0) for abar_T -> 0
             g0_hat, r_hat, logit = self.denoise(g_t, cond, gamma)
-            return {"g0_hat": g0_hat, "r_hat": r_hat, "logit": logit, "gamma": gamma, "t": t}
+            return {"g0_hat": g0_hat, "r_hat": r_hat, "logit": logit, "gamma": gamma, "t": t, "log_b": self.last_log_b}
         gamma, t = self.sample_gammas(g0.shape[0], g0.device)
         g_t = self.q_sample(g0, gamma)
         g0_hat, r_hat, logit = self.denoise(g_t, cond, gamma)
-        return {"g0_hat": g0_hat, "r_hat": r_hat, "logit": logit, "gamma": gamma, "t": t}
+        return {"g0_hat": g0_hat, "r_hat": r_hat, "logit": logit, "gamma": gamma, "t": t, "log_b": self.last_log_b}
 
     def _bridge_training_forward(self, g0: torch.Tensor, cond: torch.Tensor):
         b, T = g0.shape[0], self.cfg.bridge_T
@@ -176,7 +178,7 @@ class GrounDiff(nn.Module):
             g_t = s + th * (g0 - s) + self.bridge_sigma[t].view(-1, 1, 1, 1) * eps
         gamma = self.bridge_theta[t]
         g0_hat, r_hat, logit = self.denoise(g_t, cond, gamma)
-        return {"g0_hat": g0_hat, "r_hat": r_hat, "logit": logit, "gamma": gamma, "t": t}
+        return {"g0_hat": g0_hat, "r_hat": r_hat, "logit": logit, "gamma": gamma, "t": t, "log_b": self.last_log_b}
 
     @torch.no_grad()
     def _bridge_sample(self, cond: torch.Tensor, one_step: bool):

@@ -85,7 +85,7 @@ BRIDGE_M, BRIDGE_KEEP_M = 10.0, 20.0
 
 def _save(out: Path, name: str, arr: np.ndarray):
     """Readers cast to float32 (dataset windows, infer), so the smaller types are transparent."""
-    if name in MASK_CHANNELS and not np.isnan(arr).any():
+    if (name in MASK_CHANNELS or name.startswith(("unchanged_", "label_above"))) and not np.isnan(arr).any():
         dt = np.uint8
     elif name in HALF_CHANNELS:
         dt = np.float16

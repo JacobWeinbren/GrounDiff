@@ -1,0 +1,59 @@
+{
+ "notes": "Single-step end-to-end fine-tune (Garcia et al., WACV 2025) of runs/mt/best.pt with Noise2Noise cross-year targets and a heteroscedastic Laplace noise head (Kendall & Gal 2017; Kondylatos et al. 2025): loss |e|/b + log b, whose optimum is still the median, while b learns where the labels disagree.",
+ "data": {
+  "root": "data/mt/scenes",
+  "split_file": "data/mt/split.json",
+  "cond_channels": [
+   "dsm_max",
+   "dsm_min",
+   "dsm_last",
+   "density",
+   "z_std",
+   "echoes",
+   "tile_range"
+  ],
+  "gate_channel": "dsm_max",
+  "norm_channels": [
+   "dsm_max",
+   "dsm_min"
+  ],
+  "norm_quantile": 0.001,
+  "tile": 256,
+  "alpha": 0.2,
+  "loss_mask": "gt",
+  "fill_empty": "nearest",
+  "cross_year": true,
+  "eval_target": "consensus"
+ },
+ "model": {
+  "kind": "groundiff",
+  "aleatoric": true
+ },
+ "diffusion": {
+  "T": 10,
+  "schedule": "cosine",
+  "one_step": true
+ },
+ "loss": {
+  "lam_l1": 1.0,
+  "lam_l2": 0.0,
+  "lam_grad": 0.1,
+  "lam_conf": 0.1,
+  "nll": "laplace"
+ },
+ "optim": {
+  "name": "adamw",
+  "lr": 3e-05,
+  "weight_decay": 0.01,
+  "warmup_steps": 100,
+  "total_steps": 3000
+ },
+ "train": {
+  "out_dir": "runs/mt_1step",
+  "batch_size": 4,
+  "grad_accum": 4,
+  "val_init": "dsm_noise",
+  "val_every": 500,
+  "save_every": 500
+ }
+}

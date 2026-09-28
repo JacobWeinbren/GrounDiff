@@ -80,6 +80,7 @@ BLENDS = ["linear", "min", "mean"]
 PRIORS = ["auto", "global", "channel", "none"]
 OUTPUTS = [("dtm", "Predicted DTM"), ("p_edit", "Edit probability"),
            ("dz_before", "Predicted edit vs lasground_new (m)"), ("std", "Uncertainty (m)"),
+           ("noise_scale", "Expected label error here (m, noise-aware models)"),
            ("p_ground", "Probability the DSM is ground (DSM-only models)")]
 
 _KEEP = []          # post-processors must outlive processAlgorithm

@@ -40,7 +40,7 @@ def build_model(cfg: Config) -> nn.Module:
         from ..data.dataset import check_context_order
         check_context_order(cfg.data.cond_channels)
         n_ctx = sum(is_context(c) for c in cfg.data.cond_channels)
-        net = UNet(in_channel=1 + len(cfg.data.cond_channels), out_channel=2,
+        net = UNet(in_channel=1 + len(cfg.data.cond_channels), out_channel=3 if m.aleatoric else 2,
                    inner_channel=m.inner_channel, channel_mults=tuple(m.channel_mults),
                    res_blocks=m.res_blocks, attn_res=tuple(m.attn_res), dropout=m.dropout,
                    num_head_channels=m.num_head_channels, use_checkpoint=m.use_checkpoint,
@@ -111,6 +111,12 @@ def init_from_checkpoint(model: nn.Module, cfg: Config, path: str | Path) -> lis
                          + (f"; dropped: {dropped}" if dropped else ""))
         elif w.shape == v.shape:
             dst[k] = w
+        elif k.endswith(("out.2.weight", "out.2.bias")) and w.shape[1:] == v.shape[1:]:
+            n = min(w.shape[0], v.shape[0])              # output head gained / lost the noise-scale channel
+            nw = v.clone()
+            nw[:n] = w[:n]
+            dst[k] = nw
+            notes.append(f"output head {tuple(w.shape)} -> {tuple(v.shape)}: first {n} channels copied")
         else:
             notes.append(f"shape mismatch, left at init: {k} {tuple(w.shape)} vs {tuple(v.shape)}")
     od, nd = old_cfg.data, cfg.data

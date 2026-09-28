@@ -1,0 +1,56 @@
+{
+ "notes": "GrounDiff (gated Palette UNet, DSM -> DTM) + tile_range on multi-year EA data (2017-2022). Noise2Noise (Lehtinen et al., ICML 2018): half the training tiles take their target from another survey year of the same place (vertical offset removed, changed cells masked), so no year's label is treated as clean; L1 only (median-seeking under N2N). Validated against the multi-year consensus DTM. Trained from scratch.",
+ "data": {
+  "root": "data/mt/scenes",
+  "split_file": "data/mt/split.json",
+  "cond_channels": [
+   "dsm_max",
+   "dsm_min",
+   "dsm_last",
+   "density",
+   "z_std",
+   "echoes",
+   "tile_range"
+  ],
+  "gate_channel": "dsm_max",
+  "norm_channels": [
+   "dsm_max",
+   "dsm_min"
+  ],
+  "norm_quantile": 0.001,
+  "tile": 256,
+  "alpha": 0.2,
+  "loss_mask": "gt",
+  "fill_empty": "nearest",
+  "cross_year": true,
+  "eval_target": "consensus"
+ },
+ "model": {
+  "kind": "groundiff"
+ },
+ "diffusion": {
+  "T": 10,
+  "schedule": "cosine"
+ },
+ "loss": {
+  "lam_l1": 1.0,
+  "lam_l2": 0.0,
+  "lam_grad": 0.1,
+  "lam_conf": 0.1
+ },
+ "optim": {
+  "name": "adamw",
+  "lr": 0.0001,
+  "weight_decay": 0.01,
+  "warmup_steps": 500,
+  "total_steps": 20000
+ },
+ "train": {
+  "out_dir": "runs/mt",
+  "batch_size": 4,
+  "grad_accum": 4,
+  "val_init": "dsm_noise",
+  "val_every": 1000,
+  "save_every": 500
+ }
+}

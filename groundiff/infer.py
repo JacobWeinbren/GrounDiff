@@ -127,7 +127,8 @@ def _progress(name: str):
 def run_scene(scene_dir: Path, net, spec: RuntimeSpec, out_dir: Path, args) -> dict:
     meta = json.loads((scene_dir / "meta.json").read_text())
     g = meta["grid"]
-    names = set(spec.needed_channels) | {"gt_dtm", "gt_valid", "dsm_max", "in_survey", "has_return", "bridge"}
+    names = set(spec.needed_channels) | {"gt_dtm", "gt_valid", "dsm_max", "in_survey", "has_return", "bridge",
+                                         "gt_consensus"}
     arrs = {n: np.load(scene_dir / f"{n}.npy").astype(np.float32) for n in names
             if (scene_dir / f"{n}.npy").exists()}
     res = predict_scene(arrs, spec, net, stride=args.stride, blend=args.blend, prior=args.prior,
@@ -137,7 +138,7 @@ def run_scene(scene_dir: Path, net, spec: RuntimeSpec, out_dir: Path, args) -> d
                         progress=_progress(scene_dir.name))
     out_dir.mkdir(parents=True, exist_ok=True)
     geo = (g["xmin"], g["ymax"], g["gsd"], meta.get("crs_wkt"))
-    for k in ("dtm", "p_ground", "p_edit", "std", "dz_before", "prior"):
+    for k in ("dtm", "p_ground", "p_edit", "std", "noise_scale", "dz_before", "prior"):
         if k in res:
             write_geotiff(out_dir / f"{k}.tif", res[k], *geo)
     if not getattr(args, "no_overlays", False):
@@ -167,6 +168,8 @@ def run_scene(scene_dir: Path, net, spec: RuntimeSpec, out_dir: Path, args) -> d
             summary["lasground_new"] = dtm_metrics(before, gt, valid & np.isfinite(before), s, spec.alpha,
                                                    gsd=g["gsd"])
             true_dz = gt - before
+    if "gt_consensus" in arrs:
+        summary.update(consensus_metrics(res, arrs, spec, g["gsd"]))
     if "dz_before" in res:
         rows = block_priorities(res["dz_before"], g["gsd"], args.block_m, res.get("std"), true_dz, spec.alpha,
                                 res.get("p_edit"), g["xmin"], g["ymax"])
@@ -179,6 +182,43 @@ def run_scene(scene_dir: Path, net, spec: RuntimeSpec, out_dir: Path, args) -> d
             summary["priority"] = capture_at(rows)
     (out_dir / "metrics.json").write_text(json.dumps(summary, indent=1))
     return summary
+
+
+def consensus_metrics(res: dict, arrs: dict, spec: RuntimeSpec, gsd: float) -> dict:
+    """Scores against the multi-year consensus DTM (data.multiyear: the per-cell median of >= 3 surveys,
+    change-masked), which is less noisy than any one year's label: the model and this year's label are both
+    compared with it on the same cells. With a noise head, the predicted scale b is checked against the
+    label's actual deviation from the consensus (for a Laplace, mean |error| = b)."""
+    cons = arrs["gt_consensus"]
+    gt = np.where(arrs.get("gt_valid", np.ones_like(cons)) > 0.5, arrs.get("gt_dtm", np.full_like(cons, np.nan)),
+                  np.nan)
+    ok = np.isfinite(cons) & np.isfinite(res["dtm"])
+    out = {}
+    if ok.sum() < 20:
+        return out
+    s = arrs["dsm_max"]
+    out["model_vs_consensus"] = dtm_metrics(res["dtm"], cons, ok, s, spec.alpha, gsd=gsd)
+    both = ok & np.isfinite(gt)
+    if both.sum() >= 20:
+        out["label_vs_consensus"] = dtm_metrics(gt, cons, both, s, spec.alpha, gsd=gsd)
+        d_model, d_label = (res["dtm"] - cons)[both], (gt - cons)[both]
+        out["cons_sq_err_sum"] = float(np.sum(d_model.astype(np.float64) ** 2))
+        out["cons_label_sq_err_sum"] = float(np.sum(d_label.astype(np.float64) ** 2))
+        out["cons_n"] = int(both.sum())
+        if "noise_scale" in res:
+            b = res["noise_scale"][both]
+            e = np.abs(d_label)
+            fin = np.isfinite(b)
+            if fin.sum() >= 100:
+                edges = np.quantile(b[fin], [0, 0.5, 0.9, 0.99, 1])
+                rows = []
+                for lo, hi in zip(edges[:-1], edges[1:]):
+                    sel = fin & (b >= lo) & (b <= hi)
+                    if sel.any():
+                        rows.append({"b_lo": float(lo), "b_hi": float(hi), "mean_b": float(b[sel].mean()),
+                                     "mean_abs_label_error": float(e[sel].mean()), "cells": int(sel.sum())})
+                out["noise_scale_calibration"] = rows
+    return out
 
 
 def main(argv=None):
@@ -243,6 +283,12 @@ def main(argv=None):
               + (f", mean MAE {np.mean(mae):.3f} m" if mae else "")
               + f"; {time.time() - t_all:.0f} s in total")
         print(stratum_table(all_rows))
+    cn = sum(s.get("cons_n", 0) for s in all_rows)
+    if cn:
+        rm = np.sqrt(sum(s["cons_sq_err_sum"] for s in all_rows) / cn)
+        rl = np.sqrt(sum(s["cons_label_sq_err_sum"] for s in all_rows) / cn)
+        print(f"against the multi-year consensus ({cn} cells): model RMSE {rm:.3f} m, "
+              f"this year's label RMSE {rl:.3f} m (lower than the label = the model removed label noise)")
     return 0
 
 

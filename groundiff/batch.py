@@ -271,6 +271,8 @@ def output_keys(spec: RuntimeSpec, predict_kwargs: dict | None = None) -> list[s
     deterministic = spec.kind == "groundiff" and spec.deterministic
     if (predict_kwargs.get("n_samples", 1) > 1 and not deterministic) or predict_kwargs.get("tta"):
         keys.append("std")                     # a single-step model is deterministic: spread from TTA only
+    if spec.kind == "groundiff" and spec.aleatoric:
+        keys.append("noise_scale")             # predicted label-noise scale (metres)
     return keys
 
 

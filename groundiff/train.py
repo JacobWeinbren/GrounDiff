@@ -298,7 +298,7 @@ def train(cfg: Config, init_from: str | None = None) -> dict:
                 if is_diff:
                     o = model.training_forward(target, cond)
                     losses = groundiff_loss(o["g0_hat"], o["logit"], target, b["m_alpha"].to(device), valid, cfg.loss,
-                                            half_scale=0.5 * b["scale"].to(device))
+                                            half_scale=0.5 * b["scale"].to(device), log_b=o.get("log_b"))
                 else:
                     pred = model(b["prior"].to(device), cond)
                     losses = resdepth_loss(pred.float(), target, valid, 0.5 * b["scale"].to(device))
